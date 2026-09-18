@@ -12,7 +12,8 @@ modeled as plain Choice (not SDK function-calling - see that doc's #3) over
 the whole action space, executed immediately with no confidence-based
 retry/escalation branch. `result.choices[id].confidence` (the SDK's uniform
 per-`Answer` field, per that doc's #4) is logged unconditionally alongside
-the chosen action and a snapshot of the current-objective milestone (#18).
+the chosen action and the current-objective milestone split (#18) it was
+made against.
 
 `run_turn` is the module's single entry point, composed from three injected
 seams so it's testable without PyBoy, the ROM, or a real TypeSafe API call
@@ -38,6 +39,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from pyboy import PyBoy
+from pydantic import BaseModel
 from typesafe_sdk import Choice, JSONContent, TypeSafeClient
 
 from jev_plays_pokemon.game_state import GameState, extract_game_state
@@ -128,9 +130,11 @@ def build_jev_client() -> TypeSafeClient:
 class Decision:
     action: str
     confidence: float
-    # The current-objective snapshot (#18) this decision was made against -
-    # `None` once every milestone is complete (see `milestones.py`).
-    milestone: Milestone | None
+    # The full current-objective split (#18) this decision was made against,
+    # so downstream consumers (e.g. #22's stream-facing surface) can report
+    # the state the pick was made on - `None` current once every milestone
+    # is complete (see `milestones.py`).
+    milestone_progress: MilestoneProgress
 
 
 ActionExecutor = Callable[[str], None]
@@ -141,44 +145,78 @@ def log_decision(decision: Decision) -> None:
     """Log one decision unconditionally - no confidence threshold gates this.
 
     Per this ticket's MVP scope: every decision is logged, regardless of how
-    confident Jev was, alongside a snapshot of the current-objective
-    milestone it was made against.
+    confident Jev was, alongside the current-objective milestone split it
+    was made against.
     """
+    milestone = decision.milestone_progress.current
     logger.info(
         "action=%s confidence=%.3f milestone_id=%s milestone_description=%s",
         decision.action,
         decision.confidence,
-        decision.milestone.milestone_id if decision.milestone else None,
-        decision.milestone.description if decision.milestone else None,
+        milestone.milestone_id if milestone else None,
+        milestone.description if milestone else None,
     )
+
+
+class JevPartyMon(BaseModel):
+    species: str
+    level: int
+    hp: int
+    max_hp: int
+    status: str
+
+
+class JevBattleState(BaseModel):
+    in_battle: bool
+    battle_type: str
+    opponent_species: str | None
+    opponent_level: int | None
+
+
+class JevStatePayload(BaseModel):
+    """The `state` argument of `system_one()` - Jev's input contract.
+
+    Deliberately a subset of `GameState` plus the current objective: money,
+    inventory, event flags, `map_id` and party moves/pp are excluded, so
+    this model - not a caller's dict literal - is what says what Jev sees.
+    """
+
+    map_name: str
+    player_x: int
+    player_y: int
+    party: list[JevPartyMon]
+    badges: list[str]
+    battle: JevBattleState
+    dialog_open: bool
+    current_objective: str | None
 
 
 def _serialize_state(state: GameState, milestone: Milestone | None) -> dict:
     """Build the JSON-able `state` payload handed to `system_one()`."""
-    return {
-        "map_name": state.map_name,
-        "player_x": state.player_x,
-        "player_y": state.player_y,
-        "party": [
-            {
-                "species": mon.species,
-                "level": mon.level,
-                "hp": mon.hp,
-                "max_hp": mon.max_hp,
-                "status": mon.status,
-            }
+    return JevStatePayload(
+        map_name=state.map_name,
+        player_x=state.player_x,
+        player_y=state.player_y,
+        party=[
+            JevPartyMon(
+                species=mon.species,
+                level=mon.level,
+                hp=mon.hp,
+                max_hp=mon.max_hp,
+                status=mon.status,
+            )
             for mon in state.party
         ],
-        "badges": list(state.badges),
-        "battle": {
-            "in_battle": state.battle.in_battle,
-            "battle_type": state.battle.battle_type,
-            "opponent_species": state.battle.opponent_species,
-            "opponent_level": state.battle.opponent_level,
-        },
-        "dialog_open": state.dialog_open,
-        "current_objective": milestone.description if milestone else None,
-    }
+        badges=list(state.badges),
+        battle=JevBattleState(
+            in_battle=state.battle.in_battle,
+            battle_type=state.battle.battle_type,
+            opponent_species=state.battle.opponent_species,
+            opponent_level=state.battle.opponent_level,
+        ),
+        dialog_open=state.dialog_open,
+        current_objective=milestone.description if milestone else None,
+    ).model_dump(mode="json")
 
 
 def _build_action_question() -> Choice:
@@ -205,7 +243,9 @@ def decide_action(
     )
     answer = result.choices[_ACTION_QUESTION_ID]
     return Decision(
-        action=answer.choice, confidence=answer.confidence, milestone=milestone
+        action=answer.choice,
+        confidence=answer.confidence,
+        milestone_progress=milestone_progress,
     )
 
 
