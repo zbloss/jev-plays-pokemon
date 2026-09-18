@@ -1,0 +1,323 @@
+<title>Jev Overlay Concepts</title>
+<style>
+  :root{
+    --ink:#e9e6da;
+    --ink-dim:#a9a58f;
+    --shell:#14161b;
+    --panel:#1c1f26;
+    --panel-line:#2c303a;
+    --gb-0:#0f380f;
+    --gb-1:#306230;
+    --gb-2:#8bac0f;
+    --gb-3:#9bbc0f;
+    --gold:#f2b134;
+    --gold-dim:#7a5a1c;
+    color-scheme: dark;
+  }
+  @media (prefers-color-scheme: light){
+    :root:not([data-theme="dark"]){
+      --shell:#14161b;
+      --panel:#1c1f26;
+      --panel-line:#2c303a;
+      --ink:#e9e6da;
+      --ink-dim:#a9a58f;
+    }
+  }
+  :root[data-theme="dark"]{
+    --shell:#14161b; --panel:#1c1f26; --panel-line:#2c303a; --ink:#e9e6da; --ink-dim:#a9a58f;
+  }
+
+  * { box-sizing: border-box; }
+  body{
+    background: var(--shell);
+    color: var(--ink);
+    font-family: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+    padding-inline: 16px;
+    padding-block: 28px 120px;
+  }
+  .mono{ font-family: "IBM Plex Mono", ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+  .pixel{ font-family: "Press Start 2P", "IBM Plex Mono", monospace; }
+
+  .page{ max-width: 920px; margin: 0 auto; display:flex; flex-direction:column; gap:20px; }
+
+  .masthead{ display:flex; flex-direction:column; gap:6px; }
+  .eyebrow{ font-size:11px; letter-spacing:.12em; text-transform:uppercase; color:var(--gold); }
+  h1{ margin:0; font-size:22px; font-weight:600; text-wrap:balance; }
+  .brief{ margin:0; color:var(--ink-dim); font-size:14px; line-height:1.55; max-width:62ch; }
+  .brief b{ color:var(--ink); font-weight:600; }
+
+  /* ---- shared mock browser-source frame ---- */
+  .frame-wrap{
+    background: var(--panel);
+    border:1px solid var(--panel-line);
+    border-radius:10px;
+    padding:10px;
+  }
+  .frame-chrome{
+    display:flex; align-items:center; gap:8px;
+    padding:2px 6px 10px;
+    color: var(--ink-dim);
+    font-size:11px;
+  }
+  .frame-chrome .dot{ width:8px; height:8px; border-radius:50%; background:var(--panel-line); }
+  .frame-chrome .url{ font-family:"IBM Plex Mono",monospace; }
+
+  .gb-screen{
+    position:relative;
+    width:100%;
+    aspect-ratio: 10 / 9;
+    overflow:hidden;
+    border-radius:4px;
+    background:
+      repeating-linear-gradient(45deg, var(--gb-2) 0 6.25%, var(--gb-3) 6.25% 12.5%);
+    background-size: 12.5% 12.5%;
+  }
+  .gb-watermark{
+    position:absolute; top:8px; left:10px;
+    font-size:10px; letter-spacing:.06em;
+    color: var(--gb-0);
+    display:flex; align-items:center; gap:5px;
+    opacity:.75;
+  }
+  .gb-watermark .rec{ width:6px; height:6px; border-radius:50%; background:#c0392b; }
+  .gb-sprite{
+    position:absolute; left:50%; top:50%;
+    transform: translate(-50%,-58%);
+  }
+  .gb-sprite .head{ width:14%; aspect-ratio:1; background:var(--gb-0); border-radius:2px; margin:0 auto 2%; }
+  .gb-sprite .body{ width:20%; aspect-ratio: 1/1.1; background:var(--gb-1); border-radius:2px; }
+  .gb-sprite{ width:56px; }
+
+  .overlay-layer{ position:absolute; inset:0; }
+
+  /* ---- Variant A: HUD Corner ---- */
+  .A-hud{
+    position:absolute; left:4%; bottom:4%;
+    max-width: 58%;
+    background: rgba(10,12,10,.62);
+    backdrop-filter: blur(3px);
+    border:1px solid rgba(155,188,15,.25);
+    border-radius:8px;
+    padding:8px 10px;
+    display:flex; flex-direction:column; gap:6px;
+  }
+  .A-action-row{ display:flex; align-items:center; gap:7px; }
+  .A-btn{
+    width:18px; height:18px; border-radius:50%;
+    background: var(--gold); color:#241a03;
+    display:flex; align-items:center; justify-content:center;
+    font-size:10px; font-weight:700; flex:none;
+  }
+  .A-action{ font-size:12px; font-weight:600; letter-spacing:.04em; }
+  .A-bar-row{ display:flex; align-items:center; gap:6px; }
+  .A-bar{ flex:1; height:5px; border-radius:3px; background:rgba(255,255,255,.14); overflow:hidden; }
+  .A-bar > i{ display:block; height:100%; background:var(--gold); }
+  .A-pct{ font-size:10px; color:var(--ink-dim); min-width:2.4em; text-align:right; }
+  .A-milestone{ font-size:10.5px; color:var(--gb-3); display:flex; gap:5px; }
+  .A-caption{ font-size:9px; color:var(--ink-dim); letter-spacing:.03em; }
+
+  /* ---- Variant B: Dossier Sidebar ---- */
+  .B-wrap{ position:absolute; inset:0; display:flex; flex-direction:row-reverse; }
+  .B-sidebar{
+    width:36%; min-width:0;
+    background: rgba(14,15,12,.86);
+    backdrop-filter: blur(2px);
+    border-left:1px solid rgba(155,188,15,.2);
+    padding:10px 9px;
+    display:flex; flex-direction:column; gap:10px;
+    overflow:auto;
+  }
+  .B-eyebrow{ font-size:8.5px; letter-spacing:.1em; color:var(--gold); text-transform:uppercase; }
+  .B-action{ font-size:15px; font-weight:700; line-height:1.15; }
+  .B-gauge{ align-self:center; position:relative; width:64px; height:64px; margin:2px 0; }
+  .B-gauge svg{ width:100%; height:100%; transform:rotate(-90deg); }
+  .B-gauge .pct{ position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:12px; font-weight:600; }
+  .B-hr{ height:1px; background:var(--panel-line); border:0; margin:0; }
+  .B-list{ list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:5px; font-size:10px; }
+  .B-list li{ display:flex; align-items:flex-start; gap:5px; color:var(--ink-dim); }
+  .B-list li.done{ text-decoration: line-through; opacity:.55; }
+  .B-list li.now{
+    color:var(--gb-3); background:rgba(155,188,15,.1);
+    border-left:2px solid var(--gold); padding:3px 4px; margin-left:-2px;
+    text-decoration:none; opacity:1; border-radius:2px;
+  }
+  .B-mark{ flex:none; width:12px; }
+
+  /* ---- Variant C: Lower-Third Ticker ---- */
+  .C-bar{
+    position:absolute; left:0; right:0; bottom:0;
+    padding: 22px 4% 8px;
+    background: linear-gradient(to top, rgba(6,7,5,.92), rgba(6,7,5,.55) 65%, transparent);
+    display:flex; align-items:flex-end; justify-content:space-between; gap:10px;
+    flex-wrap: wrap;
+  }
+  .C-left{ display:flex; align-items:center; gap:6px; }
+  .C-btn{ width:16px; height:16px; border-radius:50%; background:var(--gold); color:#241a03; font-size:9px; font-weight:700; display:flex; align-items:center; justify-content:center; }
+  .C-action{ font-size:11px; font-weight:600; }
+  .C-meter{ display:flex; align-items:center; gap:5px; }
+  .C-meter .track{ width:70px; height:4px; border-radius:2px; background:rgba(255,255,255,.16); overflow:hidden; }
+  .C-meter .track > i{ display:block; height:100%; background:var(--gb-3); }
+  .C-meter .pct{ font-size:9px; color:var(--ink-dim); }
+  .C-stepper{ display:flex; align-items:center; gap:4px; }
+  .C-dot{ width:6px; height:6px; border-radius:50%; background:rgba(255,255,255,.25); }
+  .C-dot.done{ background:var(--gb-3); }
+  .C-dot.now{ width:9px; height:9px; background:var(--gold); box-shadow:0 0 0 3px rgba(242,177,52,.25); }
+  .C-line{ width:10px; height:1px; background:rgba(255,255,255,.2); }
+  .C-now-label{ font-size:9px; color:var(--gold); margin-left:4px; white-space:nowrap; }
+
+  /* ---- switcher ---- */
+  .switcher{
+    position:fixed; left:50%; bottom: calc(18px + env(safe-area-inset-bottom, 0px));
+    transform: translateX(-50%);
+    display:flex; align-items:center; gap:2px;
+    background: var(--panel);
+    border:1px solid var(--panel-line);
+    border-radius:999px;
+    padding:5px;
+    box-shadow: 0 10px 30px rgba(0,0,0,.45);
+    z-index: 10;
+  }
+  .switcher button{
+    border:0; background:transparent; color:var(--ink-dim);
+    width:30px; height:30px; border-radius:50%;
+    font-size:14px; cursor:pointer;
+    display:flex; align-items:center; justify-content:center;
+  }
+  .switcher button:hover{ background: var(--panel-line); color:var(--ink); }
+  .switcher button:focus-visible{ outline:2px solid var(--gold); outline-offset:2px; }
+  .switcher .label{
+    font-size:12px; font-weight:600; padding:0 12px;
+    min-width: 168px; text-align:center;
+    color: var(--ink);
+  }
+  .switcher .label small{ display:block; font-weight:400; color:var(--ink-dim); font-size:10px; margin-top:1px; }
+
+  .note{ font-size:12px; color:var(--ink-dim); text-align:center; }
+  .note kbd{ font-family:"IBM Plex Mono",monospace; background:var(--panel); border:1px solid var(--panel-line); border-radius:4px; padding:1px 5px; }
+</style>
+
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Press+Start+2P&display=swap">
+
+<div class="page">
+  <div class="masthead">
+    <span class="eyebrow">Overlay visual design &middot; issue #42</span>
+    <h1>Three ways to lay the decision overlay over Jev's live feed</h1>
+    <p class="brief">Composited entirely inside the browser-source page: the live PyBoy feed (<code class="mono">/video.mjpg</code>) plus Jev's current <b>action</b>, <b>confidence</b>, and <b>milestone</b> split from the JSON snapshot. Cycle variants below &mdash; same mock decision each time.</p>
+  </div>
+
+  <div class="frame-wrap">
+    <div class="frame-chrome">
+      <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+      <span class="url">obs-browser-source&nbsp;&middot;&nbsp;localhost:8000/</span>
+    </div>
+    <div class="gb-screen" id="screen">
+      <span class="gb-watermark"><span class="rec"></span>LIVE &middot; /video.mjpg (mock)</span>
+      <div class="gb-sprite"><div class="head"></div><div class="body"></div></div>
+      <div class="overlay-layer" id="overlay"></div>
+    </div>
+  </div>
+
+  <p class="note">Turn 47 &middot; press <kbd>&larr;</kbd> / <kbd>&rarr;</kbd> or use the arrows below to compare.</p>
+</div>
+
+<div class="switcher" id="switcher">
+  <button id="prev" aria-label="Previous variant">&larr;</button>
+  <div class="label" id="label"></div>
+  <button id="next" aria-label="Next variant">&rarr;</button>
+</div>
+
+<script>
+(function(){
+  var data = {
+    action: "A",
+    confidence: 0.83,
+    milestones: {
+      completed: ["Left starting bedroom", "Received starter Pokémon"],
+      current: "Reach Viridian City",
+      future: ["Defeat Brock (Pewter Gym)", "Cross Mt. Moon", "Defeat Misty (Cerulean Gym)"]
+    }
+  };
+  var pct = Math.round(data.confidence * 100);
+
+  function renderA(){
+    return ''
+      + '<div class="A-hud">'
+      +   '<div class="A-action-row"><span class="A-btn">A</span><span class="A-action">PRESS A</span></div>'
+      +   '<div class="A-bar-row"><div class="A-bar"><i style="width:' + pct + '%"></i></div><span class="A-pct mono">' + pct + '%</span></div>'
+      +   '<div class="A-milestone">&#9656; ' + data.milestones.current + '</div>'
+      +   '<div class="A-caption">' + data.milestones.completed.length + ' done &middot; ' + data.milestones.future.length + ' ahead</div>'
+      + '</div>';
+  }
+
+  function renderB(){
+    var r = 26, c = 2 * Math.PI * r, dash = c * data.confidence;
+    var items = '';
+    data.milestones.completed.forEach(function(m){
+      items += '<li class="done"><span class="B-mark">&#10003;</span>' + m + '</li>';
+    });
+    items += '<li class="now"><span class="B-mark">&#9656;</span>' + data.milestones.current + '</li>';
+    data.milestones.future.forEach(function(m, i){
+      items += '<li><span class="B-mark">' + (i + 1) + '.</span>' + m + '</li>';
+    });
+    return ''
+      + '<div class="B-wrap"><div class="B-sidebar">'
+      +   '<div><span class="B-eyebrow">Now deciding</span><div class="B-action">Press A</div></div>'
+      +   '<div class="B-gauge"><svg viewBox="0 0 60 60">'
+      +     '<circle cx="30" cy="30" r="' + r + '" fill="none" stroke="var(--panel-line)" stroke-width="5"/>'
+      +     '<circle cx="30" cy="30" r="' + r + '" fill="none" stroke="var(--gold)" stroke-width="5" stroke-linecap="round" stroke-dasharray="' + dash + ' ' + c + '"/>'
+      +   '</svg><span class="pct mono">' + pct + '%</span></div>'
+      +   '<hr class="B-hr"/>'
+      +   '<ul class="B-list">' + items + '</ul>'
+      + '</div></div>';
+  }
+
+  function renderC(){
+    var dots = '';
+    data.milestones.completed.forEach(function(){ dots += '<span class="C-dot done"></span><span class="C-line"></span>'; });
+    dots += '<span class="C-dot now"></span>';
+    data.milestones.future.forEach(function(){ dots += '<span class="C-line"></span><span class="C-dot"></span>'; });
+    return ''
+      + '<div class="C-bar">'
+      +   '<div class="C-left"><span class="C-btn">A</span><span class="C-action">PRESS A</span>'
+      +     '<div class="C-meter"><div class="track"><i style="width:' + pct + '%"></i></div><span class="pct mono">' + pct + '%</span></div>'
+      +   '</div>'
+      +   '<div class="C-stepper">' + dots + '<span class="C-now-label">' + data.milestones.current + '</span></div>'
+      + '</div>';
+  }
+
+  var variants = [
+    { key: 'A', name: 'HUD Corner', render: renderA },
+    { key: 'B', name: 'Dossier Sidebar', render: renderB },
+    { key: 'C', name: 'Lower-Third Ticker', render: renderC }
+  ];
+
+  var overlay = document.getElementById('overlay');
+  var label = document.getElementById('label');
+  var idx = 0;
+
+  try {
+    var fromHash = (location.hash || '').replace('#', '').toUpperCase();
+    var found = variants.findIndex(function(v){ return v.key === fromHash; });
+    if (found >= 0) idx = found;
+  } catch (e) {}
+
+  function show(i){
+    idx = (i + variants.length) % variants.length;
+    var v = variants[idx];
+    overlay.innerHTML = v.render();
+    label.innerHTML = v.key + ' &mdash; ' + v.name + '<small>' + (idx + 1) + ' of ' + variants.length + '</small>';
+    try { history.replaceState(null, '', '#' + v.key); } catch (e) {}
+  }
+
+  document.getElementById('prev').addEventListener('click', function(){ show(idx - 1); });
+  document.getElementById('next').addEventListener('click', function(){ show(idx + 1); });
+  document.addEventListener('keydown', function(e){
+    var t = e.target;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+    if (e.key === 'ArrowLeft') show(idx - 1);
+    if (e.key === 'ArrowRight') show(idx + 1);
+  });
+
+  show(idx);
+})();
+</script>
