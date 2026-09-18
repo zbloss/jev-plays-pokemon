@@ -71,6 +71,14 @@ _EVENT_BEAT_CHAMPION_RIVAL = 2305  # Final battle, Champion's Room.
 class MilestoneTarget:
     map_id: int
     map_name: str
+    # Tile-level destination within `map_id`, in the same world coordinates
+    # as `GameState.player_x`/`player_y` - left unset until a milestone's
+    # entry below is extended with a value verified by booting the ROM (see
+    # this module's docstring's "Targets are map-level only" note). A `None`
+    # here tells `navigation.py`'s `resolve_navigation_target` there's
+    # nothing tile-precise to path toward yet.
+    target_x: int | None = None
+    target_y: int | None = None
 
 
 @dataclass(frozen=True)
