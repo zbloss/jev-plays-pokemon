@@ -4,7 +4,7 @@
       "command": "repowise",
       "args": [
         "mcp",
-        "/Users/zbloss/Projects/jev-plays-pokemon",
+        "C:/Users/altoz/Projects/jev-plays-pokemon",
         "--transport",
         "stdio"
       ],
