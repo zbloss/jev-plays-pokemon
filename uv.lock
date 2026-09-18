@@ -322,6 +322,7 @@ dependencies = [
     { name = "openai" },
     { name = "pillow" },
     { name = "pyboy" },
+    { name = "pydantic" },
     { name = "rapidocr" },
     { name = "typesafe-sdk" },
 ]
@@ -340,6 +341,7 @@ requires-dist = [
     { name = "openai", specifier = ">=2.54.0" },
     { name = "pillow", specifier = ">=12.3.0" },
     { name = "pyboy", specifier = "==2.2.0" },
+    { name = "pydantic", specifier = ">=2.13.5" },
     { name = "rapidocr", specifier = ">=3.9.2" },
     { name = "typesafe-sdk", specifier = ">=0.6.0" },
 ]

@@ -10,6 +10,7 @@ dependencies = [
     "openai>=2.54.0",
     "pillow>=12.3.0",
     "pyboy==2.2.0",
+    "pydantic>=2.13.5",
     "rapidocr>=3.9.2",
     "typesafe-sdk>=0.6.0",
 ]

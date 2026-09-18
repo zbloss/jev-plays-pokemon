@@ -7,7 +7,11 @@ action, confidence, and the completed/current/future objective split (#18) -
 over a local HTTP JSON endpoint, so a streaming overlay can follow along.
 
 Chosen shape (per this ticket's "implementer's choice, consistent with
-minimal and read-only"): Python's stdlib ``http.server``, no new dependency.
+minimal and read-only"): Python's stdlib ``http.server`` for transport, no
+web framework; the wire shape a viewer sees is declared once as ``Snapshot``
+below (pydantic was already in the dependency tree via the vision-fallback
+path's ``openai`` SDK, and is now a direct dependency).
+
 The surface is fed through ``decision.run_turn``'s existing ``on_decision``
 seam via ``stream_logger`` below (which also keeps #21's own log line), so
 the surface updates as each new decision is logged, with no change to the
@@ -31,6 +35,8 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+from pydantic import BaseModel, Field
+
 from jev_plays_pokemon.decision import Decision, DecisionLogger, log_decision
 from jev_plays_pokemon.milestones import Milestone
 
@@ -40,8 +46,36 @@ logger = logging.getLogger(__name__)
 SNAPSHOT_PATH = "/"
 
 
-def _serialize_milestone(milestone: Milestone) -> dict[str, str]:
-    return {"id": milestone.milestone_id, "description": milestone.description}
+class MilestoneRef(BaseModel):
+    id: str
+    description: str
+
+
+class MilestoneSplit(BaseModel):
+    """The completed/current/future objective split (#18), as exposed."""
+
+    completed: list[MilestoneRef] = Field(default_factory=list)
+    current: MilestoneRef | None = None
+    future: list[MilestoneRef] = Field(default_factory=list)
+
+
+class Snapshot(BaseModel):
+    """The surface's full wire shape - the contract a stream viewer polls.
+
+    The field defaults *are* the pre-first-decision state: a poller that
+    connects before Jev's first choice sees this same shape, never a
+    different one.
+    """
+
+    decision_count: int = 0
+    updated_at: datetime | None = None
+    action: str | None = None
+    confidence: float | None = None
+    milestones: MilestoneSplit = Field(default_factory=MilestoneSplit)
+
+
+def _serialize_milestone(milestone: Milestone) -> MilestoneRef:
+    return MilestoneRef(id=milestone.milestone_id, description=milestone.description)
 
 
 class StreamSurface:
@@ -58,17 +92,17 @@ class StreamSurface:
         self._lock = threading.Lock()
         self._latest: Decision | None = None
         self._decision_count = 0
-        self._updated_at: str | None = None
+        self._updated_at: datetime | None = None
 
     def record(self, decision: Decision) -> None:
         """Update the exposed state to `decision` - the #21 `on_decision` hook."""
         with self._lock:
             self._latest = decision
             self._decision_count += 1
-            self._updated_at = datetime.now(UTC).isoformat()
+            self._updated_at = datetime.now(UTC)
 
     def snapshot(self) -> dict[str, Any]:
-        """The surface's current state as a JSON-able dict.
+        """The surface's current state as a JSON-able dict (`Snapshot` dumped).
 
         Always the same shape - a poller that connects before the first
         decision gets nulls and empty lists, not a different structure.
@@ -78,32 +112,21 @@ class StreamSurface:
             decision_count = self._decision_count
             updated_at = self._updated_at
         if latest is None:
-            progress = None
-        else:
-            progress = latest.milestone_progress
-        return {
-            "decision_count": decision_count,
-            "updated_at": updated_at,
-            "action": latest.action if latest else None,
-            "confidence": latest.confidence if latest else None,
-            "milestones": {
-                "completed": (
-                    [_serialize_milestone(m) for m in progress.completed]
-                    if progress
-                    else []
+            return Snapshot().model_dump(mode="json")
+        progress = latest.milestone_progress
+        return Snapshot(
+            decision_count=decision_count,
+            updated_at=updated_at,
+            action=latest.action,
+            confidence=latest.confidence,
+            milestones=MilestoneSplit(
+                completed=[_serialize_milestone(m) for m in progress.completed],
+                current=(
+                    _serialize_milestone(progress.current) if progress.current else None
                 ),
-                "current": (
-                    _serialize_milestone(progress.current)
-                    if progress and progress.current
-                    else None
-                ),
-                "future": (
-                    [_serialize_milestone(m) for m in progress.future]
-                    if progress
-                    else []
-                ),
-            },
-        }
+                future=[_serialize_milestone(m) for m in progress.future],
+            ),
+        ).model_dump(mode="json")
 
 
 class _StreamServer(ThreadingHTTPServer):
