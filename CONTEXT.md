@@ -19,6 +19,14 @@ _Avoid_: "answer", "output" (be specific about which primitive)
 The repeating cycle of: read game state → ask Jev a Choice/Score/Noul question over the current legal actions → execute the chosen action. "Tactical" distinguishes this from long-horizon planning/strategy, which Jev does not do on its own.
 _Avoid_: "the agent loop", "the game loop" (both undersell that Jev's role is bounded to one tactical decision at a time)
 
+**Action space**:
+The full set of options Jev may choose from in a tactical decision: the raw Game Boy button presses plus the navigation macro, offered together as one Choice's options. "Current legal actions" (see tactical action-selection loop) is the per-turn subset of this space that's actually selectable.
+_Avoid_: "actions" alone when the full set, as opposed to one turn's legal subset, is meant
+
+**Navigation macro**:
+A single Choice option that walks Jev's character toward whatever target the current-objective milestone tracker is pointing at, using RAM-derived pathfinding executed over multiple emulator frames. Jev decides only whether to invoke it this turn; it takes no destination argument, so it stays a flat Choice option rather than a function-call.
+_Avoid_: "navigate_to" (the reference starter's function name — not reused code, see #9's licensing decision)
+
 **Game state**:
 The structured text description of the current moment in the game that gets handed to Jev as input for a decision. Preferred source is direct extraction from emulator memory (RAM); a vision-model-as-tool-call is the fallback path when reliable RAM extraction isn't available for a given piece of state.
 _Avoid_: "the screen", "the frame" (game state is text handed to Jev, not an image — the image only exists on the vision-fallback path)

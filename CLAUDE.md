@@ -11,3 +11,7 @@ Default canonical labels (`needs-triage`, `needs-info`, `ready-for-agent`, `read
 ### Domain docs
 
 Single-context layout (`CONTEXT.md` + `docs/adr/` at repo root). See `docs/agents/domain.md`.
+
+### Pull Requests
+
+When you complete your work on a branch, open a pull request into main and monitor the PR checks. If any fail, begin debugging them. 
