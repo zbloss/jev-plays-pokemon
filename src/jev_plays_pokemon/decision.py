@@ -28,6 +28,11 @@ seams so it's testable without PyBoy, the ROM, or a real TypeSafe API call
   `make_pyboy_action_executor`, which dispatches to `navigation.
   execute_button`/`execute_navigation_macro`).
 
+Plus one optional seam: `dialog_text_source` (#23's wiring of #19) hands the
+loop's vision-decoded dialog text into Jev's state payload when a dialog is
+open, so `run_turn` stays vision-agnostic and its seam set stays the whole
+per-turn cycle.
+
 `decide_action` is kept separate from `run_turn` so a caller that already
 has a `GameState` for the turn (e.g. sharing one snapshot across several
 systems) can ask Jev without paying for another state read.
@@ -139,6 +144,9 @@ class Decision:
 
 ActionExecutor = Callable[[str], None]
 DecisionLogger = Callable[[Decision], None]
+# The loop's vision-fallback seam (#19): reads a turn's `GameState` and returns
+# the decoded dialog text to offer Jev, or `None`.
+DialogTextSource = Callable[[GameState], "str | None"]
 
 
 def log_decision(decision: Decision) -> None:
@@ -176,9 +184,16 @@ class JevBattleState(BaseModel):
 class JevStatePayload(BaseModel):
     """The `state` argument of `system_one()` - Jev's input contract.
 
-    Deliberately a subset of `GameState` plus the current objective: money,
-    inventory, event flags, `map_id` and party moves/pp are excluded, so
-    this model - not a caller's dict literal - is what says what Jev sees.
+    Deliberately a subset of `GameState` plus the current objective plus the
+    vision-decoded dialog text: money, inventory, event flags, `map_id` and
+    party moves/pp are excluded, so this model - not a caller's dict literal
+    - is what says what Jev sees.
+
+    `dialog_text` is the one vision-sourced field (#19): `GameState` itself
+    stays RAM-only (`dialog_open` only says *that* a dialog is up), so the
+    loop hands the decoded text in alongside the RAM snapshot rather than
+    folding it into `GameState`. `None` whenever no dialog is open, or the
+    dialog is open but the vision fallback isn't configured/failed.
     """
 
     map_name: str
@@ -188,10 +203,13 @@ class JevStatePayload(BaseModel):
     badges: list[str]
     battle: JevBattleState
     dialog_open: bool
+    dialog_text: str | None
     current_objective: str | None
 
 
-def _serialize_state(state: GameState, milestone: Milestone | None) -> dict:
+def _serialize_state(
+    state: GameState, milestone: Milestone | None, dialog_text: str | None
+) -> dict:
     """Build the JSON-able `state` payload handed to `system_one()`."""
     return JevStatePayload(
         map_name=state.map_name,
@@ -215,6 +233,7 @@ def _serialize_state(state: GameState, milestone: Milestone | None) -> dict:
             opponent_level=state.battle.opponent_level,
         ),
         dialog_open=state.dialog_open,
+        dialog_text=dialog_text,
         current_objective=milestone.description if milestone else None,
     ).model_dump(mode="json")
 
@@ -227,7 +246,11 @@ def _build_action_question() -> Choice:
 
 
 def decide_action(
-    jev_client: JevClient, state: GameState, milestone_progress: MilestoneProgress
+    jev_client: JevClient,
+    state: GameState,
+    milestone_progress: MilestoneProgress,
+    *,
+    dialog_text: str | None = None,
 ) -> Decision:
     """Ask Jev a single Choice over the full action space for `state`.
 
@@ -235,9 +258,15 @@ def decide_action(
     action pick is the only judgment this ticket asks for, so there's
     nothing else to batch alongside it yet (see module docstring on
     batching independent judgments into the same call).
+
+    `dialog_text` is the vision-decoded dialog/NPC text (#19) for this turn,
+    handed to Jev in the state payload so it can react to story text RAM
+    can't decode; `None` (the default) when there's none. It's a keyword
+    argument sourced by the caller (`run_turn`'s `dialog_text_source` seam),
+    never read from `state`, keeping `GameState` RAM-only.
     """
     milestone = milestone_progress.current
-    state_payload = _serialize_state(state, milestone)
+    state_payload = _serialize_state(state, milestone, dialog_text)
     result = jev_client.system_one(
         state_payload, {_ACTION_QUESTION_ID: _build_action_question()}
     )
@@ -255,16 +284,28 @@ def run_turn(
     execute_action: ActionExecutor,
     *,
     on_decision: DecisionLogger = log_decision,
+    dialog_text_source: DialogTextSource | None = None,
 ) -> Decision:
     """Run one full turn: read state, ask Jev, act, log - in that order.
 
     The chosen action is executed immediately with no confidence-based
     retry/escalation path, and every decision is logged unconditionally via
     `on_decision` (both per this ticket's MVP scope).
+
+    `dialog_text_source`, when given, is the loop's vision-fallback seam
+    (#19): it's handed the freshly-read `GameState` and returns the decoded
+    dialog text to offer Jev this turn (or `None`). Deciding whether to
+    decode is the source's own trigger - it returns `None` when no dialog is
+    open or the fallback isn't configured - so `run_turn` stays agnostic to
+    how/whether vision is wired, and its own ordering stays the single
+    canonical per-turn cycle (see module docstring).
     """
     state = state_source()
     milestone_progress = track_milestones(state.event_flags, state.badges)
-    decision = decide_action(jev_client, state, milestone_progress)
+    dialog_text = dialog_text_source(state) if dialog_text_source is not None else None
+    decision = decide_action(
+        jev_client, state, milestone_progress, dialog_text=dialog_text
+    )
     execute_action(decision.action)
     on_decision(decision)
     return decision

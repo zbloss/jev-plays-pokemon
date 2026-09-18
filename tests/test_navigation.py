@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 from pyboy import PyBoy
 
+from jev_plays_pokemon.emulator import boot_past_intro
 from jev_plays_pokemon.game_state import extract_game_state
 from jev_plays_pokemon.milestones import Milestone, MilestoneTarget
 from jev_plays_pokemon.navigation import (
@@ -27,53 +28,6 @@ pytestmark = pytest.mark.skipif(
 def _position(pyboy: PyBoy) -> tuple[int, int, int]:
     memory = pyboy.memory
     return (memory[0xD35E], memory[0xD362], memory[0xD361])
-
-
-def _boot_past_intro(pyboy: PyBoy) -> None:
-    """Mash through Pokemon Red's un-skippable boot sequence - title screen,
-    "NEW GAME", and the player/rival naming screens - up to the point the
-    player has full control in their bedroom.
-
-    Gen 1's intro has no shortcut, and no bundled save state exists for this
-    ROM (it's gitignored), so any test that needs a real, controllable game
-    state has to replay a fixed input sequence to get there first. This one
-    is fully deterministic: PyBoy has no real-time-clock dependency this
-    early, since the Pokemon Red cartridge itself has no RTC chip, and this
-    sequence was confirmed to land on the same in-game position across
-    repeated runs against the real ROM while building this ticket.
-
-    The three phases below mirror the three screens Gen 1's intro forces a
-    new save through, reverse-engineered by booting the ROM headless and
-    inspecting rendered frames at each step (see this ticket - nothing else
-    in this repo's RAM-map research needed real gameplay input before it):
-
-    1. mash through the title screen, "NEW GAME", and the player-naming
-       keyboard, up to the rival-naming keyboard;
-    2. mash through the rival-naming keyboard itself - its cursor starts on
-       the "A" key, so this both fills and submits the name "AAAAAA";
-    3. mash through the name confirmation and Oak's closing monologue, which
-       ends with the player standing, controllable, in their bedroom.
-
-    Each phase's button hold has to be a single `PyBoy.tick(n)` call, not a
-    loop of `n` individual `PyBoy.tick(1)` calls: `PyBoy.button`'s `delay`
-    counts *calls* to `tick`, not frames, so spreading the wait across many
-    calls releases the button far earlier than intended (see
-    `navigation.py`'s "Button timing" docstring for the same distinction).
-    """
-    for frame in range(1, 45 * 60 + 1):
-        pyboy.tick(1, False)
-        if frame % 20 == 0:
-            pyboy.button("a", 2)
-        if frame % 41 == 0:
-            pyboy.button("start", 2)
-
-    for _ in range(20):
-        pyboy.button("a", 2)
-        pyboy.tick(20, False)
-
-    for _ in range(21):
-        pyboy.button("a", 3)
-        pyboy.tick(40, False)
 
 
 _HOUSE_EXIT_PATH: tuple[str, ...] = (
@@ -120,7 +74,7 @@ def _walk_out_of_the_house(pyboy: PyBoy) -> None:
 def bedroom_state() -> bytes:
     pyboy = PyBoy(str(ROM_PATH), window="null")
     pyboy.set_emulation_speed(0)
-    _boot_past_intro(pyboy)
+    boot_past_intro(pyboy)
     buf = io.BytesIO()
     pyboy.save_state(buf)
     pyboy.stop(save=False)

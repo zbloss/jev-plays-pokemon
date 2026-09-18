@@ -1,8 +1,14 @@
+import logging
+
 import pytest
 from PIL import Image
 
 from jev_plays_pokemon import dialog_decode
-from jev_plays_pokemon.dialog_decode import DialogDecodeConfigError, load_dialog_decoder
+from jev_plays_pokemon.dialog_decode import (
+    DialogDecodeConfigError,
+    load_dialog_decoder,
+    load_dialog_decoder_or_none,
+)
 from jev_plays_pokemon.dialog_vision import VisionConfigError
 
 _SCREEN = Image.new("RGB", (160, 144), color="white")
@@ -85,3 +91,57 @@ def test_vision_llm_config_errors_still_propagate(monkeypatch):
 
     with pytest.raises(VisionConfigError, match="OPENAI_VISION_MODEL"):
         load_dialog_decoder()
+
+
+# -- load_dialog_decoder_or_none: the loop's "degrade if unconfigured" wrapper --
+
+
+def test_load_or_none_returns_a_decoder_when_the_backend_is_configured(monkeypatch):
+    monkeypatch.delenv("DIALOG_DECODE_BACKEND", raising=False)
+    monkeypatch.setattr(
+        dialog_decode, "load_vision_client_and_model", _fake_vision_client_and_model
+    )
+    monkeypatch.setattr(
+        dialog_decode,
+        "decode_dialog_text",
+        lambda client, model, screen: "ok",
+    )
+
+    decoder = load_dialog_decoder_or_none()
+
+    assert decoder is not None
+    assert decoder(_SCREEN) == "ok"
+
+
+def test_load_or_none_returns_none_when_the_backend_is_unconfigured(
+    monkeypatch, caplog
+):
+    # An unconfigured vision backend is a normal live-run state, not a crash:
+    # the loop should still run, just without dialog text.
+    monkeypatch.delenv("DIALOG_DECODE_BACKEND", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_VISION_MODEL", raising=False)
+
+    with caplog.at_level(logging.WARNING, logger="jev_plays_pokemon.dialog_decode"):
+        assert load_dialog_decoder_or_none() is None
+
+    assert any("not configured" in r.getMessage() for r in caplog.records)
+
+
+def test_load_or_none_returns_none_for_an_unrecognized_backend(monkeypatch):
+    monkeypatch.setenv("DIALOG_DECODE_BACKEND", "tesseract")
+
+    assert load_dialog_decoder_or_none() is None
+
+
+def test_load_or_none_does_not_swallow_a_non_config_error(monkeypatch):
+    # Only the two "not configured" errors are downgraded to None; any other
+    # exception (a real bug) must still propagate rather than be silenced.
+    def explode():
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(dialog_decode, "load_dialog_decoder", explode)
+
+    with pytest.raises(RuntimeError, match="unexpected"):
+        load_dialog_decoder_or_none()
