@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+.repowise
+
+# repowise API keys (local)
+.repowise/.env
+pokemon_red.gb
+.DS_Store
+
+**/**/.DS_Store
