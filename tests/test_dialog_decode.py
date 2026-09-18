@@ -43,7 +43,9 @@ def test_explicit_vision_llm_backend_selects_the_vision_path(monkeypatch):
         dialog_decode, "load_vision_client_and_model", _fake_vision_client_and_model
     )
     monkeypatch.setattr(
-        dialog_decode, "decode_dialog_text", lambda client, model, screen: "vision-result"
+        dialog_decode,
+        "decode_dialog_text",
+        lambda client, model, screen: "vision-result",
     )
 
     decoder = load_dialog_decoder()
