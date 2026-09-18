@@ -15,7 +15,7 @@ from jev_plays_pokemon.decision import (
     make_pyboy_action_executor,
     run_turn,
 )
-from jev_plays_pokemon.game_state import BattleState, GameState
+from jev_plays_pokemon.game_state import BattleState, GameState, PartyPokemon
 from jev_plays_pokemon.milestones import track_milestones
 from jev_plays_pokemon.navigation import NavigationTarget
 
@@ -145,6 +145,68 @@ def test_decide_action_state_payload_reflects_the_current_objective():
 
     ((state_payload, _),) = client.calls
     assert state_payload["current_objective"] == progress.current.description
+
+
+def test_decide_action_state_payload_is_the_documented_jev_input_shape():
+    # The full payload keys are Jev's input contract: this pins the whole
+    # shape, including what must NOT leak (party moves/pp, money, inventory,
+    # event flags, map_id).
+    state = _game_state(
+        party=(
+            PartyPokemon(
+                species="PIKACHU",
+                level=5,
+                hp=21,
+                max_hp=21,
+                status="OK",
+                moves=(169, 45, 163, 0),
+                pp=(30, 30, 15, 0),
+            ),
+        ),
+        money=3000,
+        badges=("BOULDERBADGE",),
+        event_flags=frozenset({34, 57, 37}),
+        battle=BattleState(
+            in_battle=True,
+            battle_type="wild",
+            opponent_species="RATTATA",
+            opponent_level=3,
+        ),
+        dialog_open=True,
+        map_id=45,
+        map_name="Viridian Gym",
+        player_x=4,
+        player_y=6,
+    )
+    client = _FakeJevClient("a", 0.9)
+    progress = track_milestones(state.event_flags, state.badges)
+
+    decide_action(client, state, progress)
+
+    ((state_payload, _),) = client.calls
+    assert state_payload == {
+        "map_name": "Viridian Gym",
+        "player_x": 4,
+        "player_y": 6,
+        "party": [
+            {
+                "species": "PIKACHU",
+                "level": 5,
+                "hp": 21,
+                "max_hp": 21,
+                "status": "OK",
+            }
+        ],
+        "badges": ["BOULDERBADGE"],
+        "battle": {
+            "in_battle": True,
+            "battle_type": "wild",
+            "opponent_species": "RATTATA",
+            "opponent_level": 3,
+        },
+        "dialog_open": True,
+        "current_objective": "Defeat Misty for the Cascade Badge",
+    }
 
 
 def test_decide_action_current_objective_is_none_once_every_milestone_is_complete():

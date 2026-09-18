@@ -39,6 +39,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from pyboy import PyBoy
+from pydantic import BaseModel
 from typesafe_sdk import Choice, JSONContent, TypeSafeClient
 
 from jev_plays_pokemon.game_state import GameState, extract_game_state
@@ -157,32 +158,65 @@ def log_decision(decision: Decision) -> None:
     )
 
 
+class JevPartyMon(BaseModel):
+    species: str
+    level: int
+    hp: int
+    max_hp: int
+    status: str
+
+
+class JevBattleState(BaseModel):
+    in_battle: bool
+    battle_type: str
+    opponent_species: str | None
+    opponent_level: int | None
+
+
+class JevStatePayload(BaseModel):
+    """The `state` argument of `system_one()` - Jev's input contract.
+
+    Deliberately a subset of `GameState` plus the current objective: money,
+    inventory, event flags, `map_id` and party moves/pp are excluded, so
+    this model - not a caller's dict literal - is what says what Jev sees.
+    """
+
+    map_name: str
+    player_x: int
+    player_y: int
+    party: list[JevPartyMon]
+    badges: list[str]
+    battle: JevBattleState
+    dialog_open: bool
+    current_objective: str | None
+
+
 def _serialize_state(state: GameState, milestone: Milestone | None) -> dict:
     """Build the JSON-able `state` payload handed to `system_one()`."""
-    return {
-        "map_name": state.map_name,
-        "player_x": state.player_x,
-        "player_y": state.player_y,
-        "party": [
-            {
-                "species": mon.species,
-                "level": mon.level,
-                "hp": mon.hp,
-                "max_hp": mon.max_hp,
-                "status": mon.status,
-            }
+    return JevStatePayload(
+        map_name=state.map_name,
+        player_x=state.player_x,
+        player_y=state.player_y,
+        party=[
+            JevPartyMon(
+                species=mon.species,
+                level=mon.level,
+                hp=mon.hp,
+                max_hp=mon.max_hp,
+                status=mon.status,
+            )
             for mon in state.party
         ],
-        "badges": list(state.badges),
-        "battle": {
-            "in_battle": state.battle.in_battle,
-            "battle_type": state.battle.battle_type,
-            "opponent_species": state.battle.opponent_species,
-            "opponent_level": state.battle.opponent_level,
-        },
-        "dialog_open": state.dialog_open,
-        "current_objective": milestone.description if milestone else None,
-    }
+        badges=list(state.badges),
+        battle=JevBattleState(
+            in_battle=state.battle.in_battle,
+            battle_type=state.battle.battle_type,
+            opponent_species=state.battle.opponent_species,
+            opponent_level=state.battle.opponent_level,
+        ),
+        dialog_open=state.dialog_open,
+        current_objective=milestone.description if milestone else None,
+    ).model_dump(mode="json")
 
 
 def _build_action_question() -> Choice:
