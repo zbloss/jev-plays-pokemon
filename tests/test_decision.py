@@ -70,6 +70,21 @@ class _FakeJevClient:
         )
 
 
+# The game-state data that completes every milestone in milestones.py: all
+# 8 badges plus the 6 event flags it tracks.
+_ALL_BADGES = (
+    "BOULDERBADGE",
+    "CASCADEBADGE",
+    "THUNDERBADGE",
+    "RAINBOWBADGE",
+    "SOULBADGE",
+    "MARSHBADGE",
+    "VOLCANOBADGE",
+    "EARTHBADGE",
+)
+_ALL_EVENT_FLAGS = frozenset({34, 57, 37, 296, 1372, 2305})
+
+
 def test_decide_action_returns_the_jev_clients_chosen_action_and_confidence():
     client = _FakeJevClient("a", 0.87)
     state = _game_state()
@@ -79,8 +94,8 @@ def test_decide_action_returns_the_jev_clients_chosen_action_and_confidence():
 
     assert decision.action == "a"
     assert decision.confidence == 0.87
-    assert decision.milestone is not None
-    assert decision.milestone.milestone_id == "got_starter"
+    assert decision.milestone_progress.current is not None
+    assert decision.milestone_progress.current.milestone_id == "got_starter"
 
 
 def test_decide_action_issues_exactly_one_system_one_call():
@@ -132,25 +147,14 @@ def test_decide_action_state_payload_reflects_the_current_objective():
     assert state_payload["current_objective"] == progress.current.description
 
 
-def test_decide_action_milestone_is_none_once_every_milestone_is_complete():
-    all_badges = (
-        "BOULDERBADGE",
-        "CASCADEBADGE",
-        "THUNDERBADGE",
-        "RAINBOWBADGE",
-        "SOULBADGE",
-        "MARSHBADGE",
-        "VOLCANOBADGE",
-        "EARTHBADGE",
-    )
-    all_flags = frozenset({34, 57, 37, 296, 1372, 2305})
+def test_decide_action_current_objective_is_none_once_every_milestone_is_complete():
     client = _FakeJevClient("a", 0.9)
-    state = _game_state(event_flags=all_flags, badges=all_badges)
+    state = _game_state(event_flags=_ALL_EVENT_FLAGS, badges=_ALL_BADGES)
     progress = track_milestones(state.event_flags, state.badges)
 
     decision = decide_action(client, state, progress)
 
-    assert decision.milestone is None
+    assert decision.milestone_progress.current is None
 
 
 def test_run_turn_reads_state_asks_jev_executes_and_logs_in_order():
@@ -214,7 +218,8 @@ def test_run_turn_logs_unconditionally_via_the_default_logger(caplog):
 
 
 def test_log_decision_logs_none_milestone_when_progress_is_complete(caplog):
-    decision = Decision(action="a", confidence=0.5, milestone=None)
+    progress = track_milestones(_ALL_EVENT_FLAGS, _ALL_BADGES)
+    decision = Decision(action="a", confidence=0.5, milestone_progress=progress)
 
     with caplog.at_level(logging.INFO, logger="jev_plays_pokemon.decision"):
         log_decision(decision)
