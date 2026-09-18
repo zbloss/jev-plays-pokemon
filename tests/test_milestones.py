@@ -1,4 +1,4 @@
-from jev_plays_pokemon.milestones import track_milestones
+from jev_plays_pokemon.milestones import MilestoneTarget, track_milestones
 
 _EXPECTED_ORDER = (
     "got_starter",
@@ -144,3 +144,21 @@ def test_target_map_advances_with_progress():
     assert progress.current is not None
     assert progress.current.milestone_id == "got_pokedex"
     assert progress.current.target.map_name == "Oaks Lab"
+
+
+def test_scripted_milestones_have_no_verified_tile_target_yet():
+    # None of the 14 scripted milestones has a ROM-verified tile-level
+    # destination yet (see `MilestoneTarget`'s docstring) - `target_x`/
+    # `target_y` default to `None` until one is added and verified.
+    progress = track_milestones(event_flags=frozenset(), badges=())
+
+    assert progress.current is not None
+    assert progress.current.target.target_x is None
+    assert progress.current.target.target_y is None
+
+
+def test_milestone_target_can_carry_a_verified_tile_destination():
+    target = MilestoneTarget(map_id=40, map_name="Oaks Lab", target_x=4, target_y=5)
+
+    assert target.target_x == 4
+    assert target.target_y == 5
