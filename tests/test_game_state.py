@@ -7,6 +7,15 @@ from jev_plays_pokemon.game_state import BattleState, extract_game_state
 
 ROM_PATH = Path(__file__).resolve().parent.parent / "pokemon_red.gb"
 
+# `pokemon_red.gb` is gitignored (redistributing a copyrighted ROM isn't
+# appropriate for a public repo/CI runner), so it only exists in local dev
+# checkouts that added their own copy. These tests run for real against
+# PyBoy + the ROM wherever it's present, and skip (rather than fail) where
+# it's not.
+pytestmark = pytest.mark.skipif(
+    not ROM_PATH.exists(), reason=f"{ROM_PATH} not present locally"
+)
+
 
 @pytest.fixture
 def pyboy():
