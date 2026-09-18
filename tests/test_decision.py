@@ -205,8 +205,64 @@ def test_decide_action_state_payload_is_the_documented_jev_input_shape():
             "opponent_level": 3,
         },
         "dialog_open": True,
+        "dialog_text": None,
         "current_objective": "Defeat Misty for the Cascade Badge",
     }
+
+
+def test_decide_action_hands_the_dialog_text_to_jev_when_given():
+    # #23 wiring: the loop's vision-decoded dialog text (#19) reaches Jev in
+    # the state payload - the one vision-sourced field, kept out of
+    # GameState - so it can react to story text RAM can't decode.
+    client = _FakeJevClient("a", 0.9)
+    state = _game_state(dialog_open=True)
+    progress = track_milestones(state.event_flags, state.badges)
+
+    decide_action(client, state, progress, dialog_text="A WILD RATTATA APPEARED!")
+
+    ((state_payload, _),) = client.calls
+    assert state_payload["dialog_open"] is True
+    assert state_payload["dialog_text"] == "A WILD RATTATA APPEARED!"
+
+
+def test_run_turn_feeds_dialog_text_source_into_the_jev_payload():
+    # run_turn's dialog_text_source seam is handed the freshly-read state and
+    # its return value flows into Jev's payload - the whole #19 -> #21 wiring
+    # exercised without PyBoy, the ROM, or a vision call.
+    state = _game_state(dialog_open=True)
+    client = _FakeJevClient("a", 0.9)
+    seen_states: list[GameState] = []
+
+    def dialog_text_source(read_state: GameState) -> str:
+        seen_states.append(read_state)
+        return "PROF. OAK: WILL YOU CATCH THIS ONE?"
+
+    run_turn(
+        lambda: state,
+        client,
+        lambda action: None,
+        on_decision=lambda decision: None,
+        dialog_text_source=dialog_text_source,
+    )
+
+    assert seen_states == [state]
+    ((state_payload, _),) = client.calls
+    assert state_payload["dialog_text"] == "PROF. OAK: WILL YOU CATCH THIS ONE?"
+
+
+def test_run_turn_without_a_dialog_text_source_leaves_dialog_text_none():
+    client = _FakeJevClient("a", 0.9)
+    state = _game_state(dialog_open=False)
+
+    run_turn(
+        lambda: state,
+        client,
+        lambda action: None,
+        on_decision=lambda decision: None,
+    )
+
+    ((state_payload, _),) = client.calls
+    assert state_payload["dialog_text"] is None
 
 
 def test_decide_action_current_objective_is_none_once_every_milestone_is_complete():

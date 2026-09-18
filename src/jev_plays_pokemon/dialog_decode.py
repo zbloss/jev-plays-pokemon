@@ -18,6 +18,7 @@ Any other value raises `DialogDecodeConfigError` immediately, rather than
 silently falling back to a default.
 """
 
+import logging
 import os
 from collections.abc import Callable
 
@@ -25,9 +26,12 @@ from PIL import Image
 
 from jev_plays_pokemon.dialog_ocr import decode_dialog_text_ocr, load_ocr_engine
 from jev_plays_pokemon.dialog_vision import (
+    VisionConfigError,
     decode_dialog_text,
     load_vision_client_and_model,
 )
+
+logger = logging.getLogger(__name__)
 
 _BACKEND_ENV = "DIALOG_DECODE_BACKEND"
 _VISION_LLM = "vision-llm"
@@ -61,3 +65,25 @@ def load_dialog_decoder() -> DialogDecoder:
         f"{_BACKEND_ENV}={backend!r} is not a recognized dialog-decode "
         f"backend; expected {_VISION_LLM!r} or {_RAPIDOCR!r}."
     )
+
+
+def load_dialog_decoder_or_none() -> DialogDecoder | None:
+    """Build the configured decoder, or ``None`` if it isn't configured.
+
+    The default vision backend raises `VisionConfigError` when
+    `OPENAI_VISION_MODEL` (etc.) aren't set, and `DialogDecodeConfigError` for
+    an unknown `DIALOG_DECODE_BACKEND` - both mean "no dialog decode for this
+    run," a normal state for a loop that doesn't want dialog text yet. Turn
+    those two config errors into `None` (with a warning) so the loop runs
+    without dialog text instead of crashing on startup; any other exception
+    (a real bug) still propagates rather than being silently downgraded. A
+    live run gains dialog text by setting the backend's env vars and restarting.
+    """
+    try:
+        return load_dialog_decoder()
+    except (VisionConfigError, DialogDecodeConfigError):
+        logger.warning(
+            "dialog-decode backend not configured; running without dialog text",
+            exc_info=True,
+        )
+        return None

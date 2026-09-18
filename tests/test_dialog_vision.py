@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import numpy as np
 import pytest
 from PIL import Image
 from pyboy import PyBoy
@@ -141,13 +142,30 @@ def test_load_vision_client_and_model_requires_a_model(monkeypatch):
 # only runs where a local checkout has added its own copy.
 @pytest.mark.skipif(not ROM_PATH.exists(), reason=f"{ROM_PATH} not present locally")
 def test_capture_screen_reads_a_real_rendered_frame_under_the_null_window():
+    # A rendered frame needs a render=True tick: PyBoy leaves screen.ndarray
+    # stale (uniform) under render=False, so capturing before one would hand
+    # the decoder a blank image while still reading the correct size/mode.
     pyboy = PyBoy(str(ROM_PATH), window="null")
     pyboy.set_emulation_speed(0)
-    pyboy.tick(1, False)
+    # Boot forward unrendered (buffer stays stale), then render until a frame
+    # rasterizes real content - Gen 1's intro has blank-white stretches, so a
+    # single fixed frame is not guaranteed to have pixels (see emulator.py's
+    # render_current_frame for why a batched render tick won't render at all).
+    for _ in range(60):
+        pyboy.tick(1, False)
+    screen = None
+    for _ in range(240):
+        pyboy.tick(1, True)
+        candidate = capture_screen(pyboy)
+        if float(np.std(np.asarray(candidate))) > 0.0:
+            screen = candidate
+            break
 
-    screen = capture_screen(pyboy)
-
+    assert screen is not None, (
+        "no rendered frame rasterized content under the null window"
+    )
     assert isinstance(screen, Image.Image)
     assert screen.size == (160, 144)
     assert screen.mode == "RGB"
+    assert float(np.std(np.asarray(screen))) > 0.0
     pyboy.stop(save=False)
