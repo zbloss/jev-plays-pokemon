@@ -18,7 +18,7 @@ API key, no per-call network request. `RapidOCR.__call__` accepts a
 converting it to a numpy array first.
 """
 
-from typing import Protocol
+from typing import Any, Protocol
 
 from PIL import Image
 from rapidocr import RapidOCR
@@ -35,9 +35,19 @@ class OCREngine(Protocol):
     Lets tests exercise this module's response handling against a fake/
     injected engine (per this ticket's test-coverage requirement) without
     loading the real RapidOCR model.
+
+    `RapidOCR.__call__`'s own annotations are narrower than what it accepts:
+    it declares `img_content: str | ndarray | bytes | Path` even though its
+    `LoadImage` step accepts `PIL.Image.Image` too, and returns the union of
+    every dispatch mode's output type even though the default det+cls+rec
+    call always yields a `RapidOCROutput` (which is the only member with
+    `txts`). So no protocol member signature can be both true to this
+    module's usage (PIL image in, `txts` out) and satisfied by the concrete
+    class; the call is typed `Any` and narrowed to `_OCRResult` at the use
+    site instead.
     """
 
-    def __call__(self, img_content: Image.Image) -> _OCRResult: ...
+    def __call__(self, img_content: Any) -> Any: ...
 
 
 def load_ocr_engine() -> RapidOCR:
@@ -57,5 +67,5 @@ def decode_dialog_text_ocr(engine: OCREngine, screen: Image.Image) -> str:
     with newlines to keep the multi-line shape rather than collapsing it to a
     single run-on line.
     """
-    result = engine(screen)
+    result: _OCRResult = engine(screen)
     return "\n".join(result.txts or ()).strip()

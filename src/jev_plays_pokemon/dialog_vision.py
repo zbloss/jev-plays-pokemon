@@ -37,7 +37,8 @@ client per turn.
 import base64
 import io
 import os
-from typing import Protocol
+from collections.abc import Callable, Sequence
+from typing import Any, Protocol
 
 from openai import OpenAI
 from PIL import Image
@@ -66,11 +67,18 @@ class _Choice(Protocol):
 
 class _ChatCompletion(Protocol):
     @property
-    def choices(self) -> list[_Choice]: ...
+    def choices(self) -> Sequence[_Choice]: ...
 
 
 class _Completions(Protocol):
-    def create(self, **kwargs: object) -> _ChatCompletion: ...
+    # A read-only property of `Callable[..., Any]`, not a `create(**kwargs)`
+    # method member: the openai SDK's `create` takes fixed keyword-only params
+    # (plus stream-mode overloads returning `Stream[ChatCompletionChunk]`), so
+    # no concrete `OpenAI` can satisfy an arbitrary-kwargs method member or a
+    # writable attribute member. The response is narrowed to `_ChatCompletion`
+    # at the use site in `decode_dialog_text` instead.
+    @property
+    def create(self) -> Callable[..., Any]: ...
 
 
 class _Chat(Protocol):
@@ -131,7 +139,7 @@ def decode_dialog_text(client: VisionClient, model: str, screen: Image.Image) ->
         "ascii"
     )
 
-    response = client.chat.completions.create(
+    response: _ChatCompletion = client.chat.completions.create(
         model=model,
         messages=[
             {
