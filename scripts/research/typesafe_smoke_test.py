@@ -31,7 +31,7 @@ if not os.environ.get("TYPESAFE_API_KEY"):
         "skipping live smoke test."
     )
 
-from typesafe_sdk import Choice, TypeSafeClient  # noqa: E402
+from typesafe_sdk import Choice, TypeSafeClient
 
 STATE = {
     "screen": "battle",
