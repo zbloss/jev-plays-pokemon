@@ -48,6 +48,7 @@ from pydantic import BaseModel
 from typesafe_sdk import Choice, JSONContent, TypeSafeClient
 
 from jev_plays_pokemon.game_state import GameState, extract_game_state
+from jev_plays_pokemon.lookup.moves import move_name
 from jev_plays_pokemon.milestones import Milestone, MilestoneProgress, track_milestones
 from jev_plays_pokemon.navigation import (
     RAW_BUTTONS,
@@ -166,28 +167,48 @@ def log_decision(decision: Decision) -> None:
     )
 
 
+class JevMove(BaseModel):
+    """A party Pokemon's move slot - name and current PP only.
+
+    Max PP and the PP-Up bonus formula are deliberately excluded: current PP
+    alone is sufficient for legal-move filtering elsewhere (#53's scope).
+    """
+
+    name: str
+    pp: int
+
+
 class JevPartyMon(BaseModel):
     species: str
     level: int
     hp: int
     max_hp: int
     status: str
+    moves: list[JevMove]
 
 
 class JevBattleState(BaseModel):
+    """Opponent state stays species-and-level-only, deliberately: no
+    opponent-HP field, and no new vision-fallback seam for it (#53's scope).
+    """
+
     in_battle: bool
     battle_type: str
     opponent_species: str | None
     opponent_level: int | None
 
 
+class JevInventoryItem(BaseModel):
+    item: str
+    quantity: int
+
+
 class JevStatePayload(BaseModel):
     """The `state` argument of `system_one()` - Jev's input contract.
 
     Deliberately a subset of `GameState` plus the current objective plus the
-    vision-decoded dialog text: money, inventory, event flags, `map_id` and
-    party moves/pp are excluded, so this model - not a caller's dict literal
-    - is what says what Jev sees.
+    vision-decoded dialog text: event flags and `map_id` are excluded, so
+    this model - not a caller's dict literal - is what says what Jev sees.
 
     `dialog_text` is the one vision-sourced field (#19): `GameState` itself
     stays RAM-only (`dialog_open` only says *that* a dialog is up), so the
@@ -200,6 +221,8 @@ class JevStatePayload(BaseModel):
     player_x: int
     player_y: int
     party: list[JevPartyMon]
+    money: int
+    inventory: list[JevInventoryItem]
     badges: list[str]
     battle: JevBattleState
     dialog_open: bool
@@ -222,8 +245,17 @@ def _serialize_state(
                 hp=mon.hp,
                 max_hp=mon.max_hp,
                 status=mon.status,
+                moves=[
+                    JevMove(name=move_name(move_id), pp=pp)
+                    for move_id, pp in zip(mon.moves, mon.pp, strict=True)
+                ],
             )
             for mon in state.party
+        ],
+        money=state.money,
+        inventory=[
+            JevInventoryItem(item=entry.item, quantity=entry.quantity)
+            for entry in state.inventory
         ],
         badges=list(state.badges),
         battle=JevBattleState(
