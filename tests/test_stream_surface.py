@@ -23,6 +23,7 @@ from jev_plays_pokemon.game_state import BattleState, GameState
 from jev_plays_pokemon.milestones import Milestone, MilestoneProgress, MilestoneTarget
 from jev_plays_pokemon.stream_surface import (
     VIDEO_PATH,
+    VIEWER_PATH,
     StreamSurface,
     start_stream_surface_server,
     stream_logger,
@@ -500,6 +501,57 @@ def test_video_route_exposes_no_write_mutation_path():
     try:
         for method in ("POST", "PUT", "PATCH", "DELETE", "HEAD"):
             status, _, _ = _request(server, method=method, path=VIDEO_PATH)
+            assert status == HTTPStatus.METHOD_NOT_ALLOWED, method
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_viewer_route_serves_html_referencing_the_video_feed():
+    surface = StreamSurface()
+    server = start_stream_surface_server(surface)
+    try:
+        status, headers, body = _request(server, path=VIEWER_PATH)
+
+        assert status == HTTPStatus.OK
+        assert headers.get_content_type() == "text/html"
+        html = body.decode()
+        assert VIDEO_PATH in html
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_viewer_route_renders_the_pre_first_decision_default_state():
+    # This ticket's acceptance test: hit /viewer on a fresh StreamSurface
+    # (no decision recorded yet) with a real HTTP request and confirm it
+    # renders successfully, matching Snapshot's own field defaults rather
+    # than erroring or half-populating.
+    surface = StreamSurface()
+    server = start_stream_surface_server(surface)
+    try:
+        status, _headers, body = _request(server, path=VIEWER_PATH)
+
+        assert status == HTTPStatus.OK
+        html = body.decode()
+        assert "Awaiting first decision" in html
+        assert "No current milestone" in html
+        # The default snapshot embedded for the script's initial render
+        # mirrors Snapshot()'s own field defaults exactly.
+        assert "action: null" in html
+        assert "confidence: null" in html
+        assert "completed: [], current: null, future: []" in html
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_viewer_route_exposes_no_write_mutation_path():
+    surface = StreamSurface()
+    server = start_stream_surface_server(surface)
+    try:
+        for method in ("POST", "PUT", "PATCH", "DELETE", "HEAD"):
+            status, _, _ = _request(server, method=method, path=VIEWER_PATH)
             assert status == HTTPStatus.METHOD_NOT_ALLOWED, method
     finally:
         server.shutdown()
