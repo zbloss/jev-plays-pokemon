@@ -20,8 +20,9 @@ tests:
 - ``run_loop`` is the pure per-turn cycle over injected seams; the real
   end-to-end test (``tests/test_main.py``) drives it against a booted ROM with
   a scripted fake Jev client.
-- ``main`` is the production wiring: it boots the ROM, constructs the real Jev
-  and dialog-decode clients, starts the read-only stream surface and its
+- ``main`` is the production wiring: it boots the ROM (resuming from the
+  latest snapshot if one exists - #55), constructs the real Jev and
+  dialog-decode clients, starts the read-only stream surface and its
   frame-capture timer (#51, reading the same live screen the vision fallback
   captures), and runs ``run_loop`` until interrupted.
 
@@ -34,6 +35,7 @@ text is decoded through the separately-configured OpenAI-compatible backend
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
 
 from pyboy import PyBoy
@@ -58,6 +60,16 @@ from jev_plays_pokemon.stream_surface import (
 )
 
 logger = logging.getLogger(__name__)
+
+# The 10-minute time-based save safety net (#55), independent of milestone
+# progress - a run that stalls between milestones for a long stretch still
+# gets a recent snapshot.
+_SAVE_INTERVAL_SECONDS = 600.0
+
+# Distinguishes "no decision has completed yet" from a legitimate observed
+# `MilestoneProgress.current` of `None` (every milestone done) - only the
+# latter is a real transition worth an extra save.
+_MILESTONE_UNOBSERVED = object()
 
 
 def build_dialog_text_source(
@@ -109,6 +121,9 @@ def run_loop(
     on_decision: DecisionLogger,
     dialog_text_source: DialogTextSource | None = None,
     max_turns: int | None = None,
+    save_snapshot: Callable[[], None] | None = None,
+    save_interval_seconds: float = _SAVE_INTERVAL_SECONDS,
+    time_source: Callable[[], float] = time.monotonic,
 ) -> None:
     """Run the per-turn tactical cycle, once per turn, indefinitely or up to ``max_turns``.
 
@@ -119,10 +134,22 @@ def run_loop(
     retry/escalation branch to stall on, per #3's MVP decision). ``max_turns``
     bounds the loop for the end-to-end test; production passes ``None`` and
     runs until interrupted.
+
+    ``save_snapshot`` (#55), when given, is called after a turn whose
+    ``Decision.milestone_progress.current`` differs from the previous turn's
+    (a milestone-completion transition - the very first turn never counts,
+    having no previous turn to transition from) and independently on a fixed
+    ``save_interval_seconds`` time-based safety net; either trigger alone is
+    enough. ``None`` (the default) disables saving entirely - the seam is
+    inert unless a caller opts in. ``time_source`` is a seam over
+    ``time.monotonic`` purely so the safety net is testable without a real
+    wait.
     """
     turns = 0
+    last_milestone_id: object = _MILESTONE_UNOBSERVED
+    last_save_time = time_source()
     while max_turns is None or turns < max_turns:
-        run_turn(
+        decision = run_turn(
             state_source,
             jev_client,
             execute_action,
@@ -130,6 +157,21 @@ def run_loop(
             dialog_text_source=dialog_text_source,
         )
         turns += 1
+
+        if save_snapshot is not None:
+            current = decision.milestone_progress.current
+            current_id = current.milestone_id if current else None
+            milestone_completed = (
+                last_milestone_id is not _MILESTONE_UNOBSERVED
+                and current_id != last_milestone_id
+            )
+            last_milestone_id = current_id
+
+            now = time_source()
+            safety_net_due = now - last_save_time >= save_interval_seconds
+            if milestone_completed or safety_net_due:
+                save_snapshot()
+                last_save_time = now
 
 
 def main(
@@ -154,7 +196,7 @@ def main(
     if jev_client is None:
         jev_client = build_jev_client()
 
-    pyboy = emulator.boot_to_controllable_state(rom_path or emulator.DEFAULT_ROM_PATH)
+    pyboy = emulator.boot_or_resume(rom_path or emulator.DEFAULT_ROM_PATH)
     surface = StreamSurface()
     # `capture_screen` (not `pyboy.screen.image`, which is `None` under this
     # project's `window="null"` backend - see its own docstring) is the same
@@ -175,6 +217,7 @@ def main(
     decoder = load_dialog_decoder_or_none()
     dialog_text_source = build_dialog_text_source(pyboy, decoder)
     execute_action = make_pyboy_action_executor(pyboy)
+    save_snapshot = emulator.make_pyboy_snapshot_saver(pyboy)
 
     try:
         run_loop(
@@ -183,6 +226,7 @@ def main(
             execute_action,
             on_decision=stream_logger(surface),
             dialog_text_source=dialog_text_source,
+            save_snapshot=save_snapshot,
         )
     except KeyboardInterrupt:
         logger.info("interrupted; shutting down")

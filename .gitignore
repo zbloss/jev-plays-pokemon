@@ -222,6 +222,7 @@ __marimo__/
 # repowise API keys (local)
 .repowise/.env
 pokemon_red.gb
+pokemon_red.state
 .DS_Store
 
 **/**/.DS_Store

@@ -207,6 +207,122 @@ def test_run_loop_feeds_the_dialog_text_source_into_jev_each_turn():
     assert [p["dialog_text"] for p in client.state_payloads] == ["text-1", "text-2"]
 
 
+# -- run_loop: snapshot persistence (#55) -------------------------------------
+
+
+def test_run_loop_does_not_save_on_the_very_first_turn():
+    # The first turn has no previous turn to "transition" from, so it never
+    # counts as a milestone completion on its own.
+    client = _ScriptedJevClient([("a", 0.9)])
+    saves: list[None] = []
+
+    run_loop(
+        lambda: _game_state(),
+        client,
+        lambda action: None,
+        on_decision=lambda decision: None,
+        max_turns=1,
+        save_snapshot=lambda: saves.append(None),
+        save_interval_seconds=10_000.0,
+        time_source=lambda: 0.0,
+    )
+
+    assert saves == []
+
+
+def test_run_loop_does_not_save_again_while_the_current_milestone_is_unchanged():
+    client = _ScriptedJevClient([("a", 0.9), ("a", 0.9)])
+    saves: list[None] = []
+
+    run_loop(
+        lambda: _game_state(),  # same milestone ("got_starter") every turn
+        client,
+        lambda action: None,
+        on_decision=lambda decision: None,
+        max_turns=2,
+        save_snapshot=lambda: saves.append(None),
+        save_interval_seconds=10_000.0,
+        time_source=lambda: 0.0,
+    )
+
+    assert saves == []
+
+
+def test_run_loop_saves_when_the_current_milestone_transitions():
+    client = _ScriptedJevClient([("a", 0.9), ("a", 0.9)])
+    saves: list[None] = []
+    # got_starter (turn 1) -> got_oaks_parcel (turn 2, event flag 34 set).
+    states = [_game_state(), _game_state(event_flags=frozenset({34}))]
+    calls = {"count": 0}
+
+    def state_source():
+        state = states[calls["count"]]
+        calls["count"] += 1
+        return state
+
+    run_loop(
+        state_source,
+        client,
+        lambda action: None,
+        on_decision=lambda decision: None,
+        max_turns=2,
+        save_snapshot=lambda: saves.append(None),
+        save_interval_seconds=10_000.0,
+        time_source=lambda: 0.0,
+    )
+
+    assert len(saves) == 1
+
+
+def test_run_loop_saves_on_the_time_based_safety_net_without_a_milestone_change():
+    client = _ScriptedJevClient([("a", 0.9)] * 3)
+    saves: list[None] = []
+    clock = {"now": 0.0}
+
+    def time_source():
+        return clock["now"]
+
+    def state_source():
+        clock["now"] += 2.0  # 2s "elapses" per turn
+        return _game_state()  # same milestone every turn
+
+    run_loop(
+        state_source,
+        client,
+        lambda action: None,
+        on_decision=lambda decision: None,
+        max_turns=3,
+        save_snapshot=lambda: saves.append(None),
+        save_interval_seconds=5.0,  # due once elapsed >= 5s (turn 3, at 6s)
+        time_source=time_source,
+    )
+
+    assert len(saves) == 1
+
+
+def test_run_loop_never_saves_when_no_save_snapshot_seam_is_given():
+    # save_snapshot=None (the default) disables saving entirely - the same
+    # shape every pre-#55 run_loop call already used.
+    client = _ScriptedJevClient([("a", 0.9), ("a", 0.9)])
+    states = [_game_state(), _game_state(event_flags=frozenset({34}))]
+    calls = {"count": 0}
+
+    def state_source():
+        state = states[calls["count"]]
+        calls["count"] += 1
+        return state
+
+    # Would raise if run_loop tried to call None() - passing simply confirms
+    # no attempt is made when a milestone transition happens with no seam.
+    run_loop(
+        state_source,
+        client,
+        lambda action: None,
+        on_decision=lambda decision: None,
+        max_turns=2,
+    )
+
+
 # -- end-to-end: the real per-turn cycle against a booted ROM ------------------
 
 pytestmark_e2e = pytest.mark.skipif(
