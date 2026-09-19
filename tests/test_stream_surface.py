@@ -1,20 +1,28 @@
+import contextlib
 import http.client
+import io
 import json
 import logging
+import re
+import threading
+import time
 from datetime import datetime
 from email.message import Message
 from http import HTTPStatus
 
 import pytest
+from PIL import Image
 
 from jev_plays_pokemon.decision import (
     NAVIGATION_MACRO_ACTION,
     Decision,
     run_turn,
 )
+from jev_plays_pokemon.frame_capture import FrameCapture, start_frame_capture
 from jev_plays_pokemon.game_state import BattleState, GameState
 from jev_plays_pokemon.milestones import Milestone, MilestoneProgress, MilestoneTarget
 from jev_plays_pokemon.stream_surface import (
+    VIDEO_PATH,
     StreamSurface,
     start_stream_surface_server,
     stream_logger,
@@ -184,6 +192,85 @@ def _request(
         connection.close()
 
 
+class _FakeFrameSource:
+    """Call-counting fake standing in for `pyboy.screen.image` (mirrors
+    `test_frame_capture.py`'s own fake) - no real PyBoy anywhere."""
+
+    def __init__(self, frame: Image.Image) -> None:
+        self.frame = frame
+        self.calls = 0
+
+    def __call__(self) -> Image.Image:
+        self.calls += 1
+        return self.frame
+
+
+def _solid_image(color: tuple[int, int, int]) -> Image.Image:
+    return Image.new("RGB", (160, 144), color)
+
+
+_CONTENT_LENGTH_RE = re.compile(rb"Content-Length: (\d+)", re.IGNORECASE)
+
+
+@contextlib.contextmanager
+def _video_connection(server, path: str = VIDEO_PATH, timeout: float = 5):
+    """One real HTTP connection to `path`, closed on exit.
+
+    `/video.mjpg`'s response never ends on its own, so every caller against
+    it - a header-only check or a frame-demultiplexing read - needs the
+    same open/close shape around a possibly-partial read; shared here so
+    that shape exists once.
+    """
+    connection = http.client.HTTPConnection(
+        "127.0.0.1", server.server_address[1], timeout=timeout
+    )
+    try:
+        connection.request("GET", path)
+        yield connection.getresponse()
+    finally:
+        connection.close()
+
+
+def _read_mjpeg_frames(server, count: int, path: str = VIDEO_PATH) -> list[bytes]:
+    """Open one real HTTP connection to `path` and demultiplex `count` parts.
+
+    Reads only as many bytes off the wire as needed to collect `count`
+    frames, then closes the connection - the route's generator loops
+    forever otherwise, so this is what lets a real-HTTP test against it
+    terminate.
+    """
+    with _video_connection(server, path) as response:
+        assert response.status == HTTPStatus.OK
+        boundary = response.headers.get_param("boundary")
+        marker = f"--{boundary}\r\n".encode()
+
+        frames: list[bytes] = []
+        buffer = b""
+        while len(frames) < count:
+            chunk = response.read(4096)
+            if not chunk:
+                break
+            buffer += chunk
+            while len(frames) < count:
+                start = buffer.find(marker)
+                if start == -1:
+                    break
+                rest = buffer[start + len(marker) :]
+                header_end = rest.find(b"\r\n\r\n")
+                if header_end == -1:
+                    break
+                match = _CONTENT_LENGTH_RE.search(rest[:header_end])
+                assert match is not None
+                content_length = int(match.group(1))
+                body_start = header_end + 4
+                body_end = body_start + content_length
+                if len(rest) < body_end + 2:
+                    break
+                frames.append(rest[body_start:body_end])
+                buffer = rest[body_end + 2 :]
+        return frames
+
+
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
 def test_start_fails_fast_when_the_port_is_already_in_use():
     # A bind failure must surface as an exception to the caller, not hang -
@@ -298,6 +385,140 @@ def test_poll_requests_are_logged_at_debug_level(caplog):
             _request(server)
 
         assert any("GET /" in record.getMessage() for record in caplog.records)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_video_route_serves_multipart_x_mixed_replace():
+    surface = StreamSurface()
+    capture = FrameCapture(_FakeFrameSource(_solid_image((10, 20, 30))))
+    capture.capture()
+    server = start_stream_surface_server(surface, frame_capture=capture)
+    try:
+        with _video_connection(server) as response:
+            assert response.status == HTTPStatus.OK
+            assert response.headers.get_content_type() == "multipart/x-mixed-replace"
+            assert response.headers.get_param("boundary") is not None
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_video_route_with_no_frame_capture_starts_but_never_yields_a_frame():
+    # `start_stream_surface_server`'s `frame_capture` is optional - #51 (not
+    # this ticket) wires a real one into `main.py`. Until then the route
+    # must still exist and respond, just with nothing ever cached to yield.
+    surface = StreamSurface()
+    server = start_stream_surface_server(surface)
+    try:
+        with _video_connection(server, timeout=1) as response:
+            assert response.status == HTTPStatus.OK
+            assert response.headers.get_content_type() == "multipart/x-mixed-replace"
+            with pytest.raises(TimeoutError):
+                response.read(1)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_video_route_streams_frames_the_fake_source_produced():
+    # This ticket's real-HTTP acceptance test: start the real FastAPI/uvicorn
+    # app against a frame-capture object wired to a fake source, hit it with
+    # a real HTTP client, and demultiplex the body back into JPEG frames.
+    surface = StreamSurface()
+    source = _FakeFrameSource(_solid_image((200, 30, 90)))
+    capture = FrameCapture(source)
+    capture.capture()
+    server = start_stream_surface_server(surface, frame_capture=capture)
+    try:
+        frames = _read_mjpeg_frames(server, count=2)
+
+        assert len(frames) == 2
+        for frame_bytes in frames:
+            assert frame_bytes == capture.read()
+            decoded = Image.open(io.BytesIO(frame_bytes))
+            decoded.load()
+            assert decoded.size == (160, 144)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_two_concurrent_viewers_never_trigger_extra_capture_or_encode_work():
+    # This ticket's other acceptance criterion, checked against a *real*
+    # background `FrameCaptureTimer` rather than a manually-invoked
+    # `.capture()` - so this actually verifies "the capture object's own
+    # tick rate" (the spec's phrasing), not just that reads never call
+    # `.capture()` in isolation. The timer is stopped before either viewer
+    # connects, freezing the tick count, so the assertion below is exact
+    # rather than a timing-dependent range.
+    surface = StreamSurface()
+    source = _FakeFrameSource(_solid_image((1, 2, 3)))
+    capture = FrameCapture(source)
+    timer = start_frame_capture(capture, interval_seconds=0.01)
+    deadline = time.monotonic() + 5
+    while source.calls < 2 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    timer.stop()
+    ticks_before_viewers = source.calls
+    assert ticks_before_viewers >= 2
+
+    server = start_stream_surface_server(surface, frame_capture=capture)
+    try:
+        results: dict[str, list[bytes]] = {}
+
+        def _collect(key: str) -> None:
+            results[key] = _read_mjpeg_frames(server, count=3)
+
+        readers = [
+            threading.Thread(target=_collect, args=("a",)),
+            threading.Thread(target=_collect, args=("b",)),
+        ]
+        for reader in readers:
+            reader.start()
+        for reader in readers:
+            reader.join(timeout=10)
+
+        assert len(results["a"]) == 3
+        assert len(results["b"]) == 3
+        assert all(frame == capture.read() for frame in results["a"] + results["b"])
+        # Two viewers, each reading 3 frames off two separate connections,
+        # never pushed the tick count past what the (now-stopped) timer had
+        # already produced on its own.
+        assert source.calls == ticks_before_viewers
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_video_route_exposes_no_write_mutation_path():
+    surface = StreamSurface()
+    capture = FrameCapture(_FakeFrameSource(_solid_image((4, 5, 6))))
+    capture.capture()
+    server = start_stream_surface_server(surface, frame_capture=capture)
+    try:
+        for method in ("POST", "PUT", "PATCH", "DELETE", "HEAD"):
+            status, _, _ = _request(server, method=method, path=VIDEO_PATH)
+            assert status == HTTPStatus.METHOD_NOT_ALLOWED, method
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_snapshot_route_is_unaffected_by_the_video_route_existing():
+    surface = StreamSurface()
+    capture = FrameCapture(_FakeFrameSource(_solid_image((7, 8, 9))))
+    capture.capture()
+    server = start_stream_surface_server(surface, frame_capture=capture)
+    try:
+        surface.record(_decision("a", 0.91, (), _milestone("got_starter"), ()))
+        status, headers, body = _request(server)
+
+        served = json.loads(body)
+        assert status == HTTPStatus.OK
+        assert served["action"] == "a"
+        assert headers.get_content_type() == "application/json"
     finally:
         server.shutdown()
         server.server_close()
