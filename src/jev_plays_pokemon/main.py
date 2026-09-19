@@ -24,7 +24,8 @@ tests:
   latest snapshot if one exists - #55), constructs the real Jev and
   dialog-decode clients, starts the read-only stream surface and its
   frame-capture timer (#51, reading the same live screen the vision fallback
-  captures), and runs ``run_loop`` until interrupted.
+  captures), wraps its state/action seams for stuck detection (#57), and
+  runs ``run_loop`` until interrupted.
 
 Like the rest of the package, nothing here reaches TypeSafe for vision or the
 reverse: Jev's Choice goes through the ``typesafe_sdk`` client (#21); dialog
@@ -59,6 +60,7 @@ from jev_plays_pokemon.stream_surface import (
     start_stream_surface_server,
     stream_logger,
 )
+from jev_plays_pokemon.stuck_detection import wrap_for_stuck_detection
 
 logger = logging.getLogger(__name__)
 
@@ -231,9 +233,30 @@ def main(
     execute_action = make_pyboy_action_executor(pyboy)
     save_snapshot = emulator.make_pyboy_snapshot_saver(pyboy)
 
+    def load_snapshot_if_present() -> None:
+        # A stuck escalation before any snapshot has ever been saved has
+        # nothing to reload yet - log and continue rather than crash.
+        if emulator.DEFAULT_SNAPSHOT_PATH.exists():
+            emulator.load_snapshot(pyboy)
+        else:
+            logger.warning(
+                "stuck escalated to a snapshot reload, but no snapshot exists "
+                "yet; continuing without reloading"
+            )
+
+    # A thin wrapper around run_loop's own seams (#57), not a change inside
+    # run_turn: pairs each turn's freshly-read position with the action
+    # run_turn goes on to execute, and injects a nudge/reload as a side
+    # effect when the rolling history says the run is stuck.
+    state_source, execute_action = wrap_for_stuck_detection(
+        lambda: extract_game_state(pyboy),
+        execute_action,
+        load_snapshot=load_snapshot_if_present,
+    )
+
     try:
         run_loop(
-            lambda: extract_game_state(pyboy),
+            state_source,
             jev_client,
             execute_action,
             on_decision=stream_logger(surface),
