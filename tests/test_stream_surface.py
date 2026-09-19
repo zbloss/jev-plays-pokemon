@@ -1,4 +1,5 @@
 import contextlib
+import dataclasses
 import http.client
 import io
 import json
@@ -31,26 +32,25 @@ from jev_plays_pokemon.stream_surface import (
 
 
 def _game_state(**overrides) -> GameState:
-    defaults = {
-        "party": (),
-        "money": 0,
-        "inventory": (),
-        "badges": (),
-        "event_flags": frozenset(),
-        "battle": BattleState(
+    base = GameState(
+        party=(),
+        money=0,
+        inventory=(),
+        badges=(),
+        event_flags=frozenset(),
+        battle=BattleState(
             in_battle=False,
             battle_type="none",
             opponent_species=None,
             opponent_level=None,
         ),
-        "dialog_open": False,
-        "map_id": 40,
-        "map_name": "Oaks Lab",
-        "player_x": 4,
-        "player_y": 5,
-    }
-    defaults.update(overrides)
-    return GameState(**defaults)
+        dialog_open=False,
+        map_id=40,
+        map_name="Oaks Lab",
+        player_x=4,
+        player_y=5,
+    )
+    return dataclasses.replace(base, **overrides)
 
 
 class _FakeChoiceAnswer:

@@ -1,3 +1,5 @@
+import dataclasses
+
 from jev_plays_pokemon.game_state import BattleState, GameState
 from jev_plays_pokemon.stuck_detection import (
     RecoveryTier,
@@ -115,26 +117,25 @@ def test_recovery_policy_honors_a_custom_escalation_threshold():
 
 
 def _game_state(**overrides) -> GameState:
-    defaults = {
-        "party": (),
-        "money": 0,
-        "inventory": (),
-        "badges": (),
-        "event_flags": frozenset(),
-        "battle": BattleState(
+    base = GameState(
+        party=(),
+        money=0,
+        inventory=(),
+        badges=(),
+        event_flags=frozenset(),
+        battle=BattleState(
             in_battle=False,
             battle_type="none",
             opponent_species=None,
             opponent_level=None,
         ),
-        "dialog_open": False,
-        "map_id": 40,
-        "map_name": "Oaks Lab",
-        "player_x": 4,
-        "player_y": 5,
-    }
-    defaults.update(overrides)
-    return GameState(**defaults)
+        dialog_open=False,
+        map_id=40,
+        map_name="Oaks Lab",
+        player_x=4,
+        player_y=5,
+    )
+    return dataclasses.replace(base, **overrides)
 
 
 def test_wrap_pairs_each_turns_position_with_the_action_that_turn_executes():
