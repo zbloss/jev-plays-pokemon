@@ -12,13 +12,15 @@ dependencies = [
     "pillow>=12.3.0",
     "pyboy==2.2.0",
     "pydantic>=2.13.5",
+    "pydantic-settings>=2.15.0",
     "rapidocr>=3.9.2",
+    "typer>=0.27.2",
     "typesafe-sdk>=0.6.0",
     "uvicorn>=0.53.0",
 ]
 
 [project.scripts]
-jev-plays-pokemon = "jev_plays_pokemon.main:cli"
+jev-plays-pokemon = "jev_plays_pokemon.cli:app"
 
 [dependency-groups]
 dev = [
@@ -39,6 +41,9 @@ testpaths = ["tests"]
 
 [tool.ruff]
 src = ["src"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["typer.Option", "typer.Argument"]
 
 [tool.ty.environment]
 root = ["src"]

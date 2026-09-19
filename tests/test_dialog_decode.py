@@ -83,6 +83,52 @@ def test_unrecognized_backend_raises_config_error(monkeypatch):
         load_dialog_decoder()
 
 
+def test_explicit_backend_override_beats_the_environment_variable(monkeypatch):
+    monkeypatch.setenv("DIALOG_DECODE_BACKEND", "vision-llm")
+    monkeypatch.setattr(dialog_decode, "load_ocr_engine", _fake_ocr_engine)
+    monkeypatch.setattr(
+        dialog_decode,
+        "decode_dialog_text_ocr",
+        lambda engine, screen: "ocr-result",
+    )
+
+    decoder = load_dialog_decoder(backend="rapidocr")
+
+    assert decoder(_SCREEN) == "ocr-result"
+
+
+def test_explicit_vision_overrides_are_forwarded_to_load_vision_client_and_model(
+    monkeypatch,
+):
+    captured: dict = {}
+
+    def fake_load_vision_client_and_model(**kwargs):
+        captured.update(kwargs)
+        return _FAKE_CLIENT, "resolved-model"
+
+    monkeypatch.setattr(
+        dialog_decode,
+        "load_vision_client_and_model",
+        fake_load_vision_client_and_model,
+    )
+    monkeypatch.setattr(
+        dialog_decode,
+        "decode_dialog_text",
+        lambda client, model, screen: "ok",
+    )
+
+    decoder = load_dialog_decoder(
+        base_url="http://explicit/v1", api_key="explicit-key", model="explicit-model"
+    )
+
+    assert decoder(_SCREEN) == "ok"
+    assert captured == {
+        "base_url": "http://explicit/v1",
+        "api_key": "explicit-key",
+        "model": "explicit-model",
+    }
+
+
 def test_vision_llm_config_errors_still_propagate(monkeypatch):
     monkeypatch.delenv("DIALOG_DECODE_BACKEND", raising=False)
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
@@ -133,6 +179,22 @@ def test_load_or_none_returns_none_for_an_unrecognized_backend(monkeypatch):
     monkeypatch.setenv("DIALOG_DECODE_BACKEND", "tesseract")
 
     assert load_dialog_decoder_or_none() is None
+
+
+def test_load_or_none_forwards_explicit_overrides_to_load_dialog_decoder(monkeypatch):
+    captured: dict = {}
+
+    def fake_load_dialog_decoder(**kwargs):
+        captured.update(kwargs)
+        return lambda screen: "ok"
+
+    monkeypatch.setattr(dialog_decode, "load_dialog_decoder", fake_load_dialog_decoder)
+
+    decoder = load_dialog_decoder_or_none(backend="rapidocr", model="explicit-model")
+
+    assert decoder is not None
+    assert decoder(_SCREEN) == "ok"
+    assert captured == {"backend": "rapidocr", "model": "explicit-model"}
 
 
 def test_load_or_none_does_not_swallow_a_non_config_error(monkeypatch):

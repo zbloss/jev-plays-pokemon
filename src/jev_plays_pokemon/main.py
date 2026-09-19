@@ -28,6 +28,10 @@ tests:
   runs ``run_loop`` until interrupted - catching (and logging) a crash
   in-process and exiting nonzero, for ``watchdog.py`` (#58) to restart.
 
+The ``jev-plays-pokemon`` console script (``cli.py``, ADR 0001) is what
+actually invokes ``main`` in production; this module has no CLI parsing of
+its own.
+
 Like the rest of the package, nothing here reaches TypeSafe for vision or the
 reverse: Jev's Choice goes through the ``typesafe_sdk`` client (#21); dialog
 text is decoded through the separately-configured OpenAI-compatible backend
@@ -36,7 +40,6 @@ text is decoded through the separately-configured OpenAI-compatible backend
 
 from __future__ import annotations
 
-import argparse
 import logging
 import sys
 import time
@@ -60,6 +63,7 @@ from jev_plays_pokemon.frame_capture import FrameCapture, start_frame_capture
 from jev_plays_pokemon.game_state import GameState, extract_game_state
 from jev_plays_pokemon.rate_limit import RateLimitedJevClient
 from jev_plays_pokemon.resilience import ResilientJevClient
+from jev_plays_pokemon.settings import Settings
 from jev_plays_pokemon.stream_surface import (
     StreamSurface,
     start_stream_surface_server,
@@ -196,6 +200,7 @@ def main(
     stream_port: int = 8080,
     jev_client: JevClient | None = None,
     max_calls_per_second: float | None = None,
+    settings: Settings | None = None,
 ) -> None:
     """Boot the ROM and run the live tactical loop until interrupted.
 
@@ -212,13 +217,20 @@ def main(
     about production behaviour when left unset. Pass a low rate (e.g. ``0.5``
     - one call every two seconds) to investigate a stuck-loop symptom like
     #59's without burning hundreds of real API calls doing it.
+
+    ``settings`` (see :mod:`settings`, ADR 0001) supplies the CLI-/``.env``-
+    resolved ``TYPESAFE_API_KEY``/``OPENAI_*``/``DIALOG_DECODE_BACKEND``
+    overrides; left as ``None`` (e.g. a direct, non-CLI call), a fresh
+    ``Settings()`` is resolved from the environment/``.env`` alone, matching
+    this module's pre-CLI behaviour.
     """
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
+    settings = settings or Settings()
 
     if jev_client is None:
-        jev_client = build_jev_client()
+        jev_client = build_jev_client(api_key=settings.typesafe_api_key)
     if max_calls_per_second is not None:
         jev_client = RateLimitedJevClient(
             jev_client, max_calls_per_second=max_calls_per_second
@@ -250,7 +262,12 @@ def main(
         "stream surface listening on http://127.0.0.1:%d/", server.server_address[1]
     )
 
-    decoder = load_dialog_decoder_or_none()
+    decoder = load_dialog_decoder_or_none(
+        backend=settings.dialog_decode_backend,
+        base_url=settings.openai_base_url,
+        api_key=settings.openai_api_key,
+        model=settings.openai_vision_model,
+    )
     dialog_text_source = build_dialog_text_source(pyboy, decoder)
     execute_action = make_pyboy_action_executor(pyboy)
     save_snapshot = emulator.make_pyboy_snapshot_saver(pyboy)
@@ -312,47 +329,3 @@ def main(
 
     if crashed:
         sys.exit(1)
-
-
-def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "rom_path",
-        nargs="?",
-        default=None,
-        help="passed through to emulator.boot_or_resume",
-    )
-    parser.add_argument(
-        "--max-calls-per-second",
-        type=float,
-        default=None,
-        help=(
-            "Debug mode: cap TypeSafe API calls/sec so a human can watch "
-            "decisions without burning many real calls (e.g. 0.5 = one call "
-            "every 2s). Unset = no limit (production)."
-        ),
-    )
-    parser.add_argument(
-        "--stream-port",
-        type=int,
-        default=8080,
-        help=(
-            "Port for the read-only stream surface (see "
-            "StreamSurface.start_stream_surface_server). Default 8080."
-        ),
-    )
-    return parser.parse_args(argv)
-
-
-def cli(argv: list[str] | None = None) -> None:
-    """Entry point for the ``jev-plays-pokemon`` console script (see pyproject.toml)."""
-    _args = _parse_args(argv)
-    main(
-        _args.rom_path,
-        stream_port=_args.stream_port,
-        max_calls_per_second=_args.max_calls_per_second,
-    )
-
-
-if __name__ == "__main__":
-    cli()

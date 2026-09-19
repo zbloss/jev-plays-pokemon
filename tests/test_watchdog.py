@@ -1,6 +1,11 @@
 import os
+import sys
 
-from jev_plays_pokemon.watchdog import run_watchdog, touch_heartbeat
+from jev_plays_pokemon.watchdog import (
+    run_watchdog,
+    spawn_run_subprocess,
+    touch_heartbeat,
+)
 
 
 def _set_mtime(path, when: float) -> None:
@@ -242,3 +247,85 @@ def test_does_not_restart_while_the_process_is_running_and_the_heartbeat_is_fres
 
     assert len(spawned) == 1
     assert spawned[0].terminated is False
+
+
+# -- spawn_run_subprocess: the ADR 0001 CLI-forwarding seam --
+
+
+def _fake_popen(monkeypatch):
+    calls: list[list[str]] = []
+
+    def fake(args: list[str]) -> object:
+        calls.append(args)
+        return object()
+
+    monkeypatch.setattr("jev_plays_pokemon.watchdog.subprocess.Popen", fake)
+    return calls
+
+
+def test_spawn_run_subprocess_targets_the_cli_run_subcommand(monkeypatch):
+    calls = _fake_popen(monkeypatch)
+
+    spawn_run_subprocess(
+        rom_path=None,
+        stream_port=8080,
+        max_calls_per_second=None,
+    )
+
+    assert calls == [
+        [sys.executable, "-m", "jev_plays_pokemon.cli", "run", "--stream-port", "8080"]
+    ]
+
+
+def test_spawn_run_subprocess_forwards_the_rom_path_and_max_calls_per_second_when_given(
+    monkeypatch,
+):
+    calls = _fake_popen(monkeypatch)
+
+    spawn_run_subprocess(
+        rom_path="custom.gb",
+        stream_port=9090,
+        max_calls_per_second=0.5,
+    )
+
+    assert calls == [
+        [
+            sys.executable,
+            "-m",
+            "jev_plays_pokemon.cli",
+            "run",
+            "--rom-path",
+            "custom.gb",
+            "--stream-port",
+            "9090",
+            "--max-calls-per-second",
+            "0.5",
+        ]
+    ]
+
+
+def test_spawn_run_subprocess_forwards_only_the_given_global_settings(monkeypatch):
+    calls = _fake_popen(monkeypatch)
+
+    spawn_run_subprocess(
+        rom_path=None,
+        stream_port=8080,
+        max_calls_per_second=None,
+        openai_api_key="sk-test",
+        typesafe_api_key="tsk-test",
+    )
+
+    assert calls == [
+        [
+            sys.executable,
+            "-m",
+            "jev_plays_pokemon.cli",
+            "--openai-api-key",
+            "sk-test",
+            "--typesafe-api-key",
+            "tsk-test",
+            "run",
+            "--stream-port",
+            "8080",
+        ]
+    ]

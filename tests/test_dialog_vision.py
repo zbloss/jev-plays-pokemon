@@ -138,6 +138,24 @@ def test_load_vision_client_and_model_requires_a_model(monkeypatch):
         load_vision_client_and_model()
 
 
+def test_load_vision_client_and_model_prefers_explicit_overrides_over_env(
+    monkeypatch,
+):
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://env-endpoint/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "env-key")
+    monkeypatch.setenv("OPENAI_VISION_MODEL", "env-model")
+
+    client, model = load_vision_client_and_model(
+        base_url="http://explicit-endpoint/v1",
+        api_key="explicit-key",
+        model="explicit-model",
+    )
+
+    assert model == "explicit-model"
+    assert str(client.base_url) == "http://explicit-endpoint/v1/"
+    assert client.api_key == "explicit-key"
+
+
 # `pokemon_red.gb` is gitignored (see `tests/test_game_state.py`), so this
 # only runs where a local checkout has added its own copy.
 @pytest.mark.skipif(not ROM_PATH.exists(), reason=f"{ROM_PATH} not present locally")

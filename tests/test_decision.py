@@ -668,3 +668,13 @@ def test_build_jev_client_requires_an_api_key(monkeypatch):
 
     with pytest.raises(TypeSafeError):
         build_jev_client()
+
+
+def test_build_jev_client_prefers_an_explicit_api_key_over_the_environment(
+    monkeypatch,
+):
+    monkeypatch.setenv("TYPESAFE_API_KEY", "sk-env")
+
+    client = build_jev_client(api_key="sk-explicit")
+
+    assert isinstance(client, TypeSafeClient)

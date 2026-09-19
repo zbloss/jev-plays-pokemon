@@ -1,11 +1,15 @@
 """Crash/hang watchdog with heartbeat (#58).
 
 Standalone and dependency-free: this module imports nothing from the rest
-of the package (only the standard library), and runs ``main()`` as a
-*subprocess* (``python -m jev_plays_pokemon.main``) rather than importing
-and calling it in-process - so the watchdog's own reliability never
-couples to whichever project dependency (PyBoy, the TypeSafe SDK, the
-vision backend, ...) might be the thing that's broken.
+of the package (only the standard library), and runs the live loop as a
+*subprocess* (``python -m jev_plays_pokemon.cli run ...``, ADR 0001) rather
+than importing and calling it in-process - so the watchdog's own reliability
+never couples to whichever project dependency (PyBoy, the TypeSafe SDK, the
+vision backend, ...) might be the thing that's broken. ``cli.py``'s
+``watchdog`` subcommand (the only caller of this module's functions from
+inside the CLI) keeps that same isolation one level up: it imports this
+module eagerly (safe - stdlib only) but defers importing ``main``/
+``benchmark`` (which pull in PyBoy et al.) to their own subcommands.
 
 Two-tier handling composes with the rest of #45's reliability work without
 this module depending on either directly:
@@ -32,12 +36,11 @@ to wire.
 
 from __future__ import annotations
 
-import argparse
 import logging
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 
@@ -152,41 +155,45 @@ def run_watchdog(
             return
 
 
-def _spawn_main_subprocess(rom_path: str | None) -> subprocess.Popen:
-    args = [sys.executable, "-m", "jev_plays_pokemon.main"]
+def spawn_run_subprocess(
+    *,
+    rom_path: str | None,
+    stream_port: int,
+    max_calls_per_second: float | None,
+    openai_api_key: str | None = None,
+    openai_base_url: str | None = None,
+    openai_vision_model: str | None = None,
+    dialog_decode_backend: str | None = None,
+    typesafe_api_key: str | None = None,
+) -> subprocess.Popen:
+    """Spawn ``jev-plays-pokemon run`` as a subprocess, forwarding every
+    setting the watchdog itself resolved (ADR 0001) - not just `rom_path` -
+    so a value passed as a CLI flag to the watchdog invocation still reaches
+    the child it spawns. A value that only came from an environment
+    variable/`.env` doesn't need forwarding: the child inherits the same
+    process environment and working directory, and resolves it again on its
+    own.
+
+    Global settings are re-emitted before the ``run`` subcommand name (see
+    `cli.py`), only for the ones that are set - an unset one is simply
+    omitted rather than forwarded as an explicit empty value.
+    """
+    args = [sys.executable, "-m", "jev_plays_pokemon.cli"]
+    global_overrides = {
+        "--openai-api-key": openai_api_key,
+        "--openai-base-url": openai_base_url,
+        "--openai-vision-model": openai_vision_model,
+        "--dialog-decode-backend": dialog_decode_backend,
+        "--typesafe-api-key": typesafe_api_key,
+    }
+    for flag, value in global_overrides.items():
+        if value is not None:
+            args += [flag, value]
+
+    args.append("run")
     if rom_path is not None:
-        args.append(rom_path)
+        args += ["--rom-path", rom_path]
+    args += ["--stream-port", str(stream_port)]
+    if max_calls_per_second is not None:
+        args += ["--max-calls-per-second", str(max_calls_per_second)]
     return subprocess.Popen(args)
-
-
-def main(argv: Sequence[str] | None = None) -> None:
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-    )
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--heartbeat-path", default=str(DEFAULT_HEARTBEAT_PATH))
-    parser.add_argument(
-        "--heartbeat-timeout-seconds",
-        type=float,
-        default=DEFAULT_HEARTBEAT_TIMEOUT_SECONDS,
-    )
-    parser.add_argument(
-        "--poll-interval-seconds", type=float, default=DEFAULT_POLL_INTERVAL_SECONDS
-    )
-    parser.add_argument(
-        "--rom-path",
-        default=None,
-        help="passed through to `python -m jev_plays_pokemon.main`",
-    )
-    args = parser.parse_args(argv)
-
-    run_watchdog(
-        lambda: _spawn_main_subprocess(args.rom_path),
-        heartbeat_path=Path(args.heartbeat_path),
-        heartbeat_timeout_seconds=args.heartbeat_timeout_seconds,
-        poll_interval_seconds=args.poll_interval_seconds,
-    )
-
-
-if __name__ == "__main__":
-    main()
