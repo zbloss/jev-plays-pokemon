@@ -193,7 +193,7 @@ def run_loop(
 def main(
     rom_path: str | None = None,
     *,
-    stream_port: int = 0,
+    stream_port: int = 8080,
     jev_client: JevClient | None = None,
     max_calls_per_second: float | None = None,
 ) -> None:
@@ -332,9 +332,27 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "every 2s). Unset = no limit (production)."
         ),
     )
+    parser.add_argument(
+        "--stream-port",
+        type=int,
+        default=8080,
+        help=(
+            "Port for the read-only stream surface (see "
+            "StreamSurface.start_stream_surface_server). Default 8080."
+        ),
+    )
     return parser.parse_args(argv)
 
 
+def cli(argv: list[str] | None = None) -> None:
+    """Entry point for the ``jev-plays-pokemon`` console script (see pyproject.toml)."""
+    _args = _parse_args(argv)
+    main(
+        _args.rom_path,
+        stream_port=_args.stream_port,
+        max_calls_per_second=_args.max_calls_per_second,
+    )
+
+
 if __name__ == "__main__":
-    _args = _parse_args()
-    main(_args.rom_path, max_calls_per_second=_args.max_calls_per_second)
+    cli()

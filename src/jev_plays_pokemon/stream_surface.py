@@ -462,7 +462,7 @@ _STARTUP_TIMEOUT_SECONDS = 10.0
 def start_stream_surface_server(
     surface: StreamSurface,
     host: str = "127.0.0.1",
-    port: int = 0,
+    port: int = 8000,
     frame_capture: FrameCapture | None = None,
 ) -> StreamSurfaceServer:
     """Serve `surface` over HTTP on its own daemon thread; return the server.

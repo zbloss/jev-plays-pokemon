@@ -17,6 +17,9 @@ dependencies = [
     "uvicorn>=0.53.0",
 ]
 
+[project.scripts]
+jev-plays-pokemon = "jev_plays_pokemon.main:cli"
+
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
