@@ -72,11 +72,11 @@ def build_dialog_text_source(
     None``), so the loop runs unchanged whether or not the vision backend is
     wired up.
 
-    ``render`` is called before capturing the screen because PyBoy only
-    refreshes its screen buffer on a ``render=True`` tick, while the hot loop
-    ticks with ``render=False`` - without it ``capture_screen`` would hand the
-    decoder a stale/blank frame (see ``emulator.render_current_frame``). It is
-    a seam so the ordering can be asserted without a real PyBoy.
+    ``render`` is called before capturing the screen as an explicit guarantee
+    that a frame has been rendered - PyBoy only refreshes its screen buffer on
+    a ``render=True`` tick - regardless of what ticks came before (see
+    ``emulator.render_current_frame``). It is a seam so the ordering can be
+    asserted without a real PyBoy.
 
     Never raises: a decode failure returns ``None`` (with a warning) rather
     than propagating into ``run_turn``, so one bad frame from a flaky or

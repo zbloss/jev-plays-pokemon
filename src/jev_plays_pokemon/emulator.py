@@ -52,15 +52,17 @@ def render_current_frame(pyboy: PyBoy) -> None:
     """Advance one emulator frame with rendering enabled, so screen buffers refresh.
 
     PyBoy 2.2.0 only writes `pyboy.screen.ndarray` on a tick with `render=True`;
-    the entire no-vision hot path (this module's intro-mash, `navigation.
-    execute_button`, the tactical loop) ticks with `render=False` for speed,
-    which leaves the screen buffer stale - verified against the real ROM, after
-    a run of `render=False` ticks `screen.ndarray` is a uniform 255 (std 0.0),
-    and only a `render=True` tick makes it real pixels. So the vision-fallback
-    dialog decode (#19), which reads that buffer via `dialog_vision.
-    capture_screen`, must be preceded by exactly this call, or the decoder is
-    handed a blank white frame instead of the dialog. One extra rendered frame
-    (1/60 s) is negligible and only paid on a turn where a dialog is open.
+    this module's one-time intro-mash (`boot_past_intro`) ticks with
+    `render=False` for speed, which leaves the screen buffer stale right after
+    boot - verified against the real ROM, after a run of `render=False` ticks
+    `screen.ndarray` is a uniform 255 (std 0.0), and only a `render=True` tick
+    makes it real pixels. `navigation.execute_button` (the live per-turn loop)
+    ticks with `render=True` itself (#47), so the buffer is continuously fresh
+    once play starts; this function remains the vision-fallback dialog decode's
+    (#19) explicit guarantee that a frame has been rendered before
+    `dialog_vision.capture_screen` reads it, regardless of what came before. One
+    extra rendered frame (1/60 s) is negligible and only paid on a turn where a
+    dialog is open.
     """
     pyboy.tick(1, True)
 
