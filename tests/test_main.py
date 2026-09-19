@@ -8,6 +8,7 @@ from jev_plays_pokemon.decision import make_pyboy_action_executor
 from jev_plays_pokemon.emulator import DEFAULT_ROM_PATH, boot_to_controllable_state
 from jev_plays_pokemon.game_state import BattleState, GameState, extract_game_state
 from jev_plays_pokemon.main import build_dialog_text_source, run_loop
+from jev_plays_pokemon.resilience import TurnSkipped
 from jev_plays_pokemon.stream_surface import StreamSurface, stream_logger
 
 
@@ -205,6 +206,68 @@ def test_run_loop_feeds_the_dialog_text_source_into_jev_each_turn():
     )
 
     assert [p["dialog_text"] for p in client.state_payloads] == ["text-1", "text-2"]
+
+
+# -- run_loop: skipped turns (#56) ---------------------------------------------
+
+
+def test_run_loop_continues_past_a_turn_the_jev_client_skips():
+    # A JevClient (e.g. a ResilientJevClient with retries exhausted) can
+    # raise TurnSkipped instead of answering - run_turn returns None for
+    # that turn, and run_loop must carry on to the next turn rather than
+    # crashing or stalling.
+    class _FlakyThenFineClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def system_one(self, state, questions):
+            self.calls += 1
+            if self.calls == 1:
+                raise TurnSkipped("retries exhausted")
+            return _FakeSystemOneResult({"action": _FakeChoiceAnswer("a", 0.9)})
+
+    client = _FlakyThenFineClient()
+    executed: list[str] = []
+
+    run_loop(
+        lambda: _game_state(),
+        client,
+        executed.append,
+        on_decision=lambda decision: None,
+        max_turns=2,
+    )
+
+    assert client.calls == 2
+    # Turn 1 was skipped (no action executed); turn 2 executed normally.
+    assert executed == ["a"]
+
+
+def test_run_loop_still_evaluates_the_save_safety_net_on_a_skipped_turn():
+    class _AlwaysSkipsClient:
+        def system_one(self, state, questions):
+            raise TurnSkipped("retries exhausted")
+
+    saves: list[None] = []
+    clock = {"now": 0.0}
+
+    def time_source() -> float:
+        clock["now"] += 6.0  # "6s elapses" every time run_loop checks the clock
+        return clock["now"]
+
+    run_loop(
+        lambda: _game_state(),
+        _AlwaysSkipsClient(),
+        lambda action: None,
+        on_decision=lambda decision: None,
+        max_turns=1,
+        save_snapshot=lambda: saves.append(None),
+        save_interval_seconds=5.0,
+        time_source=time_source,
+    )
+
+    # The turn was skipped, but 6s "elapsed" past the 5s safety-net
+    # threshold, so a save still happens independent of Jev.
+    assert len(saves) == 1
 
 
 # -- run_loop: snapshot persistence (#55) -------------------------------------

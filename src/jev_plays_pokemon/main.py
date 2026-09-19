@@ -53,6 +53,7 @@ from jev_plays_pokemon.dialog_decode import DialogDecoder, load_dialog_decoder_o
 from jev_plays_pokemon.dialog_vision import capture_screen
 from jev_plays_pokemon.frame_capture import FrameCapture, start_frame_capture
 from jev_plays_pokemon.game_state import GameState, extract_game_state
+from jev_plays_pokemon.resilience import ResilientJevClient
 from jev_plays_pokemon.stream_surface import (
     StreamSurface,
     start_stream_surface_server,
@@ -144,6 +145,11 @@ def run_loop(
     inert unless a caller opts in. ``time_source`` is a seam over
     ``time.monotonic`` purely so the safety net is testable without a real
     wait.
+
+    ``run_turn`` returns ``None`` for a turn Jev's retries exhausted (#56,
+    ``resilience.TurnSkipped``) - no action was taken and there's no
+    ``Decision`` to check for a milestone transition, but the time-based
+    safety net is still evaluated for that turn, independent of Jev.
     """
     turns = 0
     last_milestone_id: object = _MILESTONE_UNOBSERVED
@@ -159,13 +165,15 @@ def run_loop(
         turns += 1
 
         if save_snapshot is not None:
-            current = decision.milestone_progress.current
-            current_id = current.milestone_id if current else None
-            milestone_completed = (
-                last_milestone_id is not _MILESTONE_UNOBSERVED
-                and current_id != last_milestone_id
-            )
-            last_milestone_id = current_id
+            milestone_completed = False
+            if decision is not None:
+                current = decision.milestone_progress.current
+                current_id = current.milestone_id if current else None
+                milestone_completed = (
+                    last_milestone_id is not _MILESTONE_UNOBSERVED
+                    and current_id != last_milestone_id
+                )
+                last_milestone_id = current_id
 
             now = time_source()
             safety_net_due = now - last_save_time >= save_interval_seconds
@@ -195,6 +203,10 @@ def main(
 
     if jev_client is None:
         jev_client = build_jev_client()
+    # Wraps whichever client was resolved above (real or caller-supplied) in
+    # retry/backoff handling (#56) - transparent to run_loop/run_turn, which
+    # only ever see the JevClient seam.
+    jev_client = ResilientJevClient(jev_client)
 
     pyboy = emulator.boot_or_resume(rom_path or emulator.DEFAULT_ROM_PATH)
     surface = StreamSurface()

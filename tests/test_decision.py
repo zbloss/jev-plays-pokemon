@@ -24,6 +24,7 @@ from jev_plays_pokemon.game_state import (
 )
 from jev_plays_pokemon.milestones import track_milestones
 from jev_plays_pokemon.navigation import NavigationTarget
+from jev_plays_pokemon.resilience import TurnSkipped
 
 
 def _game_state(**overrides) -> GameState:
@@ -525,6 +526,7 @@ def test_run_turn_reads_state_asks_jev_executes_and_logs_in_order():
     assert events == ["state", "ask", "execute", "log"]
     assert executed == ["a"]
     assert logged == [decision]
+    assert decision is not None
     assert decision.action == "a"
 
 
@@ -552,6 +554,34 @@ def test_run_turn_logs_unconditionally_via_the_default_logger(caplog):
     assert "action=down" in message
     assert "confidence=0.050" in message
     assert "milestone_id=got_starter" in message
+
+
+def test_run_turn_returns_none_and_skips_the_action_when_jev_client_raises_turn_skipped(
+    caplog,
+):
+    # #56: a ResilientJevClient (or any JevClient) signals an exhausted-
+    # retries turn via TurnSkipped - run_turn must not execute an action or
+    # call on_decision for that turn, and must not propagate the exception.
+    state = _game_state()
+    executed: list[str] = []
+    logged: list[Decision] = []
+
+    class _ExhaustedJevClient:
+        def system_one(self, state, questions):
+            raise TurnSkipped("retries exhausted")
+
+    with caplog.at_level(logging.WARNING, logger="jev_plays_pokemon.decision"):
+        decision = run_turn(
+            lambda: state,
+            _ExhaustedJevClient(),
+            executed.append,
+            on_decision=logged.append,
+        )
+
+    assert decision is None
+    assert executed == []
+    assert logged == []
+    assert any("turn skipped" in r.getMessage().lower() for r in caplog.records)
 
 
 def test_log_decision_logs_none_milestone_when_progress_is_complete(caplog):
