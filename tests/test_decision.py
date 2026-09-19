@@ -11,7 +11,6 @@ from jev_plays_pokemon.decision import (
     ACTION_SPACE,
     NAVIGATION_MACRO_ACTION,
     RUN_ACTION,
-    ActionExecutor,
     Decision,
     build_jev_client,
     decide_action,
@@ -632,20 +631,13 @@ def test_pyboy_action_executor_dispatches_a_raw_button_to_press_button():
 # an already-ticked turn deliberately does *not* get a redundant extra one.
 
 
-def _executor_with_render_spy(
-    pyboy: PyBoy, **kwargs: object
-) -> tuple[ActionExecutor, list[object]]:
-    render_calls: list[object] = []
-    execute_action = make_pyboy_action_executor(
-        pyboy, render_frame=lambda pyboy: render_calls.append(pyboy), **kwargs
-    )
-    return execute_action, render_calls
-
-
 def test_pyboy_action_executor_does_not_render_an_extra_frame_after_a_raw_button():
     pyboy = cast(PyBoy, _FakePyBoy())
-    execute_action, render_calls = _executor_with_render_spy(
-        pyboy, press_button=lambda pyboy, button: None
+    render_calls: list[object] = []
+    execute_action = make_pyboy_action_executor(
+        pyboy,
+        render_frame=lambda pyboy: render_calls.append(pyboy),
+        press_button=lambda pyboy, button: None,
     )
 
     execute_action("a")
@@ -657,8 +649,10 @@ def test_pyboy_action_executor_does_not_render_an_extra_frame_when_the_macro_run
     state = _game_state(event_flags=frozenset(), badges=())
     target = NavigationTarget(map_id=40, x=4, y=5)
     pyboy = cast(PyBoy, _FakePyBoy())
-    execute_action, render_calls = _executor_with_render_spy(
+    render_calls: list[object] = []
+    execute_action = make_pyboy_action_executor(
         pyboy,
+        render_frame=lambda pyboy: render_calls.append(pyboy),
         extract_state=lambda pyboy: state,
         resolve_target=lambda milestone: target,
         run_macro=lambda pyboy, t: True,
@@ -672,8 +666,10 @@ def test_pyboy_action_executor_does_not_render_an_extra_frame_when_the_macro_run
 def test_pyboy_action_executor_renders_a_frame_when_the_macro_is_a_noop():
     state = _game_state()
     pyboy = cast(PyBoy, _FakePyBoy())
-    execute_action, render_calls = _executor_with_render_spy(
+    render_calls: list[object] = []
+    execute_action = make_pyboy_action_executor(
         pyboy,
+        render_frame=lambda pyboy: render_calls.append(pyboy),
         extract_state=lambda pyboy: state,
         resolve_target=lambda milestone: None,
     )
@@ -693,8 +689,11 @@ def test_pyboy_action_executor_renders_a_frame_when_a_battle_action_is_a_noop():
         ),
     )
     pyboy = cast(PyBoy, _FakePyBoy())
-    execute_action, render_calls = _executor_with_render_spy(
-        pyboy, extract_state=lambda pyboy: state
+    render_calls: list[object] = []
+    execute_action = make_pyboy_action_executor(
+        pyboy,
+        render_frame=lambda pyboy: render_calls.append(pyboy),
+        extract_state=lambda pyboy: state,
     )
 
     # An unparseable USE_MOVE_ slot is a no-op inside `_execute_battle_action`
