@@ -317,7 +317,10 @@ def main(
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "rom_path", nargs="?", default=None, help="passed through to emulator.boot_or_resume"
+        "rom_path",
+        nargs="?",
+        default=None,
+        help="passed through to emulator.boot_or_resume",
     )
     parser.add_argument(
         "--max-calls-per-second",
