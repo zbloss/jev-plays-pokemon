@@ -69,6 +69,7 @@ from jev_plays_pokemon.rate_limit import RateLimitedJevClient
 from jev_plays_pokemon.resilience import ResilientJevClient
 from jev_plays_pokemon.settings import Settings
 from jev_plays_pokemon.stream_surface import (
+    VIEWER_PATH,
     StreamSurface,
     start_stream_surface_server,
     stream_logger,
@@ -263,7 +264,9 @@ def main(
         surface, port=stream_port, frame_capture=frame_capture
     )
     logger.info(
-        "stream surface listening on http://127.0.0.1:%d/", server.server_address[1]
+        "stream surface viewer at http://127.0.0.1:%d%s",
+        server.server_address[1],
+        VIEWER_PATH,
     )
 
     decoder = load_dialog_decoder_or_none(
