@@ -21,8 +21,9 @@ tests:
   end-to-end test (``tests/test_main.py``) drives it against a booted ROM with
   a scripted fake Jev client.
 - ``main`` is the production wiring: it boots the ROM, constructs the real Jev
-  and dialog-decode clients, starts the read-only stream surface, and runs
-  ``run_loop`` until interrupted.
+  and dialog-decode clients, starts the read-only stream surface and its
+  frame-capture timer (#51, reading the same live screen the vision fallback
+  captures), and runs ``run_loop`` until interrupted.
 
 Like the rest of the package, nothing here reaches TypeSafe for vision or the
 reverse: Jev's Choice goes through the ``typesafe_sdk`` client (#21); dialog
@@ -48,6 +49,7 @@ from jev_plays_pokemon.decision import (
 )
 from jev_plays_pokemon.dialog_decode import DialogDecoder, load_dialog_decoder_or_none
 from jev_plays_pokemon.dialog_vision import capture_screen
+from jev_plays_pokemon.frame_capture import FrameCapture, start_frame_capture
 from jev_plays_pokemon.game_state import GameState, extract_game_state
 from jev_plays_pokemon.stream_surface import (
     StreamSurface,
@@ -154,7 +156,18 @@ def main(
 
     pyboy = emulator.boot_to_controllable_state(rom_path or emulator.DEFAULT_ROM_PATH)
     surface = StreamSurface()
-    server = start_stream_surface_server(surface, port=stream_port)
+    # `capture_screen` (not `pyboy.screen.image`, which is `None` under this
+    # project's `window="null"` backend - see its own docstring) is the same
+    # PIL-Image-from-`ndarray` read `dialog_vision.py` already uses, so
+    # `/video.mjpg` JPEG-encodes the same pixels the vision fallback would
+    # decode. `navigation.execute_button`'s per-turn `render=True` tick (#47)
+    # keeps the buffer continuously fresh once play starts, independent of
+    # this capture timer's own ~10fps pull cadence (#48).
+    frame_capture = FrameCapture(lambda: capture_screen(pyboy))
+    frame_capture_timer = start_frame_capture(frame_capture)
+    server = start_stream_surface_server(
+        surface, port=stream_port, frame_capture=frame_capture
+    )
     logger.info(
         "stream surface listening on http://127.0.0.1:%d/", server.server_address[1]
     )
@@ -176,6 +189,7 @@ def main(
     finally:
         server.shutdown()
         server.server_close()
+        frame_capture_timer.stop()
         pyboy.stop(save=False)
 
 
