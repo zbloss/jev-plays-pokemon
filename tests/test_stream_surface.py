@@ -5,6 +5,8 @@ from datetime import datetime
 from email.message import Message
 from http import HTTPStatus
 
+import pytest
+
 from jev_plays_pokemon.decision import (
     NAVIGATION_MACRO_ACTION,
     Decision,
@@ -182,6 +184,27 @@ def _request(
         connection.close()
 
 
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_start_fails_fast_when_the_port_is_already_in_use():
+    # A bind failure must surface as an exception to the caller, not hang -
+    # `ThreadingHTTPServer`'s bind used to fail synchronously in its
+    # constructor; the uvicorn-backed server binds on a background thread,
+    # so this must be actively detected rather than left to a timeout.
+    # (uvicorn's own background thread also raises `SystemExit` internally
+    # on the failed bind - pytest reports that as an unhandled thread
+    # exception by default; it's the expected shape of this failure, not a
+    # bug, so it's silenced here rather than for the whole suite.)
+    surface = StreamSurface()
+    holder = start_stream_surface_server(surface)
+    try:
+        taken_port = holder.server_address[1]
+        with pytest.raises(RuntimeError):
+            start_stream_surface_server(StreamSurface(), port=taken_port)
+    finally:
+        holder.shutdown()
+        holder.server_close()
+
+
 def test_served_endpoint_returns_the_live_snapshot_as_json():
     surface = StreamSurface()
     server = start_stream_surface_server(surface)
@@ -227,7 +250,7 @@ def test_surface_exposes_no_write_mutation_or_command_path():
 
         for method in ("POST", "PUT", "PATCH", "DELETE", "HEAD"):
             status, _, _ = _request(server, method=method)
-            assert status == HTTPStatus.NOT_IMPLEMENTED, method
+            assert status == HTTPStatus.METHOD_NOT_ALLOWED, method
 
         assert surface.snapshot() == before
     finally:

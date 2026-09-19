@@ -6,35 +6,37 @@ read-only view of the decision core's (#21) latest logged decision - chosen
 action, confidence, and the completed/current/future objective split (#18) -
 over a local HTTP JSON endpoint, so a streaming overlay can follow along.
 
-Chosen shape (per this ticket's "implementer's choice, consistent with
-minimal and read-only"): Python's stdlib ``http.server`` for transport, no
-web framework; the wire shape a viewer sees is declared once as ``Snapshot``
-below (pydantic was already in the dependency tree via the vision-fallback
-path's ``openai`` SDK, and is now a direct dependency).
+The wire shape a viewer sees is declared once as ``Snapshot`` below (pydantic
+was already in the dependency tree via the vision-fallback path's ``openai``
+SDK, and is now a direct dependency). Transport is a FastAPI app served by
+uvicorn on its own background thread; ``/video.mjpg`` and ``/viewer`` (later
+tickets) land on this same app.
 
 The surface is fed through ``decision.run_turn``'s existing ``on_decision``
 seam via ``stream_logger`` below (which also keeps #21's own log line), so
 the surface updates as each new decision is logged, with no change to the
 decision loop itself.
 
-Read-only is structural, not just by convention: the HTTP handler implements
-``do_GET`` only (``http.server`` answers every other method with ``501 Not
-Implemented`` on its own), and the server binds to loopback by default, so
-only a local process - which already has whatever access the machine
-grants - can even see the state, let alone write to it. Nothing read from
-here is ever fed back into ``run_turn``.
+Read-only is structural, not just by convention: only ``GET`` routes are
+defined anywhere on the app, so every other HTTP method against any route -
+including ``HEAD`` on the snapshot route, which FastAPI would otherwise
+answer automatically - is rejected with no mutation path added. The server
+binds to loopback by default, so only a local process - which already has
+whatever access the machine grants - can even see the state, let alone write
+to it. Nothing read from here is ever fed back into ``run_turn``.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import threading
+import time
 from datetime import UTC, datetime
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+import uvicorn
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from jev_plays_pokemon.decision import Decision, DecisionLogger, log_decision
@@ -129,57 +131,97 @@ class StreamSurface:
         ).model_dump(mode="json")
 
 
-class _StreamServer(ThreadingHTTPServer):
-    daemon_threads = True
+def _build_app(surface: StreamSurface) -> FastAPI:
+    app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
 
-    def __init__(self, address: tuple[str, int], surface: StreamSurface) -> None:
-        self.surface = surface
-        super().__init__(address, _ReadOnlyRequestHandler)
+    @app.get(SNAPSHOT_PATH)
+    def get_snapshot() -> JSONResponse:
+        logger.debug("GET %s", SNAPSHOT_PATH)
+        return JSONResponse(
+            content=surface.snapshot(),
+            # Pollers (OBS browser sources included) must never see a
+            # cached stale decision.
+            headers={"Cache-Control": "no-store"},
+        )
+
+    # `@app.get` registers only "GET" against this path (verified: unlike
+    # plain Starlette routes, FastAPI's `APIRoute` does not implicitly add
+    # "HEAD"), so every other method - HEAD included - falls through to
+    # FastAPI's own 405 handling with no extra code here.
+    return app
 
 
-class _ReadOnlyRequestHandler(BaseHTTPRequestHandler):
-    """Serves the snapshot; implements GET only.
+class StreamSurfaceServer:
+    """Handle to the background uvicorn server.
 
-    No do_POST/do_PUT/do_DELETE/... exists, so `BaseHTTPRequestHandler`
-    rejects every other method with 501 on its own - the surface has no
-    write path to misuse.
+    Mirrors the small slice of `http.server`'s server API - `server_address`,
+    `shutdown()`, `server_close()` - that callers (`main.py`, tests) already
+    drive, so the transport swap needed no change on that side.
     """
 
-    server: _StreamServer
+    def __init__(self, server: uvicorn.Server, thread: threading.Thread) -> None:
+        self._server = server
+        self._thread = thread
 
-    def do_GET(self) -> None:
-        if self.path != SNAPSHOT_PATH:
-            self.send_error(HTTPStatus.NOT_FOUND)
-            return
-        body = json.dumps(self.server.surface.snapshot()).encode("utf-8")
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        # Pollers (OBS browser sources included) must never see a cached
-        # stale decision.
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+    @property
+    def server_address(self) -> tuple[str, int]:
+        # `StreamSurfaceServer` is only ever constructed after
+        # `start_stream_surface_server` has observed `server.started`, by
+        # which point uvicorn has populated exactly one bound listener here.
+        sock = self._server.servers[0].sockets[0]
+        return sock.getsockname()[:2]
 
-    def log_message(self, format: str, *args: object) -> None:
-        logger.debug("%s - %s", self.address_string(), format % args)
+    def shutdown(self) -> None:
+        """Stop serving and block until the background thread has exited."""
+        self._server.should_exit = True
+        self._thread.join()
+
+    def server_close(self) -> None:
+        """No-op: `shutdown` above already tears down uvicorn's sockets."""
+
+
+# Bound on how long startup (including a failed bind) is given before
+# `start_stream_surface_server` gives up - `ThreadingHTTPServer`'s bind used
+# to fail synchronously in the constructor; uvicorn's happens on its
+# background thread, so without a bound a failed bind would hang the caller
+# forever instead of raising.
+_STARTUP_TIMEOUT_SECONDS = 10.0
 
 
 def start_stream_surface_server(
     surface: StreamSurface, host: str = "127.0.0.1", port: int = 0
-) -> ThreadingHTTPServer:
+) -> StreamSurfaceServer:
     """Serve `surface` over HTTP on its own daemon thread; return the server.
 
     `port=0` means the OS assigns an ephemeral port - read it back from
     `server.server_address[1]`; pass a fixed port when a stream tool needs a
     stable URL. Shut the surface down with `server.shutdown()` followed by
     `server.server_close()`.
+
+    Raises `RuntimeError` if the server fails to start (e.g. the port is
+    already in use) and `TimeoutError` if it neither starts nor fails within
+    `_STARTUP_TIMEOUT_SECONDS`.
     """
-    server = _StreamServer((host, port), surface)
-    threading.Thread(
-        target=server.serve_forever, name="stream-surface", daemon=True
-    ).start()
-    return server
+    app = _build_app(surface)
+    config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, name="stream-surface", daemon=True)
+    thread.start()
+
+    deadline = time.monotonic() + _STARTUP_TIMEOUT_SECONDS
+    while not server.started:
+        if not thread.is_alive():
+            raise RuntimeError(
+                f"stream surface server failed to start on {host}:{port} "
+                "(the port may already be in use)"
+            )
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                "stream surface server did not start within "
+                f"{_STARTUP_TIMEOUT_SECONDS}s"
+            )
+        time.sleep(0.005)
+    return StreamSurfaceServer(server, thread)
 
 
 def stream_logger(surface: StreamSurface) -> DecisionLogger:
