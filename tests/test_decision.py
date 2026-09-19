@@ -8,6 +8,7 @@ from typesafe_sdk import TypeSafeClient, TypeSafeError
 from jev_plays_pokemon.decision import (
     ACTION_SPACE,
     NAVIGATION_MACRO_ACTION,
+    RUN_ACTION,
     Decision,
     build_jev_client,
     decide_action,
@@ -265,6 +266,167 @@ def test_decide_action_state_payload_omits_no_max_pp_or_opponent_hp_field():
         "opponent_species",
         "opponent_level",
     }
+
+
+def _mon(**overrides) -> PartyPokemon:
+    defaults = {
+        "species": "PIKACHU",
+        "level": 10,
+        "hp": 30,
+        "max_hp": 30,
+        "status": "OK",
+        "moves": (84, 45, 0, 0),  # THUNDERSHOCK, GROWL, empty, empty
+        "pp": (15, 30, 0, 0),
+    }
+    defaults.update(overrides)
+    return PartyPokemon(**defaults)
+
+
+def _battle_criteria(state: GameState) -> dict:
+    """This ticket's dynamic in-battle Choice, read the same way `decide_action`
+    builds it - via a real `system_one()` call against a fake client, not by
+    reaching into `decision.py`'s private helper directly."""
+    client = _FakeJevClient("a", 0.9)
+    progress = track_milestones(state.event_flags, state.badges)
+    decide_action(client, state, progress)
+    ((_, questions),) = client.calls
+    return questions["action"].criteria
+
+
+def test_battle_choice_offers_only_moves_with_a_move_and_remaining_pp():
+    state = _game_state(
+        party=(_mon(moves=(84, 45, 33, 0), pp=(15, 0, 10, 0)),),
+        battle=BattleState(
+            in_battle=True,
+            battle_type="wild",
+            opponent_species="RATTATA",
+            opponent_level=3,
+        ),
+    )
+
+    criteria = _battle_criteria(state)
+
+    # Slot 1 (15 PP) and slot 3 (10 PP) are legal; slot 2 (0 PP) and slot 4
+    # (no move, id 0) are excluded.
+    assert "USE_MOVE_1" in criteria
+    assert "USE_MOVE_3" in criteria
+    assert "USE_MOVE_2" not in criteria
+    assert "USE_MOVE_4" not in criteria
+
+
+def test_battle_choice_offers_one_option_per_distinct_held_item():
+    state = _game_state(
+        party=(_mon(),),
+        inventory=(
+            InventoryItem(item="POTION", quantity=2),
+            InventoryItem(item="OAK's PARCEL", quantity=1),
+        ),
+        battle=BattleState(
+            in_battle=True,
+            battle_type="trainer",
+            opponent_species="RATTATA",
+            opponent_level=3,
+        ),
+    )
+
+    criteria = _battle_criteria(state)
+
+    assert "USE_ITEM_POTION" in criteria
+    assert "USE_ITEM_OAKS_PARCEL" in criteria
+
+
+def test_battle_choice_switch_options_exclude_the_leader_and_fainted_members():
+    state = _game_state(
+        party=(
+            _mon(species="PIKACHU"),
+            _mon(species="CHARMANDER", hp=0),  # fainted - excluded
+            _mon(species="SQUIRTLE", hp=12),  # living, non-active - offered
+        ),
+        battle=BattleState(
+            in_battle=True,
+            battle_type="wild",
+            opponent_species="RATTATA",
+            opponent_level=3,
+        ),
+    )
+
+    criteria = _battle_criteria(state)
+
+    assert "SWITCH_TO_1" not in criteria  # the active leader itself
+    assert "SWITCH_TO_2" not in criteria  # fainted
+    assert "SWITCH_TO_3" in criteria
+
+
+def test_battle_choice_offers_run_in_wild_battles_only():
+    wild = _game_state(
+        party=(_mon(),),
+        battle=BattleState(
+            in_battle=True,
+            battle_type="wild",
+            opponent_species="RATTATA",
+            opponent_level=3,
+        ),
+    )
+    trainer = _game_state(
+        party=(_mon(),),
+        battle=BattleState(
+            in_battle=True,
+            battle_type="trainer",
+            opponent_species="RATTATA",
+            opponent_level=3,
+        ),
+    )
+
+    assert RUN_ACTION in _battle_criteria(wild)
+    assert RUN_ACTION not in _battle_criteria(trainer)
+
+
+def test_battle_choice_forced_switch_on_faint_offers_only_living_switch_targets():
+    # The active leader has fainted (hp == 0) - Gen 1 forces a switch with no
+    # other menu options, handled by this same battle macro rather than
+    # stuck detection.
+    state = _game_state(
+        party=(
+            _mon(species="PIKACHU", hp=0),
+            _mon(species="SQUIRTLE", hp=12),
+        ),
+        inventory=(InventoryItem(item="POTION", quantity=2),),
+        battle=BattleState(
+            in_battle=True,
+            battle_type="wild",
+            opponent_species="RATTATA",
+            opponent_level=3,
+        ),
+    )
+
+    criteria = _battle_criteria(state)
+
+    assert criteria == {"SWITCH_TO_2": "Switch in SQUIRTLE (Lv.10)"}
+
+
+def test_battle_choice_replaces_rather_than_extends_the_static_action_space():
+    state = _game_state(
+        party=(_mon(),),
+        battle=BattleState(
+            in_battle=True,
+            battle_type="wild",
+            opponent_species="RATTATA",
+            opponent_level=3,
+        ),
+    )
+
+    criteria = _battle_criteria(state)
+
+    assert "up" not in criteria
+    assert NAVIGATION_MACRO_ACTION not in criteria
+
+
+def test_out_of_battle_choice_is_unchanged_by_battle_action_space_support():
+    state = _game_state()  # battle.in_battle is False by default
+
+    criteria = _battle_criteria(state)
+
+    assert set(criteria.keys()) == set(ACTION_SPACE)
 
 
 def test_decide_action_hands_the_dialog_text_to_jev_when_given():
