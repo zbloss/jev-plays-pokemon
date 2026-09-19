@@ -318,6 +318,201 @@ def test_walking_to_oaks_lab_starter_table_reaches_a_rom_verified_tile(pyboy_out
     assert dialog_opened
 
 
+# #99: per-milestone boot verification, batch 1 (parent #96). Unlike
+# got_starter's single fixed button tuple above, these targets sit past
+# Pallet Town, so reaching them drives the navigation macro itself
+# (`_walk_toward`) rather than hand-recording a raw button sequence - the
+# on-screen A* already re-plans around real obstacles each step, and a
+# fixed tuple would be far more brittle over this much distance.
+
+_EVENT_FLAGS_START_ADDRESS = 0xD747  # matches game_state.py's own constant
+_EVENT_FOLLOWED_OAK_INTO_LAB_BIT = 0  # pret/pokered's event_constants.asm
+_GRASS_RATE_ADDRESS = 0xD887  # wGrassRate, right after wEventFlags's 320
+# bytes (0xD747 + flag_array(2560 events) == 0xD887) - re-derives the
+# already-verified 0xD747/0xD886 pair from a different anchor, cross-
+# checking the byte-counted offset chain below it.
+_WATER_RATE_ADDRESS = 0xD8A4  # wGrassRate(1) + wGrassMons(20) + `ds 8`
+_VIRIDIAN_MART_CUR_SCRIPT_ADDRESS = 0xD60D  # wViridianMartCurScript; byte-
+# counted the same way from wCurMap (0xD35E, ram/wram.asm's "Main Data"
+# section) through to ram/wram.asm's "Game Progress Flags" CurScript
+# block - the chain reproduces wObtainedBadges (0xD356) and wEventFlags
+# (0xD747) exactly, both already independently verified in this repo.
+_SCRIPT_VIRIDIANMART_NOOP = 2
+
+_DIALOG_TEXT_ROW = 14
+_DIALOG_TEXT_BLANK_TILE = 383
+_DIALOG_TEXT_COLUMNS = range(1, 19)
+
+
+def _bypass_oaks_route_1_interception(pyboy: PyBoy) -> None:
+    """Sets pret/pokered's EVENT_FOLLOWED_OAK_INTO_LAB directly rather than
+    playing through Oak's mandatory Route 1 interception scripts/
+    PalletTown.asm's `PalletTownDefaultScript` gates the entire scene on
+    it. Without this flag (or actually playing the scene, as
+    `test_walking_to_oaks_lab_oak1_reaches_a_rom_verified_tile` below
+    does, since that milestone needs the scene's side effects), Oak
+    physically blocks Route 1 - no milestone past Pallet Town is
+    reachable at all - which is exactly the kind of prerequisite story
+    state this issue says to set directly rather than play through.
+    """
+    pyboy.memory[_EVENT_FLAGS_START_ADDRESS] |= 1 << _EVENT_FOLLOWED_OAK_INTO_LAB_BIT
+
+
+def _disable_wild_encounters(pyboy: PyBoy) -> None:
+    """Zeroes wGrassRate/wWaterRate: pret/pokered's
+    `engine/battle/wild_encounters.asm` (`TryDoWildEncounter`) only starts
+    a wild battle if a random byte comes up less than this rate, so 0
+    means never. The engine reloads each map's own real rate on every
+    map transition, so this needs reapplying after crossing into a new
+    map, not just once. A random wild encounter partway through one of
+    these walks isn't part of what the test below is checking, and would
+    turn an otherwise-deterministic route flaky.
+    """
+    pyboy.memory[_GRASS_RATE_ADDRESS] = 0
+    pyboy.memory[_WATER_RATE_ADDRESS] = 0
+
+
+def _walk_toward(pyboy: PyBoy, x: int, y: int, max_calls: int = 20) -> None:
+    """Drives the navigation macro toward `(x, y)` on the player's current
+    map, calling `execute_navigation_macro` repeatedly (it only takes one
+    step, or a short run, per call) until it arrives, stops making
+    progress (a real obstacle its on-screen A* can't route around, or a
+    map transition happened mid-step), or `max_calls` is exhausted.
+    """
+    for _ in range(max_calls):
+        state = extract_game_state(pyboy)
+        if (state.player_x, state.player_y) == (x, y):
+            return
+        target = NavigationTarget(map_id=state.map_id, x=x, y=y)
+        if not execute_navigation_macro(pyboy, target):
+            return
+
+
+def _cross_map_edge(pyboy: PyBoy, direction: str, max_presses: int = 5) -> None:
+    """Presses `direction` until the player's `map_id` changes - crossing a
+    map-edge connection or walking through a door - then settles a few
+    extra frames (see `rom-verification-method.md`'s post-warp gotcha: a
+    position read immediately after a transition can be stale) and
+    reapplies `_disable_wild_encounters` (the new map just reloaded its
+    own real rate).
+    """
+    start_map = extract_game_state(pyboy).map_id
+    for _ in range(max_presses):
+        execute_button(pyboy, direction)
+        if extract_game_state(pyboy).map_id != start_map:
+            break
+    pyboy.tick(90, True)
+    _disable_wild_encounters(pyboy)
+
+
+def _dialog_text_visible(pyboy: PyBoy) -> bool:
+    """A broader "is a dialog box actually showing text" check than
+    `GameState.dialog_open`'s continuation-arrow test. Verified (frame-by-
+    frame tilemap scan across 400 real frames) that Gen 1's plain,
+    single-page `<DONE>`-terminated NPC lines - e.g. Viridian Mart's
+    COOLTRAINER_M, "No! POTIONs are all sold out." - never draw the
+    arrow tile `dialog_open` looks for at all, even though the box still
+    doesn't close until a button is pressed; only longer/multi-page
+    dialogs (like the starter table's, above) do. This instead checks
+    the dialog text row for anything other than the blank tile, which
+    both styles share, so it still confirms interactivity for a tile
+    whose real text happens to be a one-page remark.
+    """
+    tilemap = pyboy.tilemap_window
+    return any(
+        tilemap[col, _DIALOG_TEXT_ROW] != _DIALOG_TEXT_BLANK_TILE
+        for col in _DIALOG_TEXT_COLUMNS
+    )
+
+
+def test_walking_to_oaks_lab_oak1_reaches_a_rom_verified_tile(pyboy_outdoors):
+    """#99's boot verification for the `got_pokedex` milestone: Oak's Lab's
+    OAKSLAB_OAK1 object (`milestone_targets.py`), map 40 tile (5, 2).
+
+    OAK1 only becomes a real, present sprite once Oak's own Route 1
+    interception scene has played out (`pret/pokered`'s `OaksLab.asm`:
+    `OaksLabDefaultScript` gates showing him at all on
+    `EVENT_OAK_APPEARED_IN_PALLET`, which that scene sets) - unlike
+    `got_oaks_parcel`'s test below, this milestone's own target tile
+    depends on that scene's side effects, so it's played out for real
+    here (walking toward Route 1's trigger tile is enough; Oak takes
+    over from there) rather than bypassed.
+    """
+    _walk_toward(pyboy_outdoors, 10, 1)
+    pyboy_outdoors.tick(60, True)
+    for _ in range(15):
+        execute_button(pyboy_outdoors, "a")
+    pyboy_outdoors.tick(90, True)
+    for _ in range(15):
+        execute_button(pyboy_outdoors, "a")
+    pyboy_outdoors.tick(90, True)
+    for _ in range(50):
+        execute_button(pyboy_outdoors, "a")
+
+    assert extract_game_state(pyboy_outdoors).map_id == 40  # Oak's Lab
+
+    _walk_toward(pyboy_outdoors, 5, 2)
+
+    pyboy_outdoors.button("a", 2)
+    dialog_opened = False
+    for _ in range(10):
+        pyboy_outdoors.tick(30, True)
+        if extract_game_state(pyboy_outdoors).dialog_open:
+            dialog_opened = True
+            break
+    assert dialog_opened
+
+
+_TO_VIRIDIAN_MART_DOOR_PATH: tuple[str, ...] = ("down", "right", "right", "up")
+
+
+def test_walking_to_viridian_mart_cooltrainer_reaches_a_rom_verified_tile(pyboy_outdoors):
+    """#99's boot verification for the `got_oaks_parcel` milestone: Viridian
+    Mart's VIRIDIANMART_COOLTRAINER_M object (`milestone_targets.py`), map
+    42 tile (3, 3).
+
+    Two pieces of prerequisite story state are set directly rather than
+    played through, per this issue's own guidance:
+    - `_bypass_oaks_route_1_interception` - this milestone has nothing to
+      do with Oak's scene (unlike `got_pokedex`, above).
+    - `wViridianMartCurScript` set to its own NOOP step - the mart's
+      script (`pret/pokered`'s `ViridianMart.asm`) otherwise auto-fires
+      an unskippable "you came from Pallet Town... here, take OAK's
+      PARCEL" cutscene the instant the map loads, regardless of which
+      tile the player ever stands on or interacts with - independent of
+      what this test is checking (COOLTRAINER_M's own interactivity).
+    """
+    _bypass_oaks_route_1_interception(pyboy_outdoors)
+    _disable_wild_encounters(pyboy_outdoors)
+    pyboy_outdoors.memory[_VIRIDIAN_MART_CUR_SCRIPT_ADDRESS] = _SCRIPT_VIRIDIANMART_NOOP
+
+    _walk_toward(pyboy_outdoors, 10, 1)
+    _cross_map_edge(pyboy_outdoors, "up")
+    assert extract_game_state(pyboy_outdoors).map_id == 12  # Route 1
+
+    _walk_toward(pyboy_outdoors, 12, 0)
+    _cross_map_edge(pyboy_outdoors, "up")
+    assert extract_game_state(pyboy_outdoors).map_id == 1  # Viridian City
+
+    _walk_toward(pyboy_outdoors, 29, 19)
+    for direction in _TO_VIRIDIAN_MART_DOOR_PATH:
+        execute_button(pyboy_outdoors, direction)
+    pyboy_outdoors.tick(90, True)
+
+    assert extract_game_state(pyboy_outdoors).map_id == 42  # Viridian Mart
+
+    _walk_toward(pyboy_outdoors, 3, 3)
+
+    pyboy_outdoors.button("a", 2)
+    dialog_visible = False
+    for _ in range(10):
+        pyboy_outdoors.tick(30, True)
+        if _dialog_text_visible(pyboy_outdoors):
+            dialog_visible = True
+            break
+    assert dialog_visible
+
+
 def _milestone(target_x: int | None = None, target_y: int | None = None) -> Milestone:
     return Milestone(
         milestone_id="test_milestone",
