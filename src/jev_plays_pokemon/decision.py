@@ -4,7 +4,11 @@ Implements #21, part of #14's MVP tactical action-selection loop: the
 decision core that asks Jev (TypeSafe's System One model) a single Choice
 per turn over the flat action space - raw Game Boy button presses
 (`navigation.RAW_BUTTONS`) plus the navigation macro (`navigation.py`, #20)
-- and acts on the result immediately, regardless of confidence.
+outside battle - and acts on the result immediately, regardless of
+confidence. While `GameState.battle.in_battle` is true, the Choice swaps to
+the dynamic battle action space instead (#54, `_battle_action_criteria`):
+`USE_MOVE_<slot>` / `USE_ITEM_<item>` / `SWITCH_TO_<slot>` / `RUN`, built
+fresh each turn and filtered to legal options only.
 
 Per the TypeSafe SDK research (`docs/research/typesafe-sdk-integration.md`,
 #6) and #3's MVP decision: one `system_one()` call per turn, the action pick
@@ -39,6 +43,7 @@ systems) can ask Jev without paying for another state read.
 """
 
 import logging
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Protocol
@@ -81,6 +86,86 @@ _ACTION_CRITERIA: dict[str, str] = {
         "choosing a single directional button yourself"
     ),
 }
+
+# In-battle Choice option prefixes/keys (#54): built fresh each turn from
+# `GameState`, filtered to legal options only - replacing `_ACTION_CRITERIA`
+# for the duration of the battle rather than extending it, since raw
+# movement buttons and the navigation macro aren't legal battle actions.
+_USE_MOVE_PREFIX = "USE_MOVE_"
+_USE_ITEM_PREFIX = "USE_ITEM_"
+_SWITCH_TO_PREFIX = "SWITCH_TO_"
+RUN_ACTION = "RUN"
+
+# This project's active-battle-slot convention: the party leader
+# (`state.party[0]`) is always treated as the Pokemon currently in battle.
+# Gen 1's real active-party-index isn't separately tracked by `game_state.py`
+# (see its RAM-map research doc), so this is what "party-leader move slot"
+# and "the active party slot's hp == 0" (this ticket's forced-switch check)
+# both mean in practice.
+_ACTIVE_PARTY_SLOT = 1
+
+
+def _sanitize_action_token(text: str) -> str:
+    """Turn a free-form display name into an ASCII, underscore-joined token.
+
+    Apostrophes and periods are dropped rather than replaced (`"OAK's
+    PARCEL"` -> `"OAKS_PARCEL"`, not `"OAK_S_PARCEL"`); every other
+    non-alphanumeric run (spaces, non-ASCII glyphs like the `é` in `"POKé
+    BALL"`, ...) becomes a single underscore.
+    """
+    stripped = text.replace("'", "").replace(".", "")
+    return re.sub(r"[^A-Za-z0-9]+", "_", stripped).strip("_").upper()
+
+
+def _battle_action_criteria(state: GameState) -> dict[str, str]:
+    """Build this turn's in-battle Choice options, filtered to legal ones only.
+
+    - `USE_MOVE_<slot>`: one per party-leader move slot (1-indexed) with a
+      non-empty move and current PP > 0.
+    - `USE_ITEM_<item>`: one per distinct held item (Red's bag has no
+      duplicate stacks, so the sanitized item name alone is a unique key).
+    - `SWITCH_TO_<slot>`: one per living (`hp > 0`), non-active party member,
+      keyed by its 1-indexed position in `state.party` (not species, to
+      avoid collisions between same-species party members).
+    - `RUN`: wild battles only, never trainer battles.
+
+    The Gen 1 forced-switch-on-faint state (the active slot's `hp == 0`) is
+    handled here, not routed through stuck detection: with the leader
+    fainted, using a move/item or running isn't a legal menu option in the
+    real game, so only `SWITCH_TO_<slot>` options are offered.
+    """
+    leader = state.party[0] if state.party else None
+    forced_switch = leader is not None and leader.hp <= 0
+
+    criteria: dict[str, str] = {}
+
+    if not forced_switch:
+        if leader is not None:
+            for slot, (move_id, pp) in enumerate(
+                zip(leader.moves, leader.pp, strict=True), start=1
+            ):
+                if move_id == 0 or pp <= 0:
+                    continue
+                criteria[f"{_USE_MOVE_PREFIX}{slot}"] = (
+                    f"Use {move_name(move_id)} ({pp} PP left)"
+                )
+
+        for item in state.inventory:
+            key = f"{_USE_ITEM_PREFIX}{_sanitize_action_token(item.item)}"
+            criteria[key] = f"Use {item.item} (have {item.quantity})"
+
+    for slot, mon in enumerate(state.party, start=1):
+        if slot == _ACTIVE_PARTY_SLOT or mon.hp <= 0:
+            continue
+        criteria[f"{_SWITCH_TO_PREFIX}{slot}"] = (
+            f"Switch in {mon.species} (Lv.{mon.level})"
+        )
+
+    if not forced_switch and state.battle.battle_type == "wild":
+        criteria[RUN_ACTION] = "Run from this wild battle"
+
+    return criteria
+
 
 _ACTION_QUESTION_ID = "action"
 
@@ -270,7 +355,16 @@ def _serialize_state(
     ).model_dump(mode="json")
 
 
-def _build_action_question() -> Choice:
+def _build_action_question(state: GameState) -> Choice:
+    """Build this turn's Choice: the dynamic battle action space (#54) while
+    `state.battle.in_battle`, the static raw-button-plus-macro space otherwise
+    (unchanged).
+    """
+    if state.battle.in_battle:
+        return Choice(
+            instructions="Which single battle action should be taken next?",
+            criteria=_battle_action_criteria(state),
+        )
     return Choice(
         instructions="Which single action should be taken next?",
         criteria=_ACTION_CRITERIA,
@@ -300,7 +394,7 @@ def decide_action(
     milestone = milestone_progress.current
     state_payload = _serialize_state(state, milestone, dialog_text)
     result = jev_client.system_one(
-        state_payload, {_ACTION_QUESTION_ID: _build_action_question()}
+        state_payload, {_ACTION_QUESTION_ID: _build_action_question(state)}
     )
     answer = result.choices[_ACTION_QUESTION_ID]
     return Decision(
