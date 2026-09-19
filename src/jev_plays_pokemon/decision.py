@@ -62,6 +62,7 @@ from jev_plays_pokemon.navigation import (
     execute_navigation_macro,
     resolve_navigation_target,
 )
+from jev_plays_pokemon.resilience import TurnSkipped
 
 logger = logging.getLogger(__name__)
 
@@ -411,7 +412,7 @@ def run_turn(
     *,
     on_decision: DecisionLogger = log_decision,
     dialog_text_source: DialogTextSource | None = None,
-) -> Decision:
+) -> Decision | None:
     """Run one full turn: read state, ask Jev, act, log - in that order.
 
     The chosen action is executed immediately with no confidence-based
@@ -425,13 +426,23 @@ def run_turn(
     open or the fallback isn't configured - so `run_turn` stays agnostic to
     how/whether vision is wired, and its own ordering stays the single
     canonical per-turn cycle (see module docstring).
+
+    Returns `None`, executing no action and logging nothing, if `jev_client`
+    raises `resilience.TurnSkipped` (#56: a `ResilientJevClient` wrapping the
+    real client that exhausted its retries for this turn) - the one
+    exception to "act regardless of confidence" above, since there's no
+    Decision to act on at all.
     """
     state = state_source()
     milestone_progress = track_milestones(state.event_flags, state.badges)
     dialog_text = dialog_text_source(state) if dialog_text_source is not None else None
-    decision = decide_action(
-        jev_client, state, milestone_progress, dialog_text=dialog_text
-    )
+    try:
+        decision = decide_action(
+            jev_client, state, milestone_progress, dialog_text=dialog_text
+        )
+    except TurnSkipped:
+        logger.warning("turn skipped: Jev retries exhausted, no action taken")
+        return None
     execute_action(decision.action)
     on_decision(decision)
     return decision
