@@ -22,6 +22,19 @@ capture itself, so any number of concurrent viewers share the one capture
 timer's work with no extra encode cost per viewer and no artificial cap on
 how many can connect.
 
+``/viewer`` (#50) serves the combined "Dossier Sidebar" page (#42's chosen
+layout, prototyped on the throwaway ``prototype/overlay-design-42`` branch):
+the live feed pinned left via a plain ``<img src="/video.mjpg">`` - the
+browser renders a held-open MJPEG multipart response as a live-updating
+image natively, no client-side JS needed to drive the video half - and a
+fixed right-hand sidebar kept live by an inline script that polls
+``GET /`` on a fixed interval and re-renders the action, a radial confidence
+gauge, and the completed/current/future milestone split. The script's own
+default state mirrors ``Snapshot``'s field defaults exactly, and is rendered
+synchronously before the first poll resolves, so the page never has a
+broken or half-populated moment before Jev's first decision - the same
+guarantee ``Snapshot`` already gives JSON pollers, extended to this page.
+
 The surface is fed through ``decision.run_turn``'s existing ``on_decision``
 seam via ``stream_logger`` below (which also keeps #21's own log line), so
 the surface updates as each new decision is logged, with no change to the
@@ -48,7 +61,7 @@ from typing import Any
 
 import uvicorn
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from PIL import Image
 from pydantic import BaseModel, Field
 
@@ -58,9 +71,15 @@ from jev_plays_pokemon.milestones import Milestone
 
 logger = logging.getLogger(__name__)
 
-# The two paths the surface serves; every other GET is a 404.
+# The three paths the surface serves; every other GET is a 404.
 SNAPSHOT_PATH = "/"
 VIDEO_PATH = "/video.mjpg"
+VIEWER_PATH = "/viewer"
+
+# How often the /viewer sidebar's inline script re-polls SNAPSHOT_PATH - a
+# fixed internal constant (not configurable), chosen to comfortably keep
+# pace with the tactical loop's decision cadence.
+_VIEWER_POLL_INTERVAL_MS = 750
 
 # Arbitrary, fixed boundary token for the multipart stream - never
 # negotiated, so it's just a constant both the header and each part's
@@ -189,6 +208,184 @@ async def _mjpeg_parts(frame_capture: FrameCapture) -> AsyncIterator[bytes]:
         await asyncio.sleep(_STREAM_POLL_INTERVAL_SECONDS)
 
 
+# The combined "Dossier Sidebar" page (#42's chosen layout): video pinned
+# left, a fixed right-hand sidebar kept live by the inline script below.
+# `__VIDEO_PATH__` / `__SNAPSHOT_PATH__` / `__POLL_INTERVAL_MS__` are
+# substituted from the constants above via plain `str.replace` (not
+# `.format`/f-string) so the JS's own `{`/`}` never need escaping.
+_VIEWER_TEMPLATE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Jev — Live</title>
+<style>
+  :root {
+    --ink: #e9e6da;
+    --ink-dim: #a9a58f;
+    --panel: #14161b;
+    --panel-line: #2c303a;
+    --gb-3: #9bbc0f;
+    --gold: #f2b134;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #000;
+    color: var(--ink);
+    font-family: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  }
+  .stage { display: flex; height: 100vh; width: 100vw; }
+  .video { width: 64%; height: 100%; object-fit: contain; background: #000; }
+  .sidebar {
+    flex: 1;
+    min-width: 0;
+    background: rgba(14, 15, 12, 0.92);
+    border-left: 1px solid var(--panel-line);
+    padding: 16px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    overflow: auto;
+  }
+  .eyebrow {
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    color: var(--gold);
+    text-transform: uppercase;
+  }
+  .action { font-size: 20px; font-weight: 700; line-height: 1.2; }
+  .gauge { align-self: center; position: relative; width: 88px; height: 88px; margin: 4px 0; }
+  .gauge svg { width: 100%; height: 100%; transform: rotate(-90deg); }
+  .gauge .track { fill: none; stroke: var(--panel-line); stroke-width: 6; }
+  .gauge .fill {
+    fill: none;
+    stroke: var(--gold);
+    stroke-width: 6;
+    stroke-linecap: round;
+    transition: stroke-dashoffset 0.2s ease;
+  }
+  .gauge .pct {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 15px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  hr { border: 0; border-top: 1px solid var(--panel-line); margin: 0; }
+  .milestones { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+  .milestones li { color: var(--ink-dim); }
+  .milestones li.done { text-decoration: line-through; opacity: 0.5; }
+  .milestones li.now {
+    color: var(--gb-3);
+    background: rgba(155, 188, 15, 0.1);
+    border-left: 3px solid var(--gold);
+    padding: 4px 6px;
+    margin-left: -3px;
+    border-radius: 2px;
+    font-weight: 600;
+  }
+  .milestones li.future { opacity: 0.45; }
+</style>
+</head>
+<body>
+  <div class="stage">
+    <img class="video" src="__VIDEO_PATH__" alt="Jev's live feed">
+    <aside class="sidebar">
+      <div>
+        <div class="eyebrow">Now deciding</div>
+        <div class="action" id="action">Awaiting first decision</div>
+      </div>
+      <div class="gauge">
+        <svg viewBox="0 0 60 60">
+          <circle class="track" cx="30" cy="30" r="26"></circle>
+          <circle class="fill" id="gauge-fill" cx="30" cy="30" r="26"></circle>
+        </svg>
+        <span class="pct" id="pct">0%</span>
+      </div>
+      <hr>
+      <ul class="milestones" id="milestones"></ul>
+    </aside>
+  </div>
+<script>
+(function () {
+  "use strict";
+  var POLL_INTERVAL_MS = __POLL_INTERVAL_MS__;
+  var SNAPSHOT_PATH = "__SNAPSHOT_PATH__";
+  // Mirrors Snapshot's own field defaults - the pre-first-decision state,
+  // rendered synchronously below before the first poll ever resolves so
+  // this page is never broken or half-populated before Jev's first choice.
+  var DEFAULT_SNAPSHOT = {
+    action: null,
+    confidence: null,
+    milestones: { completed: [], current: null, future: [] }
+  };
+
+  var actionEl = document.getElementById("action");
+  var gaugeFill = document.getElementById("gauge-fill");
+  var pctEl = document.getElementById("pct");
+  var milestonesEl = document.getElementById("milestones");
+  var CIRCUMFERENCE = 2 * Math.PI * 26;
+  gaugeFill.style.strokeDasharray = String(CIRCUMFERENCE);
+
+  function escapeHtml(text) {
+    var div = document.createElement("div");
+    div.textContent = text;
+    return div.innerHTML;
+  }
+
+  function render(snapshot) {
+    actionEl.textContent = snapshot.action || "Awaiting first decision";
+
+    var confidence = snapshot.confidence || 0;
+    pctEl.textContent = Math.round(confidence * 100) + "%";
+    gaugeFill.style.strokeDashoffset = String(CIRCUMFERENCE - CIRCUMFERENCE * confidence);
+
+    var milestones = snapshot.milestones || { completed: [], current: null, future: [] };
+    var items = [];
+    (milestones.completed || []).forEach(function (milestone) {
+      items.push('<li class="done">' + escapeHtml(milestone.description) + "</li>");
+    });
+    if (milestones.current) {
+      items.push('<li class="now">' + escapeHtml(milestones.current.description) + "</li>");
+    } else {
+      items.push('<li class="now">No current milestone</li>');
+    }
+    (milestones.future || []).forEach(function (milestone) {
+      items.push('<li class="future">' + escapeHtml(milestone.description) + "</li>");
+    });
+    milestonesEl.innerHTML = items.join("");
+  }
+
+  function poll() {
+    fetch(SNAPSHOT_PATH, { cache: "no-store" })
+      .then(function (response) { return response.json(); })
+      .then(render)
+      .catch(function () {
+        // Transient fetch error: keep the last good render rather than
+        // clobbering it with a broken one.
+      });
+  }
+
+  render(DEFAULT_SNAPSHOT);
+  poll();
+  setInterval(poll, POLL_INTERVAL_MS);
+})();
+</script>
+</body>
+</html>
+"""
+
+_VIEWER_HTML = (
+    _VIEWER_TEMPLATE.replace("__VIDEO_PATH__", VIDEO_PATH)
+    .replace("__SNAPSHOT_PATH__", SNAPSHOT_PATH)
+    .replace("__POLL_INTERVAL_MS__", str(_VIEWER_POLL_INTERVAL_MS))
+)
+
+
 def _build_app(surface: StreamSurface, frame_capture: FrameCapture | None) -> FastAPI:
     app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
     video_source = (
@@ -212,6 +409,11 @@ def _build_app(surface: StreamSurface, frame_capture: FrameCapture | None) -> Fa
             _mjpeg_parts(video_source),
             media_type=f"multipart/x-mixed-replace; boundary={_MJPEG_BOUNDARY}",
         )
+
+    @app.get(VIEWER_PATH)
+    def get_viewer() -> HTMLResponse:
+        logger.debug("GET %s", VIEWER_PATH)
+        return HTMLResponse(content=_VIEWER_HTML)
 
     # `@app.get` registers only "GET" against this path (verified: unlike
     # plain Starlette routes, FastAPI's `APIRoute` does not implicitly add
