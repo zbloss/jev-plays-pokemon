@@ -20,11 +20,11 @@ The repeating cycle of: read game state → ask Jev a Choice/Score/Noul question
 _Avoid_: "the agent loop", "the game loop" (both undersell that Jev's role is bounded to one tactical decision at a time)
 
 **Action space**:
-The full set of options Jev may choose from in a tactical decision: the raw Game Boy button presses plus the navigation macro, offered together as one Choice's options. "Current legal actions" (see tactical action-selection loop) is the per-turn subset of this space that's actually selectable.
+The full set of options Jev may choose from in a tactical decision: the raw Game Boy button presses plus the navigation macro. "Current legal actions" (see tactical action-selection loop) is the per-turn subset of this space that's actually selectable — outside battle that already means the navigation macro drops out whenever it can't resolve a destination (#83), not just the in-battle narrowing this glossary already covered.
 _Avoid_: "actions" alone when the full set, as opposed to one turn's legal subset, is meant
 
 **Navigation macro**:
-A single Choice option that walks Jev's character toward whatever target the current-objective milestone tracker is pointing at, using RAM-derived pathfinding executed over multiple emulator frames. Jev decides only whether to invoke it this turn; it takes no destination argument, so it stays a flat Choice option rather than a function-call.
+A single Choice option that walks Jev's character toward whatever target the current-objective milestone tracker is pointing at, using RAM-derived pathfinding executed over multiple emulator frames. Jev decides only whether to invoke it this turn; it takes no destination argument, so it stays a flat Choice option rather than a function-call. It's only offered on turns where the current milestone actually resolves a destination (`resolve_navigation_target`) — an option that would just press nothing isn't offered (#83).
 _Avoid_: "navigate_to" (the reference starter's function name — not reused code, see #9's licensing decision)
 
 **Game state**:

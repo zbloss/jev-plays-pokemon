@@ -5,8 +5,12 @@ decision core that asks Jev (TypeSafe's System One model) a single Choice
 per turn over the flat action space - raw Game Boy button presses
 (`navigation.RAW_BUTTONS`) plus the navigation macro (`navigation.py`, #20)
 outside battle - and acts on the result immediately, regardless of
-confidence. While `GameState.battle.in_battle` is true, the Choice swaps to
-the dynamic battle action space instead (#54, `_battle_action_criteria`):
+confidence. The macro is only offered when `navigation.
+resolve_navigation_target` can resolve a destination for the current
+milestone (#83); otherwise the Choice is raw buttons only, so Jev can't pick
+an action that presses nothing (see `out_of_battle_action_space`). While
+`GameState.battle.in_battle` is true, the Choice swaps to the dynamic
+battle action space instead (#54, `_battle_action_criteria`):
 `USE_MOVE_<slot>` / `USE_ITEM_<item>` / `SWITCH_TO_<slot>` / `RUN`, built
 fresh each turn and filtered to legal options only.
 
@@ -75,6 +79,23 @@ logger = logging.getLogger(__name__)
 NAVIGATION_MACRO_ACTION = "NAVIGATE_TO_OBJECTIVE"
 
 ACTION_SPACE: tuple[str, ...] = (*RAW_BUTTONS, NAVIGATION_MACRO_ACTION)
+
+
+def out_of_battle_action_space(milestone: Milestone | None) -> tuple[str, ...]:
+    """The out-of-battle actions actually legal to offer/nudge with this
+    turn, for `milestone`: `ACTION_SPACE` is the flat, milestone-independent
+    full space (every raw button plus the macro); this is the turn-specific
+    subset of it (#83) - the macro drops out whenever it would be a no-op.
+
+    Consults `resolve_navigation_target` - the same resolver `make_pyboy_
+    action_executor`'s macro branch calls at execution time - so the offer
+    predicate and the execution path can't drift apart into two different
+    "does this milestone have a target yet?" checks.
+    """
+    if resolve_navigation_target(milestone) is not None:
+        return ACTION_SPACE
+    return RAW_BUTTONS
+
 
 _ACTION_CRITERIA: dict[str, str] = {
     "up": "Move/face up",
@@ -498,19 +519,22 @@ def _serialize_state(
     ).model_dump(mode="json")
 
 
-def _build_action_question(state: GameState) -> Choice:
+def _build_action_question(state: GameState, milestone: Milestone | None) -> Choice:
     """Build this turn's Choice: the dynamic battle action space (#54) while
-    `state.battle.in_battle`, the static raw-button-plus-macro space otherwise
-    (unchanged).
+    `state.battle.in_battle`, otherwise the raw buttons plus the navigation
+    macro - but only when `out_of_battle_action_space` says the macro can
+    actually resolve a destination for `milestone` right now (#83).
     """
     if state.battle.in_battle:
         return Choice(
             instructions="Which single battle action should be taken next?",
             criteria=_battle_action_criteria(state),
         )
+    action_space = out_of_battle_action_space(milestone)
+    criteria = {action: _ACTION_CRITERIA[action] for action in action_space}
     return Choice(
         instructions="Which single action should be taken next?",
-        criteria=_ACTION_CRITERIA,
+        criteria=criteria,
     )
 
 
@@ -537,7 +561,7 @@ def decide_action(
     milestone = milestone_progress.current
     state_payload = _serialize_state(state, milestone, dialog_text)
     result = jev_client.system_one(
-        state_payload, {_ACTION_QUESTION_ID: _build_action_question(state)}
+        state_payload, {_ACTION_QUESTION_ID: _build_action_question(state, milestone)}
     )
     answer = result.choices[_ACTION_QUESTION_ID]
     return Decision(
