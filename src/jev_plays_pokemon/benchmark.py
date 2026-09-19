@@ -12,25 +12,27 @@ tool for that.
 Run it on the deployment host so the number includes that host's real network
 round trip to the TypeSafe API and this machine's real PyBoy throughput:
 
-    uv run python -m jev_plays_pokemon.benchmark --turns 20
+    uv run jev-plays-pokemon benchmark --turns 20
 
 `measure_turn_latencies` is the pure, testable core: it times an injected
 `turn` callable and reports wall-clock percentiles, with a throwaway warmup
-so a cold connection/first-call cost doesn't skew the steady-state figure. The
-`__main__` entry wires the real per-turn cycle (RAM state extraction + a real
-`system_one()` Choice + real action execution against a booted ROM) and is not
-unit-tested - consistent with the rest of the repo, no test here depends on
-the real TypeSafe API.
+so a cold connection/first-call cost doesn't skew the steady-state figure.
+`run_benchmark` wires the real per-turn cycle (RAM state extraction + a real
+`system_one()` Choice + real action execution against a booted ROM) - it's the
+`jev-plays-pokemon benchmark` subcommand's implementation (see `cli.py`, ADR
+0001) - and is not unit-tested - consistent with the rest of the repo, no
+test here depends on the real TypeSafe API.
 """
 
 from __future__ import annotations
 
-import argparse
 import logging
 import statistics
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+
+from jev_plays_pokemon.settings import Settings
 
 Clock = Callable[[], float]
 
@@ -108,11 +110,21 @@ def _format_stats(stats: TurnLatencyStats) -> str:
     )
 
 
-def main(argv: Sequence[str] | None = None) -> None:
-    """Run the real per-turn cycle `--turns` times and print latency percentiles.
+def run_benchmark(
+    *,
+    turns: int = 20,
+    warmup: int = 3,
+    rom_path: str | None = None,
+    no_dialog: bool = False,
+    settings: Settings | None = None,
+) -> None:
+    """Run the real per-turn cycle `turns` times and print latency percentiles.
 
     Run this from the environment the loop actually ships to; the printed p95
-    is the figure to record in `docs/turn-rate-budget.md`.
+    is the figure to record in `docs/turn-rate-budget.md`. `settings` (see
+    `settings.Settings`, ADR 0001) supplies the CLI-/`.env`-resolved
+    `TYPESAFE_API_KEY`/`OPENAI_*`/`DIALOG_DECODE_BACKEND` overrides; left as
+    `None`, a fresh `Settings()` is resolved from the environment/`.env` alone.
     """
     from jev_plays_pokemon import emulator
     from jev_plays_pokemon.decision import (
@@ -124,23 +136,22 @@ def main(argv: Sequence[str] | None = None) -> None:
     from jev_plays_pokemon.game_state import extract_game_state
     from jev_plays_pokemon.main import build_dialog_text_source
 
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--turns", type=int, default=20)
-    parser.add_argument("--warmup", type=int, default=3)
-    parser.add_argument("--rom", default=str(emulator.DEFAULT_ROM_PATH))
-    parser.add_argument(
-        "--no-dialog",
-        action="store_true",
-        help="skip the vision-fallback dialog decode even if it is configured",
-    )
-    args = parser.parse_args(argv)
-
     logging.basicConfig(level=logging.WARNING)
+    settings = settings or Settings()
 
-    pyboy = emulator.boot_to_controllable_state(args.rom)
-    jev_client = build_jev_client()
+    pyboy = emulator.boot_to_controllable_state(rom_path or emulator.DEFAULT_ROM_PATH)
+    jev_client = build_jev_client(api_key=settings.typesafe_api_key)
     execute_action = make_pyboy_action_executor(pyboy)
-    decoder = None if args.no_dialog else load_dialog_decoder_or_none()
+    decoder = (
+        None
+        if no_dialog
+        else load_dialog_decoder_or_none(
+            backend=settings.dialog_decode_backend,
+            base_url=settings.openai_base_url,
+            api_key=settings.openai_api_key,
+            model=settings.openai_vision_model,
+        )
+    )
     dialog_text_source = build_dialog_text_source(pyboy, decoder)
 
     def turn() -> None:
@@ -153,11 +164,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
 
     try:
-        stats = measure_turn_latencies(turn, turns=args.turns, warmup=args.warmup)
+        stats = measure_turn_latencies(turn, turns=turns, warmup=warmup)
         print(_format_stats(stats))
     finally:
         pyboy.stop(save=False)
-
-
-if __name__ == "__main__":
-    main()

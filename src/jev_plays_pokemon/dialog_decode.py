@@ -44,30 +44,60 @@ class DialogDecodeConfigError(RuntimeError):
     """`DIALOG_DECODE_BACKEND` names a backend this project doesn't have."""
 
 
-def load_dialog_decoder() -> DialogDecoder:
+def load_dialog_decoder(
+    *,
+    backend: str | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    model: str | None = None,
+) -> DialogDecoder:
     """Build the configured decode callable: rendered dialog screen in, text out.
+
+    `backend` overrides `DIALOG_DECODE_BACKEND` when given (see
+    `settings.Settings`, ADR 0001); `base_url`/`api_key`/`model` are forwarded
+    to `load_vision_client_and_model` only when the resolved backend is the
+    vision LLM, and only when actually given - an explicit `None` is never
+    passed through, so a bare `load_dialog_decoder()` call keeps behaving
+    exactly as if no CLI/`.env` layer existed.
 
     Each backend's own config errors (e.g. `dialog_vision.VisionConfigError`
     for a missing `OPENAI_VISION_MODEL`) still propagate from here rather than
     being swallowed.
     """
-    backend = (os.environ.get(_BACKEND_ENV) or _VISION_LLM).strip().lower()
+    resolved_backend = (
+        (backend or os.environ.get(_BACKEND_ENV) or _VISION_LLM).strip().lower()
+    )
 
-    if backend == _VISION_LLM:
-        client, model = load_vision_client_and_model()
-        return lambda screen: decode_dialog_text(client, model, screen)
+    if resolved_backend == _VISION_LLM:
+        vision_overrides = {
+            key: value
+            for key, value in {
+                "base_url": base_url,
+                "api_key": api_key,
+                "model": model,
+            }.items()
+            if value is not None
+        }
+        client, resolved_model = load_vision_client_and_model(**vision_overrides)
+        return lambda screen: decode_dialog_text(client, resolved_model, screen)
 
-    if backend == _RAPIDOCR:
+    if resolved_backend == _RAPIDOCR:
         engine = load_ocr_engine()
         return lambda screen: decode_dialog_text_ocr(engine, screen)
 
     raise DialogDecodeConfigError(
-        f"{_BACKEND_ENV}={backend!r} is not a recognized dialog-decode "
+        f"{_BACKEND_ENV}={resolved_backend!r} is not a recognized dialog-decode "
         f"backend; expected {_VISION_LLM!r} or {_RAPIDOCR!r}."
     )
 
 
-def load_dialog_decoder_or_none() -> DialogDecoder | None:
+def load_dialog_decoder_or_none(
+    *,
+    backend: str | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    model: str | None = None,
+) -> DialogDecoder | None:
     """Build the configured decoder, or ``None`` if it isn't configured.
 
     The default vision backend raises `VisionConfigError` when
@@ -77,10 +107,21 @@ def load_dialog_decoder_or_none() -> DialogDecoder | None:
     those two config errors into `None` (with a warning) so the loop runs
     without dialog text instead of crashing on startup; any other exception
     (a real bug) still propagates rather than being silently downgraded. A
-    live run gains dialog text by setting the backend's env vars and restarting.
+    live run gains dialog text by setting the backend's env vars (or the
+    matching CLI flag/`.env` entry) and restarting.
     """
+    overrides = {
+        key: value
+        for key, value in {
+            "backend": backend,
+            "base_url": base_url,
+            "api_key": api_key,
+            "model": model,
+        }.items()
+        if value is not None
+    }
     try:
-        return load_dialog_decoder()
+        return load_dialog_decoder(**overrides)
     except (VisionConfigError, DialogDecodeConfigError):
         logger.warning(
             "dialog-decode backend not configured; running without dialog text",

@@ -98,11 +98,23 @@ class VisionClient(Protocol):
     def chat(self) -> _Chat: ...
 
 
-def load_vision_client_and_model() -> tuple[OpenAI, str]:
-    """Build the OpenAI-compatible client and model id from env vars."""
-    base_url = os.environ.get("OPENAI_BASE_URL") or None
-    api_key = os.environ.get("OPENAI_API_KEY") or None
-    model = os.environ.get("OPENAI_VISION_MODEL") or None
+def load_vision_client_and_model(
+    *,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    model: str | None = None,
+) -> tuple[OpenAI, str]:
+    """Build the OpenAI-compatible client and model id.
+
+    Each parameter, left as `None`, falls back to its matching env var
+    exactly as before; an explicit value always wins - the same
+    resolve-or-env-fallback convention `typesafe_sdk` uses, letting a CLI
+    flag/`.env` value (see `settings.Settings`, ADR 0001) override the
+    environment without this function needing to know CLI/`.env` exist.
+    """
+    base_url = base_url or os.environ.get("OPENAI_BASE_URL") or None
+    api_key = api_key or os.environ.get("OPENAI_API_KEY") or None
+    model = model or os.environ.get("OPENAI_VISION_MODEL") or None
 
     if model is None:
         raise VisionConfigError(

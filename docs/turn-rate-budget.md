@@ -16,7 +16,7 @@ action execution against a booted `pokemon_red.gb` — N times and reports
 wall-clock percentiles:
 
 ```
-uv run python -m jev_plays_pokemon.benchmark --turns 25 --warmup 5
+uv run jev-plays-pokemon benchmark --turns 25 --warmup 5
 ```
 
 Add `--no-dialog` to exclude the vision-fallback dialog decode (a separate,
@@ -91,7 +91,7 @@ procedure to do so are in place and validated by this run.
 
 ## Sources
 
-- Re-benchmark: `uv run python -m jev_plays_pokemon.benchmark`, run on this
+- Re-benchmark: `uv run jev-plays-pokemon benchmark`, run on this
   host 2026-09-18 against the live TypeSafe API using this repo's `.env`
   `TYPESAFE_API_KEY` (value never printed or logged; the benchmark prints only
   latency percentiles).

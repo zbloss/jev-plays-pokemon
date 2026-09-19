@@ -207,15 +207,17 @@ class JevClient(Protocol):
     ) -> _SystemOneResultLike: ...
 
 
-def build_jev_client() -> TypeSafeClient:
+def build_jev_client(*, api_key: str | None = None) -> TypeSafeClient:
     """Construct the real Jev client for production use.
 
-    `TypeSafeClient()` reads `TYPESAFE_API_KEY` from the environment on its
-    own and raises `typesafe_sdk.TypeSafeError` if it's unset (per the SDK's
-    own `Config.resolve` - see this ticket's research doc's §1), so no
-    extra env-reading or validation belongs here.
+    `api_key`, when given, overrides `TYPESAFE_API_KEY` (see
+    `settings.Settings`, ADR 0001). Left as `None`, `TypeSafeClient` reads
+    `TYPESAFE_API_KEY` from the environment on its own and raises
+    `typesafe_sdk.TypeSafeError` if it's unset (per the SDK's own
+    `Config.resolve` - see this ticket's research doc's §1), so no extra
+    env-reading or validation belongs here either way.
     """
-    return TypeSafeClient()
+    return TypeSafeClient(api_key=api_key)
 
 
 @dataclass(frozen=True)
