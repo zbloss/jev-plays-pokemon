@@ -1,7 +1,7 @@
-"""Env-driven backend selection between the vision-LLM and RapidOCR dialog
+"""Env-driven backend selection between the RapidOCR and vision-LLM dialog
 decoders.
 
-Both `dialog_vision.decode_dialog_text` and `dialog_ocr.decode_dialog_text_ocr`
+Both `dialog_ocr.decode_dialog_text_ocr` and `dialog_vision.decode_dialog_text`
 satisfy the same contract - a rendered dialog screen (PIL image) in,
 transcribed text out - so which one actually runs is a deployment choice, not
 a code change, matching this project's existing no-hardcoded-provider pattern
@@ -9,10 +9,10 @@ a code change, matching this project's existing no-hardcoded-provider pattern
 
 `DIALOG_DECODE_BACKEND` selects the backend:
 
-- unset, empty, or `"vision-llm"`: the existing vision-LLM path (default).
-  Per issue #31, this stays the default until RapidOCR's accuracy against
-  Pokemon Red's bitmap dialog font is demonstrated.
-- `"rapidocr"`: the local RapidOCR path, no LLM call.
+- unset, empty, or `"rapidocr"`: the local RapidOCR path, no LLM call
+  (default - RapidOCR's accuracy against Pokemon Red's bitmap dialog font was
+  validated per issue #31, so the vision-LLM path is no longer the default).
+- `"vision-llm"`: the vision-LLM path.
 
 Any other value raises `DialogDecodeConfigError` immediately, rather than
 silently falling back to a default.
@@ -65,7 +65,7 @@ def load_dialog_decoder(
     being swallowed.
     """
     resolved_backend = (
-        (backend or os.environ.get(_BACKEND_ENV) or _VISION_LLM).strip().lower()
+        (backend or os.environ.get(_BACKEND_ENV) or _RAPIDOCR).strip().lower()
     )
 
     if resolved_backend == _VISION_LLM:

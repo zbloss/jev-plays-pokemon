@@ -24,23 +24,21 @@ def _fake_ocr_engine():
     return _FAKE_ENGINE
 
 
-def test_default_backend_is_vision_llm(monkeypatch):
+def test_default_backend_is_rapidocr(monkeypatch):
     monkeypatch.delenv("DIALOG_DECODE_BACKEND", raising=False)
-    monkeypatch.setattr(
-        dialog_decode, "load_vision_client_and_model", _fake_vision_client_and_model
-    )
+    monkeypatch.setattr(dialog_decode, "load_ocr_engine", _fake_ocr_engine)
     calls = []
     monkeypatch.setattr(
         dialog_decode,
-        "decode_dialog_text",
-        lambda client, model, screen: calls.append((client, model, screen)) or "ok",
+        "decode_dialog_text_ocr",
+        lambda engine, screen: calls.append((engine, screen)) or "ok",
     )
 
     decoder = load_dialog_decoder()
     result = decoder(_SCREEN)
 
     assert result == "ok"
-    assert calls == [(_FAKE_CLIENT, "test-vision-model", _SCREEN)]
+    assert calls == [(_FAKE_ENGINE, _SCREEN)]
 
 
 def test_explicit_vision_llm_backend_selects_the_vision_path(monkeypatch):
@@ -118,7 +116,10 @@ def test_explicit_vision_overrides_are_forwarded_to_load_vision_client_and_model
     )
 
     decoder = load_dialog_decoder(
-        base_url="http://explicit/v1", api_key="explicit-key", model="explicit-model"
+        backend="vision-llm",
+        base_url="http://explicit/v1",
+        api_key="explicit-key",
+        model="explicit-model",
     )
 
     assert decoder(_SCREEN) == "ok"
@@ -130,7 +131,7 @@ def test_explicit_vision_overrides_are_forwarded_to_load_vision_client_and_model
 
 
 def test_vision_llm_config_errors_still_propagate(monkeypatch):
-    monkeypatch.delenv("DIALOG_DECODE_BACKEND", raising=False)
+    monkeypatch.setenv("DIALOG_DECODE_BACKEND", "vision-llm")
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_VISION_MODEL", raising=False)
@@ -144,13 +145,11 @@ def test_vision_llm_config_errors_still_propagate(monkeypatch):
 
 def test_load_or_none_returns_a_decoder_when_the_backend_is_configured(monkeypatch):
     monkeypatch.delenv("DIALOG_DECODE_BACKEND", raising=False)
-    monkeypatch.setattr(
-        dialog_decode, "load_vision_client_and_model", _fake_vision_client_and_model
-    )
+    monkeypatch.setattr(dialog_decode, "load_ocr_engine", _fake_ocr_engine)
     monkeypatch.setattr(
         dialog_decode,
-        "decode_dialog_text",
-        lambda client, model, screen: "ok",
+        "decode_dialog_text_ocr",
+        lambda engine, screen: "ok",
     )
 
     decoder = load_dialog_decoder_or_none()
@@ -164,7 +163,7 @@ def test_load_or_none_returns_none_when_the_backend_is_unconfigured(
 ):
     # An unconfigured vision backend is a normal live-run state, not a crash:
     # the loop should still run, just without dialog text.
-    monkeypatch.delenv("DIALOG_DECODE_BACKEND", raising=False)
+    monkeypatch.setenv("DIALOG_DECODE_BACKEND", "vision-llm")
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_VISION_MODEL", raising=False)

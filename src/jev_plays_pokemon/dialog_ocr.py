@@ -1,12 +1,6 @@
 """RapidOCR-backed decode of dialog/NPC text - a local alternative to
 `dialog_vision.py`'s vision-LLM path.
 
-Per issue #31, this is an exploration, not a replacement: Pokemon Red's
-dialog renders in a fixed 8x8 pixel bitmap font that general-purpose OCR
-models aren't necessarily trained on, so this backend needs to prove itself
-before it displaces the vision-LLM path as the default (see
-`dialog_decode.py` for the env-driven choice between the two).
-
 `decode_dialog_text_ocr` matches `dialog_vision.decode_dialog_text`'s input/
 output contract - a rendered dialog screen (PIL image) in, transcribed text
 out - so either backend can sit behind `dialog_decode.load_dialog_decoder`.
