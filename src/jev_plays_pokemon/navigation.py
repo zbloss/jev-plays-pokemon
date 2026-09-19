@@ -144,6 +144,63 @@ def execute_button(pyboy: PyBoy, button: str) -> None:
         pyboy.tick(1, True)
 
 
+# Gen 1's shared "current cursor position in whichever menu is on screen"
+# register (`wCurrentMenuItem`, pret/pokered's `ram/wram.asm`) - reused across
+# every battle-menu screen (the main FIGHT/PKMN/ITEM/RUN menu, the move list,
+# the bag list, the party switch list) rather than one address per menu type,
+# per that symbol's own doc comment in `wram.asm` ("the id of the currently
+# selected menu item ... the top item has id 0"). Byte offset computed the
+# same way `game_state.py`'s `_BATTLE_RESULT_ADDRESS` was: summing `wram.asm`'s
+# `db` declarations forward from this run's first field, `wTopMenuItemY`,
+# based at 0xCC24 per Data Crystal's RAM map - and cross-checked against two
+# independent PyBoy-driven Pokemon Red battle bots reading this exact address
+# live during real battles (`InsaneJSK/DeepRed`'s `battle_controller.py`;
+# `2389-research/jev-plays-pokemon`'s `battle.py`, whose reading is validated
+# against a captured real-battle save state, not address-table-only).
+_MENU_CURSOR_ADDRESS = 0xCC26
+
+
+def read_menu_cursor(pyboy: PyBoy) -> int:
+    """Read Gen 1's live menu-cursor index for whatever battle-menu screen is
+    currently on screen (`wCurrentMenuItem`) - see `_MENU_CURSOR_ADDRESS`."""
+    return pyboy.memory[_MENU_CURSOR_ADDRESS]
+
+
+def menu_list_delta_buttons(current: int, target: int) -> tuple[str, ...]:
+    """The button sequence to move a vertical list menu's cursor from
+    `current` to `target` - the delta only, never a fixed-length sequence
+    (#76): Gen 1 remembers each list menu's cursor position across turns
+    (pret/pokered's `wPartyAndBillsPCSavedMenuItem`/`wBagSavedMenuItem`/
+    `wBattleAndStartSavedMenuItem`), so a hardcoded press count is only
+    correct the one turn the cursor happens to already sit where it assumes -
+    cross-repo research on `milanboers/jev-plays-pokemon` and
+    `valentynkit/jev-plays-pokemon-red` both independently hit this exact
+    failure mode (see #76).
+    """
+    delta = target - current
+    button = "down" if delta >= 0 else "up"
+    return (button,) * abs(delta)
+
+
+def main_battle_menu_delta_buttons(current: int, target: int) -> tuple[str, ...]:
+    """The button sequence to move the main FIGHT(0)/PKMN(1)/ITEM(2)/RUN(3)
+    battle menu's cursor from `current` to `target`.
+
+    This menu is a 2x2 grid, not a vertical list (row = index // 2, column =
+    index % 2; DOWN/UP toggle the row, RIGHT/LEFT toggle the column) - so at
+    most one press per axis gets there directly from wherever the cursor
+    currently sits, with no wraparound assumption needed either way (#76).
+    """
+    current_row, current_col = divmod(current, 2)
+    target_row, target_col = divmod(target, 2)
+    buttons: list[str] = []
+    if target_col != current_col:
+        buttons.append("right" if target_col > current_col else "left")
+    if target_row != current_row:
+        buttons.append("down" if target_row > current_row else "up")
+    return tuple(buttons)
+
+
 @dataclass(frozen=True)
 class NavigationTarget:
     map_id: int

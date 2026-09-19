@@ -13,6 +13,9 @@ from jev_plays_pokemon.navigation import (
     NavigationTarget,
     execute_button,
     execute_navigation_macro,
+    main_battle_menu_delta_buttons,
+    menu_list_delta_buttons,
+    read_menu_cursor,
     resolve_navigation_target,
 )
 
@@ -279,3 +282,59 @@ def test_resolve_navigation_target_returns_the_milestones_tile_coordinates():
     target = resolve_navigation_target(milestone)
 
     assert target == NavigationTarget(map_id=40, x=4, y=5)
+
+
+# #76: battle-menu cursor delta helpers - pure, no PyBoy required.
+
+
+def test_menu_list_delta_buttons_presses_down_for_a_positive_delta():
+    assert menu_list_delta_buttons(0, 3) == ("down", "down", "down")
+
+
+def test_menu_list_delta_buttons_presses_up_for_a_negative_delta():
+    assert menu_list_delta_buttons(3, 1) == ("up", "up")
+
+
+def test_menu_list_delta_buttons_is_empty_when_already_at_the_target():
+    assert menu_list_delta_buttons(2, 2) == ()
+
+
+def test_menu_list_delta_buttons_never_hardcodes_a_fixed_sequence_across_turns():
+    """#76's whole point: the same target reached from two different starting
+    cursor positions (e.g. wherever a previous turn left it) presses a
+    different number of buttons, since it's a live delta, not a fixed one."""
+    turn_one = menu_list_delta_buttons(0, 2)
+    turn_two = menu_list_delta_buttons(2, 2)
+    turn_three = menu_list_delta_buttons(3, 2)
+
+    assert turn_one == ("down", "down")
+    assert turn_two == ()
+    assert turn_three == ("up",)
+
+
+def test_main_battle_menu_delta_buttons_toggles_column_only():
+    # FIGHT(0) -> PKMN(1): same row, one column over.
+    assert main_battle_menu_delta_buttons(0, 1) == ("right",)
+    assert main_battle_menu_delta_buttons(1, 0) == ("left",)
+
+
+def test_main_battle_menu_delta_buttons_toggles_row_only():
+    # FIGHT(0) -> ITEM(2): same column, one row down.
+    assert main_battle_menu_delta_buttons(0, 2) == ("down",)
+    assert main_battle_menu_delta_buttons(2, 0) == ("up",)
+
+
+def test_main_battle_menu_delta_buttons_toggles_both_axes_for_the_diagonal():
+    # FIGHT(0) -> RUN(3): opposite corner.
+    assert main_battle_menu_delta_buttons(0, 3) == ("right", "down")
+    assert main_battle_menu_delta_buttons(3, 0) == ("left", "up")
+
+
+def test_main_battle_menu_delta_buttons_is_empty_when_already_at_the_target():
+    assert main_battle_menu_delta_buttons(1, 1) == ()
+
+
+def test_read_menu_cursor_reads_the_live_wcurrentmenuitem_byte(pyboy_in_bedroom):
+    pyboy_in_bedroom.memory[0xCC26] = 2
+
+    assert read_menu_cursor(pyboy_in_bedroom) == 2

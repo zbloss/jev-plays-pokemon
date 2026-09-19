@@ -1,5 +1,6 @@
 import dataclasses
 import logging
+from pathlib import Path
 from typing import cast
 
 import pytest
@@ -653,6 +654,383 @@ def test_pyboy_action_executor_macro_is_a_noop_without_a_resolvable_target():
     execute_action(NAVIGATION_MACRO_ACTION)
 
     assert macro_calls == []
+
+
+# #76: dynamic in-battle actions (USE_MOVE_<slot>/USE_ITEM_<item>/
+# SWITCH_TO_<slot>/RUN) translated into button presses. `read_menu_cursor` is
+# injected the same way `press_button` already is, so these run against
+# `_FakePyBoy` with no real PyBoy/ROM involved - `_execute_battle_action`'s
+# own delta math is covered independently and exhaustively (with plain ints,
+# no PyBoy at all) by test_navigation.py's `menu_list_delta_buttons`/
+# `main_battle_menu_delta_buttons` tests; these dispatch tests exercise the
+# wiring between a `Decision.action` string and that math.
+
+
+def test_pyboy_action_executor_use_move_selects_fight_then_the_move_list():
+    state = _game_state(
+        party=(_mon(moves=(84, 45, 0, 0), pp=(15, 30, 0, 0)),),
+        battle=BattleState(
+            in_battle=True,
+            battle_type="wild",
+            opponent_species="RATTATA",
+            opponent_level=3,
+        ),
+    )
+    presses: list[str] = []
+    cursor_reads = iter([1, 3])  # main menu on PKMN(1), move list on slot 3
+    execute_action = make_pyboy_action_executor(
+        cast(PyBoy, _FakePyBoy()),
+        extract_state=lambda pyboy: state,
+        press_button=lambda pyboy, button: presses.append(button),
+        read_menu_cursor=lambda pyboy: next(cursor_reads),
+    )
+
+    execute_action("USE_MOVE_1")
+
+    # PKMN(1) -> FIGHT(0): one "left". Move cursor 3 -> slot 1: two "up"s.
+    assert presses == ["left", "a", "up", "up", "a"]
+
+
+def test_pyboy_action_executor_use_move_computes_a_fresh_delta_each_turn():
+    """#76 acceptance criteria: picking the same slot from two different
+    starting cursor positions (as if left there by a previous turn) presses
+    a different sequence each time - proof this isn't a hardcoded sequence
+    that only happens to be correct once."""
+    state = _game_state(
+        party=(_mon(),),
+        battle=BattleState(
+            in_battle=True,
+            battle_type="wild",
+            opponent_species="RATTATA",
+            opponent_level=3,
+        ),
+    )
+
+    def _run(cursor_sequence: list[int]) -> list[str]:
+        presses: list[str] = []
+        reads = iter(cursor_sequence)
+        execute_action = make_pyboy_action_executor(
+            cast(PyBoy, _FakePyBoy()),
+            extract_state=lambda pyboy: state,
+            press_button=lambda pyboy, button: presses.append(button),
+            read_menu_cursor=lambda pyboy: next(reads),
+        )
+        execute_action("USE_MOVE_1")
+        return presses
+
+    turn_one = _run([0, 0])  # already on FIGHT(0); move cursor already at 0
+    turn_two = _run([3, 3])  # cursor left on RUN(3) by a previous turn
+
+    assert turn_one == ["a", "down", "a"]
+    assert turn_two == ["left", "up", "a", "up", "up", "a"]
+    assert turn_one != turn_two
+
+
+def test_pyboy_action_executor_switch_to_does_not_skip_a_fainted_row():
+    state = _game_state(
+        party=(
+            _mon(species="PIKACHU"),
+            _mon(
+                species="CHARMANDER", hp=0
+            ),  # fainted - sits between cursor and target
+            _mon(species="SQUIRTLE", hp=12),
+        ),
+        battle=BattleState(
+            in_battle=True,
+            battle_type="wild",
+            opponent_species="RATTATA",
+            opponent_level=3,
+        ),
+    )
+    presses: list[str] = []
+    # Main menu on FIGHT(0), party list at the top(0), and the SWITCH/STATS/
+    # CANCEL confirmation left on CANCEL(2) by a previous turn.
+    cursor_reads = iter([0, 0, 2])
+    execute_action = make_pyboy_action_executor(
+        cast(PyBoy, _FakePyBoy()),
+        extract_state=lambda pyboy: state,
+        press_button=lambda pyboy, button: presses.append(button),
+        read_menu_cursor=lambda pyboy: next(cursor_reads),
+    )
+
+    execute_action("SWITCH_TO_3")
+
+    # PKMN(1) is one "right" of FIGHT(0). Slot 3's real, unfiltered party row
+    # is index 2 - two "down"s, not one, since the fainted slot 2 isn't
+    # skipped/compacted out of the list. The confirmation is read live too
+    # (#76): CANCEL(2) -> SWITCH(0) is two "up"s, not a blind fixed press.
+    assert presses == ["right", "a", "down", "down", "a", "up", "up", "a"]
+
+
+def test_pyboy_action_executor_use_item_selects_item_then_the_bag_list():
+    state = _game_state(
+        inventory=(
+            InventoryItem(item="POTION", quantity=2),
+            InventoryItem(item="OAK's PARCEL", quantity=1),
+        ),
+    )
+    presses: list[str] = []
+    execute_action = make_pyboy_action_executor(
+        cast(PyBoy, _FakePyBoy()),
+        extract_state=lambda pyboy: state,
+        press_button=lambda pyboy, button: presses.append(button),
+        read_menu_cursor=lambda pyboy: 0,
+    )
+
+    execute_action("USE_ITEM_OAKS_PARCEL")
+
+    # ITEM(2) is one "down" of FIGHT(0). OAK's PARCEL is bag index 1.
+    assert presses == ["down", "a", "down", "a"]
+
+
+def test_pyboy_action_executor_use_item_with_no_matching_inventory_entry_is_a_noop():
+    state = _game_state(inventory=(InventoryItem(item="POTION", quantity=1),))
+    presses: list[str] = []
+    execute_action = make_pyboy_action_executor(
+        cast(PyBoy, _FakePyBoy()),
+        extract_state=lambda pyboy: state,
+        press_button=lambda pyboy, button: presses.append(button),
+        read_menu_cursor=lambda pyboy: 0,
+    )
+
+    execute_action("USE_ITEM_NOT_A_REAL_ITEM")
+
+    assert presses == []
+
+
+def test_pyboy_action_executor_run_selects_run_and_confirms():
+    presses: list[str] = []
+    execute_action = make_pyboy_action_executor(
+        cast(PyBoy, _FakePyBoy()),
+        extract_state=lambda pyboy: _game_state(),
+        press_button=lambda pyboy, button: presses.append(button),
+        read_menu_cursor=lambda pyboy: 0,
+    )
+
+    execute_action(RUN_ACTION)
+
+    # RUN(3) is diagonal from FIGHT(0): one "right", one "down".
+    assert presses == ["right", "down", "a"]
+
+
+def test_pyboy_action_executor_use_move_with_a_malformed_slot_is_a_noop():
+    presses: list[str] = []
+    execute_action = make_pyboy_action_executor(
+        cast(PyBoy, _FakePyBoy()),
+        extract_state=lambda pyboy: _game_state(),
+        press_button=lambda pyboy, button: presses.append(button),
+        read_menu_cursor=lambda pyboy: 0,
+    )
+
+    execute_action("USE_MOVE_not-a-number")
+
+    assert presses == []
+
+
+def test_pyboy_action_executor_use_move_no_longer_raises_unknown_button():
+    """#76's regression pin: this used to raise `ValueError: unknown button:
+    'USE_MOVE_1'` from `navigation.execute_button`'s validation, since #54
+    introduced this action with no translation to a real button press."""
+    state = _game_state(
+        party=(_mon(),),
+        battle=BattleState(
+            in_battle=True,
+            battle_type="wild",
+            opponent_species="RATTATA",
+            opponent_level=3,
+        ),
+    )
+    execute_action = make_pyboy_action_executor(
+        cast(PyBoy, _FakePyBoy()),
+        extract_state=lambda pyboy: state,
+        press_button=lambda pyboy, button: None,
+        read_menu_cursor=lambda pyboy: 0,
+    )
+
+    execute_action("USE_MOVE_1")  # must not raise
+
+
+_ROM_PATH = Path(__file__).resolve().parent.parent / "pokemon_red.gb"
+
+
+@pytest.fixture
+def real_pyboy():
+    """A real, freshly-booted PyBoy instance - no `_FakePyBoy` stand-in - so
+    the tests below exercise `read_menu_cursor`'s real `0xCC26` address
+    against genuine emulator memory, not a mock (#76's acceptance criteria:
+    "exercised end-to-end against a real battle-menu RAM fixture, not just
+    criteria-building unit tests"). No boot-past-intro mash is needed since
+    these only poke/read raw memory, matching `tests/test_game_state.py`'s
+    own fixture-poke style rather than driving a live, on-screen menu -
+    scope note: this proves the address/delta wiring is correct against
+    genuine PyBoy memory, not that a real battle's move/switch/item menu
+    code actually renders and reacts to these presses the way assumed (no
+    committed fixture can drive that: a live encounter isn't deterministic
+    to automate, and a captured save state would be exactly the kind of
+    derived, regenerable artifact `emulator.py`'s own snapshot docstring
+    says not to check in)."""
+    instance = PyBoy(str(_ROM_PATH), window="null")
+    instance.set_emulation_speed(0)
+    instance.tick(1, False)
+    yield instance
+    instance.stop(save=False)
+
+
+pytestmark_real_rom = pytest.mark.skipif(
+    not _ROM_PATH.exists(), reason=f"{_ROM_PATH} not present locally"
+)
+
+
+@pytestmark_real_rom
+def test_pyboy_action_executor_use_move_reads_a_real_ram_cursor_across_two_turns(
+    real_pyboy,
+):
+    """#76 AC1, against real PyBoy memory rather than a fake: the same
+    action, picked on two consecutive turns with two different real, live
+    starting cursor values (as `wCurrentMenuItem` would carry over from
+    whatever a previous turn left it at), presses a genuinely different
+    sequence each time - not a fixed one that's only correct once."""
+    state = _game_state(
+        party=(_mon(moves=(84, 45, 0, 0), pp=(15, 30, 0, 0)),),
+        battle=BattleState(
+            in_battle=True,
+            battle_type="wild",
+            opponent_species="RATTATA",
+            opponent_level=3,
+        ),
+    )
+    presses: list[str] = []
+    execute_action = make_pyboy_action_executor(
+        real_pyboy,
+        extract_state=lambda pyboy: state,
+        press_button=lambda pyboy, button: presses.append(button),
+    )
+
+    # Turn 1: the real cursor already sits on FIGHT(0)/move slot 1.
+    real_pyboy.memory[0xCC26] = 0
+    execute_action("USE_MOVE_1")
+    turn_one = list(presses)
+    presses.clear()
+
+    # Turn 2: a stale cursor left on PKMN(1) - the exact scenario a fixed
+    # sequence gets wrong after turn 1 (this ticket's cited cross-repo bug).
+    real_pyboy.memory[0xCC26] = 1
+    execute_action("USE_MOVE_2")
+    turn_two = list(presses)
+
+    assert turn_one == ["a", "down", "a"]
+    assert turn_two == ["left", "a", "down", "a"]
+    assert turn_one != turn_two
+
+
+@pytestmark_real_rom
+def test_pyboy_action_executor_switch_to_does_not_skip_a_fainted_row_against_real_ram(
+    real_pyboy,
+):
+    """#76 AC2, against real PyBoy memory."""
+    state = _game_state(
+        party=(
+            _mon(species="PIKACHU"),
+            _mon(species="CHARMANDER", hp=0),
+            _mon(species="SQUIRTLE", hp=12),
+        ),
+        battle=BattleState(
+            in_battle=True,
+            battle_type="wild",
+            opponent_species="RATTATA",
+            opponent_level=3,
+        ),
+    )
+    presses: list[str] = []
+    a_presses = 0
+
+    def press_button(pyboy: PyBoy, button: str) -> None:
+        nonlocal a_presses
+        presses.append(button)
+        if button != "a":
+            return
+        a_presses += 1
+        if a_presses == 2:
+            # Simulates the real game landing the freshly-opened SWITCH/
+            # STATS/CANCEL confirmation on STATS(1), not SWITCH(0) - proving
+            # the confirm step reads this real address live rather than
+            # assuming it always opens on SWITCH.
+            pyboy.memory[0xCC26] = 1
+
+    real_pyboy.memory[0xCC26] = 0
+    execute_action = make_pyboy_action_executor(
+        real_pyboy,
+        extract_state=lambda pyboy: state,
+        press_button=press_button,
+    )
+
+    execute_action("SWITCH_TO_3")
+
+    assert presses == ["right", "a", "down", "down", "a", "up", "a"]
+
+
+@pytestmark_real_rom
+def test_pyboy_action_executor_use_item_and_run_against_real_ram(real_pyboy):
+    """#76 AC3: USE_ITEM_<item> and RUN exercised end to end against real
+    PyBoy memory, not just `_battle_action_criteria`'s own unit tests."""
+    item_state = _game_state(
+        inventory=(
+            InventoryItem(item="POTION", quantity=2),
+            InventoryItem(item="OAK's PARCEL", quantity=1),
+        ),
+    )
+    presses: list[str] = []
+    real_pyboy.memory[0xCC26] = 0
+    execute_action = make_pyboy_action_executor(
+        real_pyboy,
+        extract_state=lambda pyboy: item_state,
+        press_button=lambda pyboy, button: presses.append(button),
+    )
+    execute_action("USE_ITEM_OAKS_PARCEL")
+    assert presses == ["down", "a", "down", "a"]
+
+    presses.clear()
+    run_state = _game_state(
+        party=(_mon(),),
+        battle=BattleState(
+            in_battle=True,
+            battle_type="wild",
+            opponent_species="RATTATA",
+            opponent_level=3,
+        ),
+    )
+    real_pyboy.memory[0xCC26] = 0
+    execute_action = make_pyboy_action_executor(
+        real_pyboy,
+        extract_state=lambda pyboy: run_state,
+        press_button=lambda pyboy, button: presses.append(button),
+    )
+    execute_action(RUN_ACTION)
+    assert presses == ["right", "down", "a"]
+
+
+@pytestmark_real_rom
+def test_pyboy_action_executor_use_move_no_longer_raises_unknown_button_against_real_pyboy(
+    real_pyboy,
+):
+    """#76 AC4, against real PyBoy memory rather than `_FakePyBoy`."""
+    state = _game_state(
+        party=(_mon(),),
+        battle=BattleState(
+            in_battle=True,
+            battle_type="wild",
+            opponent_species="RATTATA",
+            opponent_level=3,
+        ),
+    )
+    real_pyboy.memory[0xCC26] = 0
+    execute_action = make_pyboy_action_executor(
+        real_pyboy,
+        extract_state=lambda pyboy: state,
+        press_button=lambda pyboy, button: None,
+    )
+
+    execute_action("USE_MOVE_1")  # must not raise
 
 
 def test_build_jev_client_reads_the_api_key_from_the_environment(monkeypatch):

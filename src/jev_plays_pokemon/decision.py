@@ -52,6 +52,7 @@ from pyboy import PyBoy
 from pydantic import BaseModel
 from typesafe_sdk import Choice, JSONContent, TypeSafeClient
 
+from jev_plays_pokemon import navigation
 from jev_plays_pokemon.game_state import GameState, extract_game_state
 from jev_plays_pokemon.lookup.moves import move_name
 from jev_plays_pokemon.milestones import Milestone, MilestoneProgress, track_milestones
@@ -60,6 +61,8 @@ from jev_plays_pokemon.navigation import (
     NavigationTarget,
     execute_button,
     execute_navigation_macro,
+    main_battle_menu_delta_buttons,
+    menu_list_delta_buttons,
     resolve_navigation_target,
 )
 from jev_plays_pokemon.resilience import TurnSkipped
@@ -104,6 +107,22 @@ RUN_ACTION = "RUN"
 # and "the active party slot's hp == 0" (this ticket's forced-switch check)
 # both mean in practice.
 _ACTIVE_PARTY_SLOT = 1
+
+# The main battle menu's 2x2 grid layout (#76) - standard across Gen 1's
+# wild/trainer battles, cross-checked against `InsaneJSK/DeepRed`'s
+# `battle_controller.py`:
+#   FIGHT(0) | PKMN(1)
+#   ---------+--------
+#   ITEM(2)  | RUN(3)
+_MAIN_MENU_FIGHT = 0
+_MAIN_MENU_PKMN = 1
+_MAIN_MENU_ITEM = 2
+_MAIN_MENU_RUN = 3
+
+# Picking a party member from the PKMN list opens a SWITCH/STATS/CANCEL
+# confirmation - SWITCH is always its top (id-0) option, per
+# `InsaneJSK/DeepRed`'s `battle_controller.py`.
+_CONFIRM_SWITCH_INDEX = 0
 
 
 def _sanitize_action_token(text: str) -> str:
@@ -166,6 +185,120 @@ def _battle_action_criteria(state: GameState) -> dict[str, str]:
         criteria[RUN_ACTION] = "Run from this wild battle"
 
     return criteria
+
+
+def _is_battle_menu_action(action: str) -> bool:
+    return action == RUN_ACTION or action.startswith(
+        (_USE_MOVE_PREFIX, _USE_ITEM_PREFIX, _SWITCH_TO_PREFIX)
+    )
+
+
+def _navigate_menu(
+    pyboy: PyBoy,
+    delta_buttons: Callable[[int], tuple[str, ...]],
+    *,
+    press_button: Callable[[PyBoy, str], None],
+    read_menu_cursor: Callable[[PyBoy], int],
+) -> None:
+    """Read one battle-menu screen's live cursor, press only what
+    `delta_buttons` computes for it, then confirm with A.
+
+    The one navigation primitive every step of `_execute_battle_action`
+    (#76) is built from: never a fixed-length sequence, since Gen 1's menu
+    cursor persists across turns (see `navigation.menu_list_delta_buttons`/
+    `main_battle_menu_delta_buttons`'s docstrings). Reading fresh on every
+    call - rather than letting a caller reuse an earlier read - matters
+    because a screen's cursor means something different the moment a new
+    menu opens on top of it.
+    """
+    cursor = read_menu_cursor(pyboy)
+    for button in delta_buttons(cursor):
+        press_button(pyboy, button)
+    press_button(pyboy, "a")
+
+
+def _execute_battle_action(
+    pyboy: PyBoy,
+    action: str,
+    state: GameState,
+    *,
+    press_button: Callable[[PyBoy, str], None],
+    read_menu_cursor: Callable[[PyBoy], int],
+) -> None:
+    """Translate one in-battle `Decision.action` (#54) into the Game Boy
+    input Gen 1's battle menus require (#76), via `_navigate_menu`.
+
+    Move/switch/item targets are the real, unfiltered slot/bag position
+    (`_battle_action_criteria` already keys them that way) - a fainted party
+    member or an unusable move still occupies its own real row in the menu,
+    so no compaction/re-indexing happens here either (per this ticket's
+    acceptance criteria).
+
+    Parses `USE_MOVE_<slot>`/`SWITCH_TO_<slot>`'s numeric suffix defensively:
+    an unparseable slot (Jev picking something outside the criteria it was
+    given) is a no-op rather than a crash, matching this ticket's whole
+    point - a battle turn should never raise over the chosen action. Same for
+    `USE_ITEM_<item>` when the token doesn't match anything in `state.
+    inventory`.
+    """
+
+    def navigate(delta_buttons: Callable[[int], tuple[str, ...]]) -> None:
+        _navigate_menu(
+            pyboy,
+            delta_buttons,
+            press_button=press_button,
+            read_menu_cursor=read_menu_cursor,
+        )
+
+    if action == RUN_ACTION:
+        navigate(lambda cursor: main_battle_menu_delta_buttons(cursor, _MAIN_MENU_RUN))
+        return
+
+    if action.startswith(_USE_MOVE_PREFIX):
+        try:
+            slot = int(action[len(_USE_MOVE_PREFIX) :])
+        except ValueError:
+            return
+        navigate(
+            lambda cursor: main_battle_menu_delta_buttons(cursor, _MAIN_MENU_FIGHT)
+        )
+        # The move list is 1-indexed by cursor value (cursor == slot) -
+        # cross-checked against `2389-research/jev-plays-pokemon`'s
+        # `battle.py`, validated there against a real battle save state.
+        navigate(lambda cursor: menu_list_delta_buttons(cursor, slot))
+        return
+
+    if action.startswith(_SWITCH_TO_PREFIX):
+        try:
+            slot = int(action[len(_SWITCH_TO_PREFIX) :])
+        except ValueError:
+            return
+        navigate(lambda cursor: main_battle_menu_delta_buttons(cursor, _MAIN_MENU_PKMN))
+        navigate(lambda cursor: menu_list_delta_buttons(cursor, slot - 1))
+        # Picking a party member opens a SWITCH/STATS/CANCEL confirmation
+        # (SWITCH is always its top, id-0, option) - cross-checked against
+        # `InsaneJSK/DeepRed`'s `switch()`. Read live rather than assumed,
+        # same as every other menu here (#76): a blind fixed press would be
+        # exactly the bug this ticket exists to close if that assumption
+        # ever turns out wrong.
+        navigate(lambda cursor: menu_list_delta_buttons(cursor, _CONFIRM_SWITCH_INDEX))
+        return
+
+    if action.startswith(_USE_ITEM_PREFIX):
+        item_token = action[len(_USE_ITEM_PREFIX) :]
+        item_index = next(
+            (
+                index
+                for index, entry in enumerate(state.inventory)
+                if _sanitize_action_token(entry.item) == item_token
+            ),
+            None,
+        )
+        if item_index is None:
+            return
+        navigate(lambda cursor: main_battle_menu_delta_buttons(cursor, _MAIN_MENU_ITEM))
+        navigate(lambda cursor: menu_list_delta_buttons(cursor, item_index))
+        return
 
 
 _ACTION_QUESTION_ID = "action"
@@ -459,20 +592,26 @@ def make_pyboy_action_executor(
     ] = resolve_navigation_target,
     run_macro: Callable[[PyBoy, NavigationTarget], bool] = execute_navigation_macro,
     press_button: Callable[[PyBoy, str], None] = execute_button,
+    read_menu_cursor: Callable[[PyBoy], int] = navigation.read_menu_cursor,
 ) -> ActionExecutor:
     """Build the real `execute_action` callable for `run_turn`, against `pyboy`.
 
-    The `extract_state`/`resolve_target`/`run_macro`/`press_button` seams
-    default to the real `game_state`/`navigation` functions and only need
-    overriding in tests (per this ticket's no-real-PyBoy test-coverage
-    requirement) - production callers just pass `pyboy`.
+    The `extract_state`/`resolve_target`/`run_macro`/`press_button`/
+    `read_menu_cursor` seams default to the real `game_state`/`navigation`
+    functions and only need overriding in tests (per this ticket's
+    no-real-PyBoy test-coverage requirement) - production callers just pass
+    `pyboy`.
 
     Dispatches a raw button straight to `press_button`. The navigation macro
     action re-reads the current milestone itself (rather than reusing the
     triggering `Decision`'s own snapshot) so it always targets whatever's
     current at execution time, and is a no-op when that milestone has no
     verified tile target yet (see `navigation.py`'s docstring -
-    `resolve_navigation_target` returns `None` in that case).
+    `resolve_navigation_target` returns `None` in that case). A dynamic
+    battle action (#54's `USE_MOVE_<slot>`/`USE_ITEM_<item>`/
+    `SWITCH_TO_<slot>`/`RUN`) is translated into the matching button sequence
+    by `_execute_battle_action` (#76) instead, since none of those are legal
+    `press_button` arguments on their own.
     """
 
     def execute_action(action: str) -> None:
@@ -482,6 +621,16 @@ def make_pyboy_action_executor(
             target = resolve_target(milestone_progress.current)
             if target is not None:
                 run_macro(pyboy, target)
+            return
+        if _is_battle_menu_action(action):
+            state = extract_state(pyboy)
+            _execute_battle_action(
+                pyboy,
+                action,
+                state,
+                press_button=press_button,
+                read_menu_cursor=read_menu_cursor,
+            )
             return
         press_button(pyboy, action)
 
