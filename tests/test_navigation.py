@@ -258,6 +258,66 @@ def test_navigation_macro_reaches_a_milestones_target_end_to_end(pyboy_outdoors)
     assert (after.player_x, after.player_y) == (target.x, target.y)
 
 
+_TO_OAKS_LAB_TABLE_PATH: tuple[str, ...] = (
+    "down",
+    "down",
+    "down",
+    "down",
+    "right",
+    "right",
+    "right",
+    "down",
+    "down",
+    "down",
+    "right",
+    "up",
+    "down",
+    "down",
+    "right",
+    "right",
+    "right",
+    "up",
+    "down",
+    "up",
+    "up",
+    "up",
+    "up",
+    "up",
+    "up",
+    "right",
+    "right",
+    "up",
+)
+
+
+def test_walking_to_oaks_lab_starter_table_reaches_a_rom_verified_tile(pyboy_outdoors):
+    """#90's worked example of the repeatable ROM-verification method (see
+    `docs/research/rom-verification-method.md`): a fixed button sequence
+    from the outdoor Pallet Town spawn - built and re-verified the same way
+    `_HOUSE_EXIT_PATH` was (screenshotting each step against the real ROM,
+    see the linked doc) - walks the player through Oak's Lab's front door
+    up to the starter Poke Ball table, landing on the one tile that's
+    actually interactive: pressing "a" there opens a real dialog box
+    (`GameState.dialog_open`), not just a tile that's visually adjacent to
+    the table. This is `milestones.py`'s "got_starter" milestone's real,
+    ROM-verified `target_x`/`target_y` (Oak's Lab, map 40) - wiring it into
+    that milestone's entry is ordinary #84 follow-up work, not done here.
+    """
+    for direction in _TO_OAKS_LAB_TABLE_PATH:
+        execute_button(pyboy_outdoors, direction)
+
+    assert _position(pyboy_outdoors) == (40, 7, 4)
+
+    pyboy_outdoors.button("a", 2)
+    dialog_opened = False
+    for _ in range(10):
+        pyboy_outdoors.tick(30, True)
+        if extract_game_state(pyboy_outdoors).dialog_open:
+            dialog_opened = True
+            break
+    assert dialog_opened
+
+
 def _milestone(target_x: int | None = None, target_y: int | None = None) -> Milestone:
     return Milestone(
         milestone_id="test_milestone",
