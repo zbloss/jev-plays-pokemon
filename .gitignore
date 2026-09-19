@@ -223,6 +223,7 @@ __marimo__/
 .repowise/.env
 pokemon_red.gb
 pokemon_red.state
+heartbeat.txt
 .DS_Store
 
 **/**/.DS_Store

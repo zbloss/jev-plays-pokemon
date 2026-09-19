@@ -25,7 +25,8 @@ tests:
   dialog-decode clients, starts the read-only stream surface and its
   frame-capture timer (#51, reading the same live screen the vision fallback
   captures), wraps its state/action seams for stuck detection (#57), and
-  runs ``run_loop`` until interrupted.
+  runs ``run_loop`` until interrupted - catching (and logging) a crash
+  in-process and exiting nonzero, for ``watchdog.py`` (#58) to restart.
 
 Like the rest of the package, nothing here reaches TypeSafe for vision or the
 reverse: Jev's Choice goes through the ``typesafe_sdk`` client (#21); dialog
@@ -36,6 +37,7 @@ text is decoded through the separately-configured OpenAI-compatible backend
 from __future__ import annotations
 
 import logging
+import sys
 import time
 from collections.abc import Callable
 
@@ -43,6 +45,7 @@ from pyboy import PyBoy
 
 from jev_plays_pokemon import emulator
 from jev_plays_pokemon.decision import (
+    Decision,
     DecisionLogger,
     DialogTextSource,
     JevClient,
@@ -61,6 +64,7 @@ from jev_plays_pokemon.stream_surface import (
     stream_logger,
 )
 from jev_plays_pokemon.stuck_detection import wrap_for_stuck_detection
+from jev_plays_pokemon.watchdog import touch_heartbeat
 
 logger = logging.getLogger(__name__)
 
@@ -207,8 +211,12 @@ def main(
         jev_client = build_jev_client()
     # Wraps whichever client was resolved above (real or caller-supplied) in
     # retry/backoff handling (#56) - transparent to run_loop/run_turn, which
-    # only ever see the JevClient seam.
-    jev_client = ResilientJevClient(jev_client)
+    # only ever see the JevClient seam. `on_attempt` touches the heartbeat
+    # file (#58) on every attempt/backoff tick, so a run currently backing
+    # off through an API outage still looks alive to the watchdog.
+    jev_client = ResilientJevClient(
+        jev_client, on_attempt=lambda event: touch_heartbeat()
+    )
 
     pyboy = emulator.boot_or_resume(rom_path or emulator.DEFAULT_ROM_PATH)
     surface = StreamSurface()
@@ -254,22 +262,42 @@ def main(
         load_snapshot=load_snapshot_if_present,
     )
 
+    log_and_update_surface = stream_logger(surface)
+
+    def on_decision(decision: Decision) -> None:
+        # Full-turn completion is the heartbeat's other write point (#58),
+        # alongside resilience.py's per-attempt one above - a healthy run
+        # with no retries at all still keeps the file fresh.
+        touch_heartbeat()
+        log_and_update_surface(decision)
+
+    crashed = False
     try:
         run_loop(
             state_source,
             jev_client,
             execute_action,
-            on_decision=stream_logger(surface),
+            on_decision=on_decision,
             dialog_text_source=dialog_text_source,
             save_snapshot=save_snapshot,
         )
     except KeyboardInterrupt:
         logger.info("interrupted; shutting down")
+    except Exception:
+        # Caught in-process (#58) rather than left to propagate as a bare
+        # traceback: logged here, then a deliberate nonzero exit below (once
+        # cleanup finishes) is what tells watchdog.py's subprocess-restart
+        # loop this run crashed.
+        logger.exception("main() crashed")
+        crashed = True
     finally:
         server.shutdown()
         server.server_close()
         frame_capture_timer.stop()
         pyboy.stop(save=False)
+
+    if crashed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
