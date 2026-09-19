@@ -52,7 +52,7 @@ from pyboy import PyBoy
 from pydantic import BaseModel
 from typesafe_sdk import Choice, JSONContent, TypeSafeClient
 
-from jev_plays_pokemon import navigation
+from jev_plays_pokemon import emulator, navigation
 from jev_plays_pokemon.game_state import GameState, extract_game_state
 from jev_plays_pokemon.lookup.moves import move_name
 from jev_plays_pokemon.milestones import Milestone, MilestoneProgress, track_milestones
@@ -224,7 +224,7 @@ def _execute_battle_action(
     *,
     press_button: Callable[[PyBoy, str], None],
     read_menu_cursor: Callable[[PyBoy], int],
-) -> None:
+) -> bool:
     """Translate one in-battle `Decision.action` (#54) into the Game Boy
     input Gen 1's battle menus require (#76), via `_navigate_menu`.
 
@@ -240,6 +240,11 @@ def _execute_battle_action(
     point - a battle turn should never raise over the chosen action. Same for
     `USE_ITEM_<item>` when the token doesn't match anything in `state.
     inventory`.
+
+    Returns whether it actually pressed anything - `False` on any of the
+    no-op cases above (`make_pyboy_action_executor` uses this to know when a
+    turn needs #81's explicit extra render, since a no-op here never ticks
+    `pyboy` itself).
     """
 
     def navigate(delta_buttons: Callable[[int], tuple[str, ...]]) -> None:
@@ -252,13 +257,13 @@ def _execute_battle_action(
 
     if action == RUN_ACTION:
         navigate(lambda cursor: main_battle_menu_delta_buttons(cursor, _MAIN_MENU_RUN))
-        return
+        return True
 
     if action.startswith(_USE_MOVE_PREFIX):
         try:
             slot = int(action[len(_USE_MOVE_PREFIX) :])
         except ValueError:
-            return
+            return False
         navigate(
             lambda cursor: main_battle_menu_delta_buttons(cursor, _MAIN_MENU_FIGHT)
         )
@@ -266,13 +271,13 @@ def _execute_battle_action(
         # cross-checked against `2389-research/jev-plays-pokemon`'s
         # `battle.py`, validated there against a real battle save state.
         navigate(lambda cursor: menu_list_delta_buttons(cursor, slot))
-        return
+        return True
 
     if action.startswith(_SWITCH_TO_PREFIX):
         try:
             slot = int(action[len(_SWITCH_TO_PREFIX) :])
         except ValueError:
-            return
+            return False
         navigate(lambda cursor: main_battle_menu_delta_buttons(cursor, _MAIN_MENU_PKMN))
         navigate(lambda cursor: menu_list_delta_buttons(cursor, slot - 1))
         # Picking a party member opens a SWITCH/STATS/CANCEL confirmation
@@ -282,7 +287,7 @@ def _execute_battle_action(
         # exactly the bug this ticket exists to close if that assumption
         # ever turns out wrong.
         navigate(lambda cursor: menu_list_delta_buttons(cursor, _CONFIRM_SWITCH_INDEX))
-        return
+        return True
 
     if action.startswith(_USE_ITEM_PREFIX):
         item_token = action[len(_USE_ITEM_PREFIX) :]
@@ -295,10 +300,12 @@ def _execute_battle_action(
             None,
         )
         if item_index is None:
-            return
+            return False
         navigate(lambda cursor: main_battle_menu_delta_buttons(cursor, _MAIN_MENU_ITEM))
         navigate(lambda cursor: menu_list_delta_buttons(cursor, item_index))
-        return
+        return True
+
+    return False
 
 
 _ACTION_QUESTION_ID = "action"
@@ -593,14 +600,15 @@ def make_pyboy_action_executor(
     run_macro: Callable[[PyBoy, NavigationTarget], bool] = execute_navigation_macro,
     press_button: Callable[[PyBoy, str], None] = execute_button,
     read_menu_cursor: Callable[[PyBoy], int] = navigation.read_menu_cursor,
+    render_frame: Callable[[PyBoy], None] = emulator.render_current_frame,
 ) -> ActionExecutor:
     """Build the real `execute_action` callable for `run_turn`, against `pyboy`.
 
     The `extract_state`/`resolve_target`/`run_macro`/`press_button`/
-    `read_menu_cursor` seams default to the real `game_state`/`navigation`
-    functions and only need overriding in tests (per this ticket's
-    no-real-PyBoy test-coverage requirement) - production callers just pass
-    `pyboy`.
+    `read_menu_cursor`/`render_frame` seams default to the real
+    `game_state`/`navigation`/`emulator` functions and only need overriding
+    in tests (per this ticket's no-real-PyBoy test-coverage requirement) -
+    production callers just pass `pyboy`.
 
     Dispatches a raw button straight to `press_button`. The navigation macro
     action re-reads the current milestone itself (rather than reusing the
@@ -612,6 +620,34 @@ def make_pyboy_action_executor(
     `SWITCH_TO_<slot>`/`RUN`) is translated into the matching button sequence
     by `_execute_battle_action` (#76) instead, since none of those are legal
     `press_button` arguments on their own.
+
+    `render_frame` (#81) only runs when the turn's dispatch was itself a
+    no-op: `NAVIGATION_MACRO_ACTION` whenever `resolve_target` can't resolve
+    a target (true for every milestone today - see above), or a malformed
+    battle action (an unparseable slot, an item not in `state.inventory`,
+    both reported back via `_execute_battle_action`'s return value). Those
+    are the only two paths that leave `pyboy` completely untouched - every
+    other dispatch already ticks with `render=True` inside `press_button`
+    (directly, or via `_execute_battle_action`/`run_macro`), so calling
+    `render_frame` there too would just pay a redundant extra tick forever.
+    A perpetually-untouched `pyboy` starves `frame_capture.py`'s background
+    capture of any rendered frame to read - its `capture_screen` read has no
+    ticking of its own (see `main.main`'s wiring) - which is exactly #81's
+    bug: a run where Jev keeps picking the (today, always no-op) navigation
+    macro never renders a single frame, so `/video.mjpg` stays solid white
+    forever.
+
+    This is a deliberate narrower fix than #81's other two "worth checking"
+    angles: it doesn't add any cross-thread ticking of `pyboy` from
+    `frame_capture.py`'s own background capture thread (the tactical loop's
+    thread is the only thread that ever calls `pyboy.tick()`, and it stays
+    that way - ticking `pyboy` from two threads at once is unsupported and
+    would risk corrupting `navigation.execute_button`'s own precisely-counted
+    tick loops), and it doesn't address a possible read/tick data race
+    between that capture thread and the tactical loop (pre-existing, not
+    introduced or worsened here - #81's own symptom, a clean uniform-white
+    frame with no corruption/errors, matches a screen that was simply never
+    rendered, not a torn or raced one).
     """
 
     def execute_action(action: str) -> None:
@@ -621,17 +657,20 @@ def make_pyboy_action_executor(
             target = resolve_target(milestone_progress.current)
             if target is not None:
                 run_macro(pyboy, target)
-            return
-        if _is_battle_menu_action(action):
+            else:
+                render_frame(pyboy)
+        elif _is_battle_menu_action(action):
             state = extract_state(pyboy)
-            _execute_battle_action(
+            pressed = _execute_battle_action(
                 pyboy,
                 action,
                 state,
                 press_button=press_button,
                 read_menu_cursor=read_menu_cursor,
             )
-            return
-        press_button(pyboy, action)
+            if not pressed:
+                render_frame(pyboy)
+        else:
+            press_button(pyboy, action)
 
     return execute_action

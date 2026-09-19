@@ -255,7 +255,9 @@ def main(
     # project's `window="null"` backend - see its own docstring) is the same
     # PIL-Image-from-`ndarray` read `dialog_vision.py` already uses, so
     # `/video.mjpg` JPEG-encodes the same pixels the vision fallback would
-    # decode. `navigation.execute_button`'s per-turn `render=True` tick (#47)
+    # decode. `decision.make_pyboy_action_executor`'s per-turn `render_frame`
+    # call (#81, itself either `navigation.execute_button`'s own `render=True`
+    # tick (#47) or an explicit extra one when the turn's action was a no-op)
     # keeps the buffer continuously fresh once play starts, independent of
     # this capture timer's own ~10fps pull cadence (#48).
     frame_capture = FrameCapture(lambda: capture_screen(pyboy))
