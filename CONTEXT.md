@@ -27,6 +27,18 @@ _Avoid_: "actions" alone when the full set, as opposed to one turn's legal subse
 A single Choice option that walks Jev's character toward whatever target the current-objective milestone tracker is pointing at, using RAM-derived pathfinding executed over multiple emulator frames. Jev decides only whether to invoke it this turn; it takes no destination argument, so it stays a flat Choice option rather than a function-call.
 _Avoid_: "navigate_to" (the reference starter's function name — not reused code, see #9's licensing decision)
 
+**Travel graph**:
+The hand-authored, reusable graph of hops between maps that the navigation macro's cross-map routing searches, statelessly, on every invocation to find the next hop toward the current milestone's target map. See `docs/adr/` for the architecture decision.
+_Avoid_: "warp graph" (undercounts — some hops are map-edge connections, not warps), "waypoint graph" (a waypoint is a hop's tile, not the graph itself)
+
+**Hop**:
+A single travel graph edge — one warp door or map-edge connection — that takes the player from a specific tile on one map to a specific tile on an adjacent map. The travel graph is built entirely from hops.
+_Avoid_: "warp" alone when a connection-based hop is equally possible
+
+**Last-mile pathing**:
+The existing local A* search over PyBoy's on-screen collision window, scoped to walking from the player's current position to the next hop's tile (or the milestone's own target tile, once on the target map) rather than to a distant milestone target directly.
+_Avoid_: "local pathfinding" alone once the travel graph exists — ambiguous about whether the whole route or just the current map's last leg is meant
+
 **Game state**:
 The structured text description of the current moment in the game that gets handed to Jev as input for a decision. Preferred source is direct extraction from emulator memory (RAM); a vision-model-as-tool-call is the fallback path when reliable RAM extraction isn't available for a given piece of state.
 _Avoid_: "the screen", "the frame" (game state is text handed to Jev, not an image — the image only exists on the vision-fallback path)
