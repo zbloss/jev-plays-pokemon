@@ -26,6 +26,7 @@ exist at this pinned version.
 """
 
 from dataclasses import dataclass
+from typing import Literal
 
 from pyboy import PyBoy
 
@@ -70,18 +71,32 @@ _EVENT_FLAGS_START_ADDRESS = 0xD747
 _EVENT_FLAGS_END_ADDRESS = 0xD886
 
 # `wIsInBattle`: 0 = no battle, 1 = wild battle, 2 = trainer battle, -1 (0xFF) =
-# lost battle (pokered's own comment on the symbol). There is no reliably
-# address-verifiable "won" signal independent of this - `wBattleResult` exists
-# in pokered but its declaration sits inside a WRAM union whose base address
-# isn't computable from the disassembly source alone, and no secondary source
-# (PokemonRedExperiments, Data Crystal) documents a verified address for it
-# either, so it's deliberately left out here rather than guessed.
+# lost battle (pokered's own comment on the symbol).
 _IS_IN_BATTLE_ADDRESS = 0xD057
 _BATTLE_TYPE_LOST = 0xFF
 _BATTLE_TYPE_WILD = 1
 _BATTLE_TYPE_TRAINER = 2
 _CURRENT_OPPONENT_ADDRESS = 0xD059
 _CURRENT_ENEMY_LEVEL_ADDRESS = 0xD127
+
+# `wBattleResult` (#75): a plain, standalone `db` in pokered's `ram/wram.asm`
+# ("WRAM" section, right after `wBoughtOrSoldItemInMart` and right before
+# `wAutoTextBoxDrawingControl`, outside every `UNION`/`ENDU` block) - not
+# inside a union as previously assumed here. Its address is computed by
+# summing every preceding struct/db/ds/UNION size from WRAM0's origin per
+# pokered's own `layout.link` (WRAM0 starts its packed layout at $c100, not
+# $c000 - the "Audio RAM" section ahead of it is placed separately), the same
+# method this file already uses for its other addresses, and cross-checked
+# by reproducing that sum in full for `wIsInBattle`/`wCurOpponent`/
+# `wPartyCount`/`wNumBagItems`/`wPlayerMoney`/`wObtainedBadges`/`wCurMap`/
+# `wYCoord`/`wXCoord` - every other address already verified in this file -
+# and getting an exact match for all nine.
+_BATTLE_RESULT_ADDRESS = 0xCF0B
+_BATTLE_RESULT_WIN = 0x00
+_BATTLE_RESULT_LOSE = 0x01
+_BATTLE_RESULT_DRAW = 0x02
+
+BattleResult = Literal["win", "lose", "draw"]
 
 _MAP_ID_ADDRESS = 0xD35E
 _PLAYER_Y_ADDRESS = 0xD361
@@ -135,11 +150,55 @@ class GameState:
     map_name: str
     player_x: int
     player_y: int
+    last_battle_result: BattleResult | None = None
 
 
-def extract_game_state(pyboy: PyBoy) -> GameState:
-    """Read one turn's structured `GameState` from a running PyBoy instance."""
+class BattleResultTracker:
+    """Latches `wBattleResult` at the instant `wIsInBattle` transitions from
+    nonzero (wild/trainer/lost) to `0` (#75) - the only instant its value
+    means anything, since the game reuses/clears the byte between battles.
+
+    One instance per run, fed every turn's `BattleState.battle_type` via
+    `update`. Returns the most recently latched result, or `None` before any
+    battle has ended.
+    """
+
+    def __init__(self) -> None:
+        self._battle_in_progress = False
+        self._latched: BattleResult | None = None
+
+    def update(self, memory, battle_type: str) -> BattleResult | None:
+        battle_in_progress = battle_type != "none"
+        if self._battle_in_progress and not battle_in_progress:
+            raw = memory[_BATTLE_RESULT_ADDRESS]
+            if raw == _BATTLE_RESULT_WIN:
+                self._latched = "win"
+            elif raw == _BATTLE_RESULT_LOSE:
+                self._latched = "lose"
+            elif raw == _BATTLE_RESULT_DRAW:
+                self._latched = "draw"
+        self._battle_in_progress = battle_in_progress
+        return self._latched
+
+
+def extract_game_state(
+    pyboy: PyBoy, *, battle_result_tracker: BattleResultTracker | None = None
+) -> GameState:
+    """Read one turn's structured `GameState` from a running PyBoy instance.
+
+    `battle_result_tracker` is optional (#75): callers that don't pass one
+    (most tests, `benchmark.py`, `navigation.py`) get `last_battle_result=None`
+    on every call, the same as before this field existed. Production wiring
+    (`main.py`) passes one long-lived tracker across turns so the latch
+    survives from the turn a battle ends to whenever it's next read.
+    """
     memory = pyboy.memory
+    battle = _read_battle(memory)
+    last_battle_result = (
+        battle_result_tracker.update(memory, battle.battle_type)
+        if battle_result_tracker is not None
+        else None
+    )
 
     return GameState(
         party=_read_party(memory),
@@ -147,13 +206,14 @@ def extract_game_state(pyboy: PyBoy) -> GameState:
         inventory=_read_inventory(memory),
         badges=_read_badges(memory),
         event_flags=_read_event_flags(memory),
-        battle=_read_battle(memory),
+        battle=battle,
         dialog_open=pyboy.tilemap_window[_DIALOG_ARROW_COLUMN, _DIALOG_ARROW_ROW]
         == _DIALOG_ARROW_TILE,
         map_id=memory[_MAP_ID_ADDRESS],
         map_name=map_name(memory[_MAP_ID_ADDRESS]),
         player_x=memory[_PLAYER_X_ADDRESS],
         player_y=memory[_PLAYER_Y_ADDRESS],
+        last_battle_result=last_battle_result,
     )
 
 

@@ -60,7 +60,11 @@ from jev_plays_pokemon.decision import (
 from jev_plays_pokemon.dialog_decode import DialogDecoder, load_dialog_decoder_or_none
 from jev_plays_pokemon.dialog_vision import capture_screen
 from jev_plays_pokemon.frame_capture import FrameCapture, start_frame_capture
-from jev_plays_pokemon.game_state import GameState, extract_game_state
+from jev_plays_pokemon.game_state import (
+    BattleResultTracker,
+    GameState,
+    extract_game_state,
+)
 from jev_plays_pokemon.rate_limit import RateLimitedJevClient
 from jev_plays_pokemon.resilience import ResilientJevClient
 from jev_plays_pokemon.settings import Settings
@@ -283,12 +287,17 @@ def main(
                 "yet; continuing without reloading"
             )
 
+    # One tracker for the whole run (#75): `extract_game_state` is called
+    # fresh every turn, so the wIsInBattle-transition latch has to live
+    # outside it, in a long-lived object threaded through every call.
+    battle_result_tracker = BattleResultTracker()
+
     # A thin wrapper around run_loop's own seams (#57), not a change inside
     # run_turn: pairs each turn's freshly-read position with the action
     # run_turn goes on to execute, and injects a nudge/reload as a side
     # effect when the rolling history says the run is stuck.
     state_source, execute_action = wrap_for_stuck_detection(
-        lambda: extract_game_state(pyboy),
+        lambda: extract_game_state(pyboy, battle_result_tracker=battle_result_tracker),
         execute_action,
         load_snapshot=load_snapshot_if_present,
     )

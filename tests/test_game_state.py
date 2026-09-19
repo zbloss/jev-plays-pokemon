@@ -3,7 +3,11 @@ from pathlib import Path
 import pytest
 from pyboy import PyBoy
 
-from jev_plays_pokemon.game_state import BattleState, extract_game_state
+from jev_plays_pokemon.game_state import (
+    BattleResultTracker,
+    BattleState,
+    extract_game_state,
+)
 
 ROM_PATH = Path(__file__).resolve().parent.parent / "pokemon_red.gb"
 
@@ -174,6 +178,83 @@ def test_lost_battle_is_reported_as_not_in_battle(pyboy):
 
     assert state.battle.battle_type == "lost"
     assert state.battle.in_battle is False
+
+
+def test_last_battle_result_is_none_without_a_tracker(pyboy):
+    pyboy.memory[0xD057] = 1  # wild battle
+    pyboy.memory[0xCF0B] = 0x00  # win, but there's no tracker to latch it
+
+    state = extract_game_state(pyboy)
+
+    assert state.last_battle_result is None
+
+
+def test_last_battle_result_is_none_before_any_battle_has_ended(pyboy):
+    tracker = BattleResultTracker()
+
+    state = extract_game_state(pyboy, battle_result_tracker=tracker)
+
+    assert state.last_battle_result is None
+
+
+def test_last_battle_result_latches_a_win_on_the_nonzero_to_zero_transition(pyboy):
+    tracker = BattleResultTracker()
+
+    pyboy.memory[0xD057] = 1  # wild battle in progress
+    state = extract_game_state(pyboy, battle_result_tracker=tracker)
+    assert state.last_battle_result is None
+
+    pyboy.memory[0xD057] = 0  # battle just ended
+    pyboy.memory[0xCF0B] = 0x00  # win
+    state = extract_game_state(pyboy, battle_result_tracker=tracker)
+
+    assert state.last_battle_result == "win"
+
+
+def test_last_battle_result_latches_a_loss_from_the_lost_battle_state(pyboy):
+    tracker = BattleResultTracker()
+
+    pyboy.memory[0xD057] = 2  # trainer battle in progress
+    extract_game_state(pyboy, battle_result_tracker=tracker)
+
+    pyboy.memory[0xD057] = 0xFF  # lost
+    extract_game_state(pyboy, battle_result_tracker=tracker)
+
+    pyboy.memory[0xD057] = 0  # settles back to no battle
+    pyboy.memory[0xCF0B] = 0x01  # lose
+    state = extract_game_state(pyboy, battle_result_tracker=tracker)
+
+    assert state.last_battle_result == "lose"
+
+
+def test_last_battle_result_latches_a_draw(pyboy):
+    tracker = BattleResultTracker()
+
+    pyboy.memory[0xD057] = 2  # trainer battle in progress
+    extract_game_state(pyboy, battle_result_tracker=tracker)
+
+    pyboy.memory[0xD057] = 0
+    pyboy.memory[0xCF0B] = 0x02  # draw
+    state = extract_game_state(pyboy, battle_result_tracker=tracker)
+
+    assert state.last_battle_result == "draw"
+
+
+def test_last_battle_result_stays_latched_until_the_next_battle_ends(pyboy):
+    tracker = BattleResultTracker()
+
+    pyboy.memory[0xD057] = 1
+    extract_game_state(pyboy, battle_result_tracker=tracker)
+    pyboy.memory[0xD057] = 0
+    pyboy.memory[0xCF0B] = 0x00  # win
+    extract_game_state(pyboy, battle_result_tracker=tracker)
+
+    # `wBattleResult` gets reused/cleared between battles - reading it on a
+    # tick that isn't the latch transition must not affect the exposed value.
+    pyboy.memory[0xCF0B] = 0xFF
+    state = extract_game_state(pyboy, battle_result_tracker=tracker)
+
+    assert state.last_battle_result == "win"
 
 
 def test_dialog_open_is_detected_from_the_continue_arrow_tile(pyboy):
