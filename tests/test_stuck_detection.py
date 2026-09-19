@@ -1,6 +1,8 @@
 import dataclasses
 
+from jev_plays_pokemon.decision import NAVIGATION_MACRO_ACTION
 from jev_plays_pokemon.game_state import BattleState, GameState
+from jev_plays_pokemon.navigation import RAW_BUTTONS
 from jev_plays_pokemon.stuck_detection import (
     RecoveryTier,
     StuckRecoveryPolicy,
@@ -174,6 +176,36 @@ def test_wrap_nudges_with_a_legal_action_once_stuck_and_does_not_double_record_i
     # ever paired into history (checked indirectly below via turn 5+6 not
     # re-triggering a nudge immediately from a corrupted pairing).
     assert executed == ["up", "down", "up", "down", "nudge"]
+
+
+def test_wrap_nudge_pool_excludes_the_navigation_macro_without_a_resolvable_target():
+    # #83: `_game_state()`'s empty event_flags/badges resolve to the
+    # "got_starter" milestone, which - like every milestone shipped today -
+    # has no tile-level target. A nudge that rolled the macro anyway would
+    # press nothing and leave the run wedged, so the default (unpinned)
+    # nudge pool must never offer it here.
+    nudge_pools: list[tuple[str, ...]] = []
+
+    def spy_random_choice(actions):
+        pool = tuple(actions)
+        nudge_pools.append(pool)
+        return pool[0]
+
+    wrapped_state_source, wrapped_execute_action = wrap_for_stuck_detection(
+        lambda: _game_state(),  # always the same position
+        lambda action: None,
+        load_snapshot=lambda: None,
+        threshold=4,
+        random_choice=spy_random_choice,
+    )
+
+    for action in ("up", "down", "up", "down"):
+        wrapped_state_source()
+        wrapped_execute_action(action)
+
+    assert nudge_pools, "expected the stuck nudge to have fired"
+    assert nudge_pools[0] == RAW_BUTTONS
+    assert NAVIGATION_MACRO_ACTION not in nudge_pools[0]
 
 
 def test_wrap_escalates_to_reload_and_clears_history_after_a_sustained_stuck_run():

@@ -1,4 +1,5 @@
 import dataclasses
+import inspect
 import logging
 from pathlib import Path
 from typing import cast
@@ -7,6 +8,8 @@ import pytest
 from pyboy import PyBoy
 from typesafe_sdk import TypeSafeClient, TypeSafeError
 
+from jev_plays_pokemon import decision as decision_module
+from jev_plays_pokemon import navigation as navigation_module
 from jev_plays_pokemon.decision import (
     ACTION_SPACE,
     NAVIGATION_MACRO_ACTION,
@@ -16,6 +19,7 @@ from jev_plays_pokemon.decision import (
     decide_action,
     log_decision,
     make_pyboy_action_executor,
+    out_of_battle_action_space,
     run_turn,
 )
 from jev_plays_pokemon.game_state import (
@@ -24,8 +28,13 @@ from jev_plays_pokemon.game_state import (
     InventoryItem,
     PartyPokemon,
 )
-from jev_plays_pokemon.milestones import track_milestones
-from jev_plays_pokemon.navigation import NavigationTarget
+from jev_plays_pokemon.milestones import (
+    Milestone,
+    MilestoneProgress,
+    MilestoneTarget,
+    track_milestones,
+)
+from jev_plays_pokemon.navigation import RAW_BUTTONS, NavigationTarget
 from jev_plays_pokemon.resilience import TurnSkipped
 
 
@@ -92,6 +101,20 @@ _ALL_BADGES = (
 )
 _ALL_EVENT_FLAGS = frozenset({34, 57, 37, 296, 1372, 2305})
 
+# No milestone in milestones.py carries a tile-level target today (#83) - a
+# standalone fixture milestone (not one `track_milestones` would ever
+# return) that does, for exercising the "macro is offered" branch without
+# waiting on #84's real coordinates.
+_RESOLVABLE_MILESTONE = Milestone(
+    milestone_id="test_resolvable_milestone",
+    description="A milestone with a verified tile target, for #83's tests.",
+    target=MilestoneTarget(map_id=40, map_name="Oaks Lab", target_x=4, target_y=5),
+)
+
+
+def _progress_at(milestone: Milestone | None) -> MilestoneProgress:
+    return MilestoneProgress(completed=(), current=milestone, future=())
+
 
 def test_decide_action_returns_the_jev_clients_chosen_action_and_confidence():
     client = _FakeJevClient("a", 0.87)
@@ -116,17 +139,82 @@ def test_decide_action_issues_exactly_one_system_one_call():
     assert len(client.calls) == 1
 
 
-def test_decide_action_presents_a_single_choice_over_the_full_action_space():
+def test_decide_action_presents_a_single_choice_over_raw_buttons_by_default():
+    # Every scripted milestone ships with no tile-level target (#83), so the
+    # macro can't resolve a destination for "got_starter" - the Choice is
+    # raw buttons only, not the macro too.
     client = _FakeJevClient("a", 0.87)
     state = _game_state()
     progress = track_milestones(state.event_flags, state.badges)
+    assert progress.current is not None
+    assert progress.current.milestone_id == "got_starter"
 
     decide_action(client, state, progress)
 
     ((_, questions),) = client.calls
     assert set(questions.keys()) == {"action"}
-    assert set(questions["action"].criteria.keys()) == set(ACTION_SPACE)
-    assert NAVIGATION_MACRO_ACTION in questions["action"].criteria
+    assert set(questions["action"].criteria.keys()) == set(RAW_BUTTONS)
+    assert NAVIGATION_MACRO_ACTION not in questions["action"].criteria
+
+
+def test_decide_action_offers_the_macro_when_the_milestone_has_a_resolvable_target():
+    client = _FakeJevClient("a", 0.87)
+    state = _game_state()
+    progress = _progress_at(_RESOLVABLE_MILESTONE)
+
+    decide_action(client, state, progress)
+
+    ((_, questions),) = client.calls
+    criteria = questions["action"].criteria
+    assert set(criteria.keys()) == set(ACTION_SPACE)
+    assert criteria[NAVIGATION_MACRO_ACTION] == (
+        "Automatically walk toward the current story objective instead of "
+        "choosing a single directional button yourself"
+    )
+
+
+def test_out_of_battle_action_space_excludes_the_macro_without_a_resolvable_target():
+    assert out_of_battle_action_space(None) == RAW_BUTTONS
+
+
+def test_out_of_battle_action_space_includes_the_macro_with_a_resolvable_target():
+    assert out_of_battle_action_space(_RESOLVABLE_MILESTONE) == ACTION_SPACE
+
+
+def test_offer_predicate_and_executor_consult_the_same_navigation_resolver():
+    # Pins #83's single-source-of-truth requirement: the offer predicate
+    # (`out_of_battle_action_space`, via `decide_action`) and `make_pyboy_
+    # action_executor`'s macro branch must both resolve a milestone's
+    # destination through the exact same `resolve_navigation_target`, not
+    # two independent "does this milestone have coordinates?" checks that
+    # could drift apart later.
+    executor_default_resolver = (
+        inspect.signature(make_pyboy_action_executor)
+        .parameters["resolve_target"]
+        .default
+    )
+
+    assert executor_default_resolver is navigation_module.resolve_navigation_target
+    assert decision_module.resolve_navigation_target is (
+        navigation_module.resolve_navigation_target
+    )
+
+
+def test_out_of_battle_action_space_delegates_to_the_shared_resolver(monkeypatch):
+    # Complements the identity pin above with a behavioral check: the offer
+    # predicate must call through to whatever `resolve_navigation_target` is
+    # bound to, not a hardcoded copy of its "has tile coordinates?" check.
+    calls: list[Milestone | None] = []
+
+    def fake_resolver(milestone: Milestone | None) -> NavigationTarget | None:
+        calls.append(milestone)
+        return None
+
+    monkeypatch.setattr(decision_module, "resolve_navigation_target", fake_resolver)
+
+    out_of_battle_action_space(_RESOLVABLE_MILESTONE)
+
+    assert calls == [_RESOLVABLE_MILESTONE]
 
 
 def test_decide_action_low_confidence_is_still_returned_with_no_special_handling():
@@ -424,11 +512,12 @@ def test_battle_choice_replaces_rather_than_extends_the_static_action_space():
 
 
 def test_out_of_battle_choice_is_unchanged_by_battle_action_space_support():
-    state = _game_state()  # battle.in_battle is False by default
+    state = _game_state()  # battle.in_battle is False by default; "got_starter"
+    # has no resolvable target (#83), so the macro is excluded too.
 
     criteria = _battle_criteria(state)
 
-    assert set(criteria.keys()) == set(ACTION_SPACE)
+    assert set(criteria.keys()) == set(RAW_BUTTONS)
 
 
 def test_decide_action_hands_the_dialog_text_to_jev_when_given():

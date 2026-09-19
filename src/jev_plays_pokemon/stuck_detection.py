@@ -39,8 +39,9 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 
-from jev_plays_pokemon.decision import ACTION_SPACE
+from jev_plays_pokemon.decision import out_of_battle_action_space
 from jev_plays_pokemon.game_state import GameState
+from jev_plays_pokemon.milestones import Milestone, track_milestones
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +136,7 @@ def wrap_for_stuck_detection(
     load_snapshot: Callable[[], None],
     threshold: int = DEFAULT_STUCK_THRESHOLD,
     escalation_threshold: int = DEFAULT_ESCALATION_THRESHOLD,
-    legal_actions: Sequence[str] = ACTION_SPACE,
+    legal_actions: Sequence[str] | None = None,
     random_choice: Callable[[Sequence[str]], str] = random.choice,
 ) -> tuple[Callable[[], GameState], Callable[[str], None]]:
     """Build instrumented `(state_source, execute_action)` seams that add
@@ -148,6 +149,13 @@ def wrap_for_stuck_detection(
     each turn's position (read at the wrapped `state_source` call) with the
     action `run_turn` goes on to execute that same turn.
 
+    `legal_actions`, when left at its default of `None`, is recomputed every
+    nudge from that turn's own current milestone via `decision.
+    out_of_battle_action_space` - the same "can the macro actually resolve a
+    destination right now?" predicate the per-turn Choice itself is built
+    from (#83), so an injected legal action is never a no-op. Pass an
+    explicit sequence to pin the nudge pool instead (tests only).
+
     The nudge tier calls the *original*, unwrapped `execute_action` for its
     injected button, not the wrapped one - the nudge is an out-of-band
     recovery action, not another turn, so it isn't itself recorded into the
@@ -156,10 +164,12 @@ def wrap_for_stuck_detection(
     history: deque[TurnRecord] = deque(maxlen=threshold)
     policy = StuckRecoveryPolicy(escalation_threshold=escalation_threshold)
     last_position: list[Position | None] = [None]
+    last_milestone: list[Milestone | None] = [None]
 
     def wrapped_state_source() -> GameState:
         state = state_source()
         last_position[0] = (state.map_id, state.player_x, state.player_y)
+        last_milestone[0] = track_milestones(state.event_flags, state.badges).current
         return state
 
     def wrapped_execute_action(action: str) -> None:
@@ -175,7 +185,12 @@ def wrap_for_stuck_detection(
         stuck = is_stuck(history, threshold=threshold)
         tier = policy.on_turn(stuck)
         if tier is RecoveryTier.NUDGE:
-            nudge_action = random_choice(legal_actions)
+            pool = (
+                legal_actions
+                if legal_actions is not None
+                else out_of_battle_action_space(last_milestone[0])
+            )
+            nudge_action = random_choice(pool)
             logger.warning("stuck detected; nudging with action=%s", nudge_action)
             execute_action(nudge_action)
         elif tier is RecoveryTier.RELOAD:
