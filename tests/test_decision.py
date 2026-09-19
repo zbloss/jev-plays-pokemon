@@ -15,7 +15,12 @@ from jev_plays_pokemon.decision import (
     make_pyboy_action_executor,
     run_turn,
 )
-from jev_plays_pokemon.game_state import BattleState, GameState, PartyPokemon
+from jev_plays_pokemon.game_state import (
+    BattleState,
+    GameState,
+    InventoryItem,
+    PartyPokemon,
+)
 from jev_plays_pokemon.milestones import track_milestones
 from jev_plays_pokemon.navigation import NavigationTarget
 
@@ -149,8 +154,8 @@ def test_decide_action_state_payload_reflects_the_current_objective():
 
 def test_decide_action_state_payload_is_the_documented_jev_input_shape():
     # The full payload keys are Jev's input contract: this pins the whole
-    # shape, including what must NOT leak (party moves/pp, money, inventory,
-    # event flags, map_id).
+    # shape, including what must NOT leak (event flags, map_id) and what
+    # #53 added (party moves/pp, money, inventory).
     state = _game_state(
         party=(
             PartyPokemon(
@@ -164,6 +169,10 @@ def test_decide_action_state_payload_is_the_documented_jev_input_shape():
             ),
         ),
         money=3000,
+        inventory=(
+            InventoryItem(item="POTION", quantity=3),
+            InventoryItem(item="POKé BALL", quantity=5),
+        ),
         badges=("BOULDERBADGE",),
         event_flags=frozenset({34, 57, 37}),
         battle=BattleState(
@@ -195,7 +204,18 @@ def test_decide_action_state_payload_is_the_documented_jev_input_shape():
                 "hp": 21,
                 "max_hp": 21,
                 "status": "OK",
+                "moves": [
+                    {"name": "Unknown Move (169)", "pp": 30},
+                    {"name": "GROWL", "pp": 30},
+                    {"name": "SLASH", "pp": 15},
+                    {"name": "Unknown Move (0)", "pp": 0},
+                ],
             }
+        ],
+        "money": 3000,
+        "inventory": [
+            {"item": "POTION", "quantity": 3},
+            {"item": "POKé BALL", "quantity": 5},
         ],
         "badges": ["BOULDERBADGE"],
         "battle": {
@@ -207,6 +227,43 @@ def test_decide_action_state_payload_is_the_documented_jev_input_shape():
         "dialog_open": True,
         "dialog_text": None,
         "current_objective": "Defeat Misty for the Cascade Badge",
+    }
+
+
+def test_decide_action_state_payload_omits_no_max_pp_or_opponent_hp_field():
+    # This ticket's explicit exclusions: no max-PP/PP-Up-bonus field, and no
+    # opponent-HP field - JevBattleState stays species+level only.
+    state = _game_state(
+        party=(
+            PartyPokemon(
+                species="PIKACHU",
+                level=5,
+                hp=21,
+                max_hp=21,
+                status="OK",
+                moves=(84, 0, 0, 0),
+                pp=(20, 0, 0, 0),
+            ),
+        ),
+        battle=BattleState(
+            in_battle=True,
+            battle_type="wild",
+            opponent_species="RATTATA",
+            opponent_level=3,
+        ),
+    )
+    client = _FakeJevClient("a", 0.9)
+    progress = track_milestones(state.event_flags, state.badges)
+
+    decide_action(client, state, progress)
+
+    ((state_payload, _),) = client.calls
+    assert set(state_payload["party"][0]["moves"][0].keys()) == {"name", "pp"}
+    assert set(state_payload["battle"].keys()) == {
+        "in_battle",
+        "battle_type",
+        "opponent_species",
+        "opponent_level",
     }
 
 
