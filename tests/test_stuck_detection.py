@@ -178,12 +178,11 @@ def test_wrap_nudges_with_a_legal_action_once_stuck_and_does_not_double_record_i
     assert executed == ["up", "down", "up", "down", "nudge"]
 
 
-def test_wrap_nudge_pool_excludes_the_navigation_macro_without_a_resolvable_target():
-    # #83: `_game_state()`'s empty event_flags/badges resolve to the
-    # "got_starter" milestone, which - like every milestone shipped today -
-    # has no tile-level target. A nudge that rolled the macro anyway would
-    # press nothing and leave the run wedged, so the default (unpinned)
-    # nudge pool must never offer it here.
+def test_wrap_nudge_pool_includes_the_navigation_macro_with_a_resolvable_target():
+    # #98: `_game_state()`'s empty event_flags/badges resolve to the
+    # "got_starter" milestone, which - like every milestone now - carries a
+    # ROM-derived tile-level target, so the default (unpinned) nudge pool
+    # recomputed via `out_of_battle_action_space` offers the macro here too.
     nudge_pools: list[tuple[str, ...]] = []
 
     def spy_random_choice(actions):
@@ -204,8 +203,8 @@ def test_wrap_nudge_pool_excludes_the_navigation_macro_without_a_resolvable_targ
         wrapped_execute_action(action)
 
     assert nudge_pools, "expected the stuck nudge to have fired"
-    assert nudge_pools[0] == RAW_BUTTONS
-    assert NAVIGATION_MACRO_ACTION not in nudge_pools[0]
+    assert set(nudge_pools[0]) == set(RAW_BUTTONS) | {NAVIGATION_MACRO_ACTION}
+    assert NAVIGATION_MACRO_ACTION in nudge_pools[0]
 
 
 def test_wrap_escalates_to_reload_and_clears_history_after_a_sustained_stuck_run():
