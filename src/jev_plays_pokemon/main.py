@@ -36,6 +36,7 @@ text is decoded through the separately-configured OpenAI-compatible backend
 
 from __future__ import annotations
 
+import argparse
 import logging
 import sys
 import time
@@ -57,6 +58,7 @@ from jev_plays_pokemon.dialog_decode import DialogDecoder, load_dialog_decoder_o
 from jev_plays_pokemon.dialog_vision import capture_screen
 from jev_plays_pokemon.frame_capture import FrameCapture, start_frame_capture
 from jev_plays_pokemon.game_state import GameState, extract_game_state
+from jev_plays_pokemon.rate_limit import RateLimitedJevClient
 from jev_plays_pokemon.resilience import ResilientJevClient
 from jev_plays_pokemon.stream_surface import (
     StreamSurface,
@@ -193,6 +195,7 @@ def main(
     *,
     stream_port: int = 0,
     jev_client: JevClient | None = None,
+    max_calls_per_second: float | None = None,
 ) -> None:
     """Boot the ROM and run the live tactical loop until interrupted.
 
@@ -202,6 +205,13 @@ def main(
     own ROM through :mod:`emulator`, and binds the read-only stream surface to
     an ephemeral loopback port (see
     :func:`stream_surface.start_stream_surface_server` for reading it back).
+
+    ``max_calls_per_second``, when given, wraps the resolved client in
+    :class:`rate_limit.RateLimitedJevClient` - debug mode: slow enough for a
+    human (or a log tail) to watch each decision, without changing anything
+    about production behaviour when left unset. Pass a low rate (e.g. ``0.5``
+    - one call every two seconds) to investigate a stuck-loop symptom like
+    #59's without burning hundreds of real API calls doing it.
     """
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -209,6 +219,10 @@ def main(
 
     if jev_client is None:
         jev_client = build_jev_client()
+    if max_calls_per_second is not None:
+        jev_client = RateLimitedJevClient(
+            jev_client, max_calls_per_second=max_calls_per_second
+        )
     # Wraps whichever client was resolved above (real or caller-supplied) in
     # retry/backoff handling (#56) - transparent to run_loop/run_turn, which
     # only ever see the JevClient seam. `on_attempt` touches the heartbeat
@@ -300,5 +314,24 @@ def main(
         sys.exit(1)
 
 
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "rom_path", nargs="?", default=None, help="passed through to emulator.boot_or_resume"
+    )
+    parser.add_argument(
+        "--max-calls-per-second",
+        type=float,
+        default=None,
+        help=(
+            "Debug mode: cap TypeSafe API calls/sec so a human can watch "
+            "decisions without burning many real calls (e.g. 0.5 = one call "
+            "every 2s). Unset = no limit (production)."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
 if __name__ == "__main__":
-    main()
+    _args = _parse_args()
+    main(_args.rom_path, max_calls_per_second=_args.max_calls_per_second)
