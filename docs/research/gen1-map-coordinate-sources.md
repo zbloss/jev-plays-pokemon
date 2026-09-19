@@ -117,6 +117,14 @@ labelled `"error": "not derived"`; they are present and validated in
 `rom_maps_full.json` (`blocks_match_blk_file: true`, `records_match_asm: true`), so the earlier
 failure was the scratch script looking them up in its own weaker `.blk`-anchored table.
 
+**Correction (#98):** this table's `got_pokedex` row is wrong. `OAKSLAB_RIVAL` is a consequence of
+the parcel-delivery scene, not its trigger — `pret/pokered scripts/OaksLab.asm`'s
+`OaksLabOak1Text`'s `.got_parcel` branch is what removes the parcel and sets `EVENT_GOT_POKEDEX`,
+transitioning to `SCRIPT_OAKSLAB_RIVAL_ARRIVES_AT_OAKS_REQUEST` only afterward. The milestone's
+actual target is `OAKSLAB_OAK1` (5,2), not `OAKSLAB_RIVAL` (4,3) — see
+`src/jev_plays_pokemon/milestone_targets.py`'s `got_pokedex` entry, which this table's honesty
+note below already flagged as exactly this kind of Oak-position judgment call.
+
 Two honesty notes on that table:
 
 - **The object *choice* is authored, not derived.** The scratch script picked a target by
