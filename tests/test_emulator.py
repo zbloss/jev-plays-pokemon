@@ -78,10 +78,12 @@ def test_boot_past_intro_moves_off_the_title_screen(booted_pyboy: PyBoy):
 
 
 def test_render_current_frame_refreshes_the_stale_screen_buffer():
-    # Guards the blank-frame bug: the hot path ticks render=False, which
-    # leaves pyboy.screen.ndarray uniform (so the dialog decoder would see a
-    # white frame). render_current_frame's render=True tick is what puts real
-    # pixels in the buffer - the precondition for dialog_vision.capture_screen.
+    # Guards the blank-frame bug: a render=False tick leaves pyboy.screen.
+    # ndarray uniform (so the dialog decoder would see a white frame) -
+    # still true of boot_past_intro's one-time render=False ticks, though
+    # navigation.execute_button's per-turn ticks now render=True (#47).
+    # render_current_frame's render=True tick is what puts real pixels in
+    # the buffer regardless - the precondition for dialog_vision.capture_screen.
     pyboy = create_pyboy(DEFAULT_ROM_PATH)
     try:
         for _ in range(30):

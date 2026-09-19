@@ -1,6 +1,7 @@
 import io
 from pathlib import Path
 
+import numpy as np
 import pytest
 from pyboy import PyBoy
 
@@ -143,6 +144,18 @@ def test_raw_button_press_blocked_by_a_wall_does_not_move_the_player(pyboy_in_be
 def test_execute_button_rejects_an_unknown_button(pyboy_in_bedroom):
     with pytest.raises(ValueError):
         execute_button(pyboy_in_bedroom, "not-a-button")
+
+
+def test_execute_button_leaves_the_screen_buffer_rendered(pyboy_in_bedroom):
+    # #47: execute_button's ticks render=True now, so the live per-turn loop
+    # never leaves screen.ndarray stale (a uniform blank frame) between turns,
+    # unlike a render=False tick (see test_emulator.py's stale-buffer test).
+    pyboy_in_bedroom.tick(1, False)
+    assert float(np.std(pyboy_in_bedroom.screen.ndarray)) == 0.0
+
+    execute_button(pyboy_in_bedroom, "down")
+
+    assert float(np.std(pyboy_in_bedroom.screen.ndarray)) > 0.0
 
 
 def test_raw_buttons_cover_the_four_directions_and_the_face_buttons():

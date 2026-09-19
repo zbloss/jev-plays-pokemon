@@ -133,15 +133,15 @@ def execute_button(pyboy: PyBoy, button: str) -> None:
         memory = pyboy.memory
         before = (memory[_PLAYER_X_ADDRESS], memory[_PLAYER_Y_ADDRESS])
         for _ in range(_MAX_WALK_FRAMES):
-            pyboy.tick(1, False)
+            pyboy.tick(1, True)
             if (memory[_PLAYER_X_ADDRESS], memory[_PLAYER_Y_ADDRESS]) != before:
                 break
     else:
         for _ in range(_PRESS_FRAMES):
-            pyboy.tick(1, False)
+            pyboy.tick(1, True)
     pyboy.button_release(button)
     for _ in range(_SETTLE_FRAMES):
-        pyboy.tick(1, False)
+        pyboy.tick(1, True)
 
 
 @dataclass(frozen=True)
