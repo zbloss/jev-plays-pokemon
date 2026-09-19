@@ -146,15 +146,20 @@ def test_target_map_advances_with_progress():
     assert progress.current.target.map_name == "Oaks Lab"
 
 
-def test_scripted_milestones_have_no_verified_tile_target_yet():
-    # None of the 14 scripted milestones has a ROM-verified tile-level
-    # destination yet (see `MilestoneTarget`'s docstring) - `target_x`/
-    # `target_y` default to `None` until one is added and verified.
+def test_all_scripted_milestones_have_a_resolved_tile_target():
+    # All 14 scripted milestones carry a ROM-derived tile-level destination
+    # (issue #98) - `target_x`/`target_y` are only ever `None` for a future
+    # milestone added without one yet (see `MilestoneTarget`'s docstring).
     progress = track_milestones(event_flags=frozenset(), badges=())
+    all_milestones = (
+        list(progress.completed) + [progress.current] + list(progress.future)
+    )
 
-    assert progress.current is not None
-    assert progress.current.target.target_x is None
-    assert progress.current.target.target_y is None
+    assert len(all_milestones) == len(_EXPECTED_ORDER)
+    for milestone in all_milestones:
+        assert milestone is not None
+        assert milestone.target.target_x is not None, milestone.milestone_id
+        assert milestone.target.target_y is not None, milestone.milestone_id
 
 
 def test_milestone_target_can_carry_a_verified_tile_destination():

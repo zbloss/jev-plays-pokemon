@@ -139,10 +139,10 @@ def test_decide_action_issues_exactly_one_system_one_call():
     assert len(client.calls) == 1
 
 
-def test_decide_action_presents_a_single_choice_over_raw_buttons_by_default():
-    # Every scripted milestone ships with no tile-level target (#83), so the
-    # macro can't resolve a destination for "got_starter" - the Choice is
-    # raw buttons only, not the macro too.
+def test_decide_action_presents_a_single_choice_including_the_macro_by_default():
+    # Every scripted milestone now carries a ROM-derived tile-level target
+    # (#98), so the macro can resolve a destination for "got_starter" too -
+    # the Choice is the full action space, not raw buttons only.
     client = _FakeJevClient("a", 0.87)
     state = _game_state()
     progress = track_milestones(state.event_flags, state.badges)
@@ -153,8 +153,8 @@ def test_decide_action_presents_a_single_choice_over_raw_buttons_by_default():
 
     ((_, questions),) = client.calls
     assert set(questions.keys()) == {"action"}
-    assert set(questions["action"].criteria.keys()) == set(RAW_BUTTONS)
-    assert NAVIGATION_MACRO_ACTION not in questions["action"].criteria
+    assert set(questions["action"].criteria.keys()) == set(ACTION_SPACE)
+    assert NAVIGATION_MACRO_ACTION in questions["action"].criteria
 
 
 def test_decide_action_offers_the_macro_when_the_milestone_has_a_resolvable_target():
@@ -513,11 +513,11 @@ def test_battle_choice_replaces_rather_than_extends_the_static_action_space():
 
 def test_out_of_battle_choice_is_unchanged_by_battle_action_space_support():
     state = _game_state()  # battle.in_battle is False by default; "got_starter"
-    # has no resolvable target (#83), so the macro is excluded too.
+    # has a resolvable target (#98), so the macro is included too.
 
     criteria = _battle_criteria(state)
 
-    assert set(criteria.keys()) == set(RAW_BUTTONS)
+    assert set(criteria.keys()) == set(ACTION_SPACE)
 
 
 def test_decide_action_hands_the_dialog_text_to_jev_when_given():

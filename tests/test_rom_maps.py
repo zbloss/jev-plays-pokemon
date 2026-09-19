@@ -2,8 +2,9 @@ from pathlib import Path
 
 import pytest
 
-from jev_plays_pokemon import rom_maps
+from jev_plays_pokemon import milestones, rom_maps
 from jev_plays_pokemon.lookup.maps import MAP_COUNT, is_unused_map
+from jev_plays_pokemon.milestone_targets import resolve_target_coordinates
 
 ROM_PATH = Path(__file__).resolve().parent.parent / "pokemon_red.gb"
 
@@ -173,3 +174,20 @@ def test_viridian_city_three_way_connections_match_known_geography(rom):
         "south": 12,
         "west": 33,
     }  # Route 2, Route 1, Route 22
+
+
+def test_milestone_target_literals_match_the_roms_object_records(all_maps):
+    """Regression guard for issue #98's hand-authored milestone -> object
+    selection (`milestone_targets.py`): re-derives every milestone's
+    `(x, y)` from this parser and checks it against the literals pinned in
+    `milestones.py`'s `_MILESTONES`, so a `pokemon_red.gb` re-dump or an
+    upstream layout change fails here instead of silently drifting."""
+    resolved = resolve_target_coordinates(all_maps)
+    pinned = {
+        check.milestone.milestone_id: (
+            check.milestone.target.target_x,
+            check.milestone.target.target_y,
+        )
+        for check in milestones._MILESTONES
+    }
+    assert resolved == pinned

@@ -50,12 +50,14 @@ it doesn't guarantee arrival, and doesn't attempt cross-map routing (if the
 player isn't already on the target's map, it's a no-op - see
 `execute_navigation_macro`).
 
-Milestone targets are map-level only today (`milestones.py` doesn't yet
-carry verified tile coordinates for any of its entries - see that module's
-docstring), so `resolve_navigation_target` returns `None` until a milestone
-is extended with real, ROM-verified `target_x`/`target_y`. Until then,
-`execute_navigation_macro` is exercised directly with an explicit
-`NavigationTarget` (see tests) rather than through a real milestone.
+All 14 scripted milestones now carry ROM-derived tile coordinates
+(`milestones.py`, #98), so `resolve_navigation_target` resolves a real
+`NavigationTarget` for any of them; it still returns `None` only when there's
+no current milestone (every milestone complete) or - for some future
+milestone added without a resolved target - when `target_x`/`target_y` are
+unset. `execute_navigation_macro` is still exercised directly with an
+explicit `NavigationTarget` in most tests (see tests) for isolation from
+milestone-tracking state, not because real milestones lack one.
 """
 
 from __future__ import annotations
