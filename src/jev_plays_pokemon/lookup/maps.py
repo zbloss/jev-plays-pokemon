@@ -270,6 +270,12 @@ _MAP_NAMES: dict[int, str] = {
     for map_id, const_name in enumerate(_MAP_CONSTANTS)
 }
 
+# Total map ID slots `pokered`'s `constants/map_constants.asm` `const_def`
+# block defines, `UNUSED_MAP_*` placeholders included - `rom_maps.py` uses
+# this as the upper bound when resolving every map through the ROM's own
+# header tables.
+MAP_COUNT = len(_MAP_CONSTANTS)
+
 
 def map_name(map_id: int) -> str:
     """Resolve a Pokemon Red map ID to its display name.
@@ -278,3 +284,19 @@ def map_name(map_id: int) -> str:
     raising, so callers building game-state text never crash on a bad ID.
     """
     return _MAP_NAMES.get(map_id, f"Unknown Map ({map_id})")
+
+
+def is_unused_map(map_id: int) -> bool:
+    """True if `map_id` is one of `pokered`'s unused/placeholder map slots.
+
+    These IDs still resolve through the ROM's header pointer/bank tables to
+    *something*, but that something is padding: several consecutive unused
+    slots alias the exact same (bank, address) pair and decode to
+    implausible block/record data (e.g. a 240x92-block grid, or a warp
+    count in the hundreds) rather than a real map - confirmed by
+    `rom_maps.py`'s own parse against this repo's `pokemon_red.gb`.
+    Out-of-range IDs count as unused so callers can filter with this alone.
+    """
+    if 0 <= map_id < len(_MAP_CONSTANTS):
+        return _MAP_CONSTANTS[map_id].startswith("UNUSED_MAP")
+    return True
