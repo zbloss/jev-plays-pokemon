@@ -9,8 +9,18 @@ over a local HTTP JSON endpoint, so a streaming overlay can follow along.
 The wire shape a viewer sees is declared once as ``Snapshot`` below (pydantic
 was already in the dependency tree via the vision-fallback path's ``openai``
 SDK, and is now a direct dependency). Transport is a FastAPI app served by
-uvicorn on its own background thread; ``/video.mjpg`` and ``/viewer`` (later
-tickets) land on this same app.
+uvicorn on its own background thread; ``/video.mjpg`` (this module, below)
+and ``/viewer`` (a later ticket) land on this same app.
+
+``/video.mjpg`` serves the frame-capture component's (``frame_capture.py``,
+#48) cached JPEG bytes as an MJPEG (``multipart/x-mixed-replace``) stream,
+hand-rolled on Starlette's ``StreamingResponse`` per #41's transport decision
+- no MJPEG-serving or OpenCV-coupled third-party library is adopted. The
+route only ever re-yields whatever ``FrameCapture.read()`` currently has
+cached, on its own delivery cadence; it never triggers or waits for a
+capture itself, so any number of concurrent viewers share the one capture
+timer's work with no extra encode cost per viewer and no artificial cap on
+how many can connect.
 
 The surface is fed through ``decision.run_turn``'s existing ``on_decision``
 seam via ``stream_logger`` below (which also keeps #21's own log line), so
@@ -28,24 +38,40 @@ to it. Nothing read from here is ever fed back into ``run_turn``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any
 
 import uvicorn
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from PIL import Image
 from pydantic import BaseModel, Field
 
 from jev_plays_pokemon.decision import Decision, DecisionLogger, log_decision
+from jev_plays_pokemon.frame_capture import FrameCapture
 from jev_plays_pokemon.milestones import Milestone
 
 logger = logging.getLogger(__name__)
 
-# The one path the surface serves; every other GET is a 404.
+# The two paths the surface serves; every other GET is a 404.
 SNAPSHOT_PATH = "/"
+VIDEO_PATH = "/video.mjpg"
+
+# Arbitrary, fixed boundary token for the multipart stream - never
+# negotiated, so it's just a constant both the header and each part's
+# marker line reference.
+_MJPEG_BOUNDARY = "frame"
+
+# How often the route re-yields whatever's cached, independent of the
+# frame-capture component's own tick rate (`frame_capture.py`'s
+# ~10fps/`_CAPTURE_INTERVAL_SECONDS`) - this loop never triggers a capture,
+# it only decides how often to re-check the cache.
+_STREAM_POLL_INTERVAL_SECONDS = 0.1
 
 
 class MilestoneRef(BaseModel):
@@ -131,8 +157,43 @@ class StreamSurface:
         ).model_dump(mode="json")
 
 
-def _build_app(surface: StreamSurface) -> FastAPI:
+def _no_frame_source() -> Image.Image:
+    # Only reachable if something calls `FrameCapture.capture()` on the
+    # default placeholder below - `read()` never does, so a server started
+    # with no `frame_capture` argument just serves an eternally-empty
+    # `/video.mjpg` (no capture wired yet is #51's job) rather than crashing.
+    raise RuntimeError("no frame source wired for this stream surface (see #51)")
+
+
+async def _mjpeg_parts(frame_capture: FrameCapture) -> AsyncIterator[bytes]:
+    """Re-yield `frame_capture`'s cached JPEG bytes as multipart parts.
+
+    Never triggers or waits for a capture - each iteration just re-checks
+    whatever `read()` currently has cached, on this loop's own cadence
+    (`_STREAM_POLL_INTERVAL_SECONDS`), so any number of concurrent viewers
+    of `/video.mjpg` share the one capture timer's work. Runs until the
+    client disconnects, at which point Starlette cancels this generator.
+    """
+    while True:
+        jpeg_bytes = frame_capture.read()
+        if jpeg_bytes is not None:
+            yield (
+                (
+                    f"--{_MJPEG_BOUNDARY}\r\n"
+                    "Content-Type: image/jpeg\r\n"
+                    f"Content-Length: {len(jpeg_bytes)}\r\n\r\n"
+                ).encode()
+                + jpeg_bytes
+                + b"\r\n"
+            )
+        await asyncio.sleep(_STREAM_POLL_INTERVAL_SECONDS)
+
+
+def _build_app(surface: StreamSurface, frame_capture: FrameCapture | None) -> FastAPI:
     app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
+    video_source = (
+        frame_capture if frame_capture is not None else FrameCapture(_no_frame_source)
+    )
 
     @app.get(SNAPSHOT_PATH)
     def get_snapshot() -> JSONResponse:
@@ -142,6 +203,14 @@ def _build_app(surface: StreamSurface) -> FastAPI:
             # Pollers (OBS browser sources included) must never see a
             # cached stale decision.
             headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get(VIDEO_PATH)
+    def get_video() -> StreamingResponse:
+        logger.debug("GET %s", VIDEO_PATH)
+        return StreamingResponse(
+            _mjpeg_parts(video_source),
+            media_type=f"multipart/x-mixed-replace; boundary={_MJPEG_BOUNDARY}",
         )
 
     # `@app.get` registers only "GET" against this path (verified: unlike
@@ -189,7 +258,10 @@ _STARTUP_TIMEOUT_SECONDS = 10.0
 
 
 def start_stream_surface_server(
-    surface: StreamSurface, host: str = "127.0.0.1", port: int = 0
+    surface: StreamSurface,
+    host: str = "127.0.0.1",
+    port: int = 0,
+    frame_capture: FrameCapture | None = None,
 ) -> StreamSurfaceServer:
     """Serve `surface` over HTTP on its own daemon thread; return the server.
 
@@ -198,11 +270,16 @@ def start_stream_surface_server(
     stable URL. Shut the surface down with `server.shutdown()` followed by
     `server.server_close()`.
 
+    `frame_capture` (`frame_capture.py`, #48) backs `/video.mjpg` - pass the
+    same instance a background `FrameCaptureTimer` is filling for a live
+    feed. Omitted, `/video.mjpg` still exists but never yields a frame,
+    since nothing wires a real capture until #51.
+
     Raises `RuntimeError` if the server fails to start (e.g. the port is
     already in use) and `TimeoutError` if it neither starts nor fails within
     `_STARTUP_TIMEOUT_SECONDS`.
     """
-    app = _build_app(surface)
+    app = _build_app(surface, frame_capture)
     config = uvicorn.Config(app, host=host, port=port, log_level="warning")
     server = uvicorn.Server(config)
     thread = threading.Thread(target=server.run, name="stream-surface", daemon=True)
