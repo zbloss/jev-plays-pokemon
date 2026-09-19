@@ -8,13 +8,19 @@ have to button-mash its way out of. The ROM-gated integration test
 against the same live game state it runs against in production.
 
 Getting a fresh Pokemon Red save to a controllable state has no shortcut and
-no bundled save state (the ROM is gitignored, so no `.state` ships either -
-see `tests/test_game_state.py`), so the intro has to be replayed as a fixed
-input sequence every cold boot. The sequence below is lifted verbatim from
-the one `tests/test_navigation.py` worked out by booting this repo's own
-`pokemon_red.gb` headless and inspecting rendered frames at each step; it
-lives here now so the live loop and the navigation tests share one
-definition rather than each carrying their own copy.
+no bundled save state ships in the repo (the ROM is gitignored, so no
+`.state` does either - see `tests/test_game_state.py`), so the intro has to
+be replayed as a fixed input sequence every cold boot. The sequence below is
+lifted verbatim from the one `tests/test_navigation.py` worked out by
+booting this repo's own `pokemon_red.gb` headless and inspecting rendered
+frames at each step; it lives here now so the live loop and the navigation
+tests share one definition rather than each carrying their own copy.
+
+`save_snapshot`/`load_snapshot`/`boot_or_resume` (#55) are this project's
+minimal persistence: a live run's `pyboy.save_state()` overwrites the single
+latest snapshot on disk (no history), and `boot_or_resume` loads it back on
+the next startup instead of replaying the intro-mash - the intro sequence
+below only ever runs again once no snapshot exists yet.
 
 Deterministic: the Pokemon Red cartridge has no RTC chip, so nothing in this
 sequence depends on wall-clock time, and the same inputs land on the same
@@ -23,6 +29,7 @@ in-game position across repeated runs (confirmed while building #20).
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 from pyboy import PyBoy
@@ -31,6 +38,11 @@ from pyboy import PyBoy
 # isn't redistributable - see tests/test_game_state.py). Callers that keep
 # their ROM elsewhere pass an explicit `rom_path`.
 DEFAULT_ROM_PATH = Path(__file__).resolve().parents[2] / "pokemon_red.gb"
+
+# The single latest snapshot (#55), alongside the ROM at the working-tree
+# root. Also gitignored: a save file is derived, regenerable game state, not
+# something to check in.
+DEFAULT_SNAPSHOT_PATH = Path(__file__).resolve().parents[2] / "pokemon_red.state"
 
 _WINDOW_BACKEND = "null"
 
@@ -118,3 +130,56 @@ def boot_to_controllable_state(
     pyboy = create_pyboy(rom_path)
     boot_past_intro(pyboy)
     return pyboy
+
+
+def save_snapshot(pyboy: PyBoy, path: str | Path = DEFAULT_SNAPSHOT_PATH) -> None:
+    """Save `pyboy`'s complete emulator state to `path`.
+
+    Overwrites whatever was already at `path` - only the single latest
+    snapshot is ever kept, no history/retention logic (#55) - so this is
+    safe to call as often as a caller likes.
+    """
+    with open(path, "wb") as snapshot_file:
+        pyboy.save_state(snapshot_file)
+
+
+def load_snapshot(pyboy: PyBoy, path: str | Path = DEFAULT_SNAPSHOT_PATH) -> None:
+    """Restore `pyboy`'s complete emulator state from `path`."""
+    with open(path, "rb") as snapshot_file:
+        pyboy.load_state(snapshot_file)
+
+
+def make_pyboy_snapshot_saver(
+    pyboy: PyBoy, path: str | Path = DEFAULT_SNAPSHOT_PATH
+) -> Callable[[], None]:
+    """Build a zero-argument save-snapshot seam bound to `pyboy` (#55).
+
+    Mirrors `decision.make_pyboy_action_executor`'s injection shape:
+    production callers (`main.main`) just pass `pyboy`, while `main.run_loop`
+    only ever sees the returned zero-arg callable, so its tests inject their
+    own save spy instead of a real `PyBoy`.
+    """
+
+    def save() -> None:
+        save_snapshot(pyboy, path)
+
+    return save
+
+
+def boot_or_resume(
+    rom_path: str | Path = DEFAULT_ROM_PATH,
+    snapshot_path: str | Path = DEFAULT_SNAPSHOT_PATH,
+) -> PyBoy:
+    """Boot `rom_path`, resuming from `snapshot_path` if a snapshot exists (#55).
+
+    A snapshot already carries a fully in-game state, so it's loaded onto a
+    freshly created (not intro-mashed) instance. With no snapshot on disk -
+    every cold start until the first save - this falls back to
+    `boot_to_controllable_state`'s fixed intro-mash sequence, unchanged.
+    """
+    snapshot_path = Path(snapshot_path)
+    if snapshot_path.exists():
+        pyboy = create_pyboy(rom_path)
+        load_snapshot(pyboy, snapshot_path)
+        return pyboy
+    return boot_to_controllable_state(rom_path)
