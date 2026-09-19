@@ -1,0 +1,36 @@
+# Travel graph for cross-map navigation, with context-dependent warp treatment
+
+Status: accepted
+
+The navigation macro (`navigation.py`) re-plans a local A* path every step over PyBoy 2.2.0's on-screen collision window, but has never had a real destination: `milestones.py` carries map-level targets only, and even once a milestone gets a verified tile-level target, that tile sits on a different map than the player's current position for every milestone after the first — local A* has no notion of maps, doors, or warps, and today treats warp tiles as ordinary walkable ground, so a path can silently cross into another map mid-route. #84/#85/#88 posed three candidate architectures to close this gap.
+
+We adopt a **travel graph**: a hand-authored, reusable graph of **hops** (see `CONTEXT.md`) — warp doors (`warp_event`) and map-edge connections (`connection`) from `pret/pokered`'s disassembly, in the same X/Y tile frame as `player_x`/`player_y` (confirmed by research #87, no translation needed) — with today's local A* demoted to **last-mile pathing**: walking from the player's current position to the next hop's tile, or to the milestone's own target tile once on the target map, rather than planning the whole cross-map route itself.
+
+## Why this shape
+
+- **It's the only candidate that actually solves cross-map travel.** Extracting full-map block/collision data from WRAM (`wOverworldMap`, confirmed reachable at the pinned PyBoy 2.2.0 by research #86) only gives collision for whichever single map is currently loaded — it says nothing about which map to go to next or how maps connect, so it doesn't touch the cross-map problem on its own. Rewriting the milestone list into finer beats (candidate 3) just relocates the same warp/connection knowledge into milestone data with no reuse across milestones, and still needs that knowledge from somewhere.
+- **A dedicated graph module is independently testable** against `pret/pokered`'s own warp/connection data, and keeps `milestones.py` describing *what* the objective is (a map + tile) rather than *how* to walk there hop by hop.
+
+## Scope
+
+- The graph models **both** warp doors and map-edge connections as hops, uniformly — each is "leave the current map at tile X, arrive at map M near tile Y." All 14 of today's milestone maps are interiors reached by doors, but several journeys to them (e.g. Pallet Town → Pewter Gym) cross multiple outdoor route/city maps first, and those outdoor-to-outdoor legs use `connection`, not `warp_event`. Leaving outdoor traversal to a directional heuristic instead risks local minima and backtracking around large or maze-like routes.
+- **Full-map WRAM collision decoding (candidate 2) is not adopted now.** It's real (research #86) but unverified against a live boot, and needs a block→tile→walkable-list decode this project would have to write from scratch. The graph's hops are meant to be spaced closely enough that last-mile pathing never needs to see past the on-screen window. Revisit only if a specific map proves too large or complex for on-screen A* to cross reliably.
+- **The graph is built incrementally, one milestone's route at a time**, not authored and boot-verified for the whole game upfront — consistent with #84's own acceptance criteria (each tile-level target individually ROM-verified) and `milestones.py`'s existing per-entry verification discipline.
+- **`LAST_MAP` (dynamic-destination) warp edges are excluded from the graph entirely.** Research #87 found 11 of the 14 milestone maps' warp tables use `LAST_MAP` on their *exit* doors (resolved at runtime to `wLastMap`) — but every milestone route is a forward journey *into* a map, which needs only the corresponding outdoor map's own entrance warp (presumed to carry a static, non-`LAST_MAP` destination, since going in isn't ambiguous the way leaving is). That outdoor-side warp data wasn't fetched by #87 and needs confirming per map as ordinary #84 follow-up work — it does not block this architecture.
+- **Saffron Gym's same-map teleport-tile puzzle is out of scope for the graph.** Its 30 teleport "warps" all have `dest_map = SAFFRON_GYM` itself (research #87) — the graph only needs Saffron Gym's ordinary entrance hop; the puzzle interior is a same-map, last-mile concern for whoever implements that specific milestone.
+
+## Warp-tile treatment: context-dependent
+
+Local A* treats a warp tile as an **obstacle by default** — it will not route the player onto a warp that isn't the thing it's actually trying to reach — **except** when that warp tile is the specific tile the current hop or milestone target names, in which case it's the intended step. This is the only treatment that both stops accidental map transitions mid-path and lets the macro actually use warps to make progress; always-obstacle can't cross maps at all, and always-deliberate reintroduces the silent-transition bug this decision exists to close.
+
+## Statelessness
+
+`execute_navigation_macro` stays fully stateless, matching its existing design (no destination argument; `resolve_navigation_target` already re-derives everything from current game state each call). Each invocation reads the current map from game state, runs a graph search (BFS/Dijkstra — cheap at this graph's size) from the current map to the milestone's target map, takes the first edge on that path, and hands last-mile A* the current map's side of that hop's tile (or the milestone's own target tile, once already on the target map). No route progress is persisted across turns, and nothing needs invalidating if the player gets knocked off course — the next invocation just searches again from wherever they actually are.
+
+## Consequences
+
+- New module (name TBD at implementation time, e.g. `travel_graph.py`) holding the hop data and graph search, populated incrementally per milestone rather than all at once.
+- `navigation.py`'s module docstring currently states the macro "doesn't attempt cross-map routing (if the player isn't already on the target's map, it's a no-op)" — that will need updating once cross-map routing lands.
+- `resolve_navigation_target` will need the current map (not just the milestone) as an input, since the tile it hands to local A* now depends on where the player currently is relative to the graph, not solely on the milestone's own target.
+- Outdoor maps' own entrance-warp destinations (the other end of each `LAST_MAP` exit) are unconfirmed and will need per-map ROM verification as part of #84's ordinary follow-up work, not before this architecture can be implemented against.
+- `wOverworldMap` full-map WRAM decoding (candidate 2) remains unimplemented and unverified; tracked as a possible future follow-up only if a specific map's on-screen A* proves insufficient, not committed to now.
