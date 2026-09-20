@@ -1,4 +1,5 @@
 import io
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -222,6 +223,83 @@ def test_navigation_macro_is_a_noop_when_player_is_on_a_different_map(pyboy_outd
     after = extract_game_state(pyboy_outdoors)
     assert moved is False
     assert (after.player_x, after.player_y) == (before.player_x, before.player_y)
+
+
+def test_navigation_macro_stops_immediately_if_dialog_is_already_open(
+    pyboy_outdoors, monkeypatch
+):
+    """The dialog/battle early-break (see `execute_navigation_macro`'s own
+    docstring) must fire before any button press - a dialog open at entry
+    should leave the player exactly where they started, not walk toward the
+    target regardless."""
+    before = extract_game_state(pyboy_outdoors)
+    target = NavigationTarget(
+        map_id=before.map_id, x=before.player_x + 3, y=before.player_y
+    )
+    monkeypatch.setattr(
+        "jev_plays_pokemon.navigation.extract_game_state",
+        lambda pyboy: replace(before, dialog_open=True),
+    )
+
+    moved = execute_navigation_macro(pyboy_outdoors, target)
+
+    after = extract_game_state(pyboy_outdoors)
+    assert moved is False
+    assert (after.player_x, after.player_y) == (before.player_x, before.player_y)
+
+
+def test_navigation_macro_stops_immediately_if_a_battle_is_already_active(
+    pyboy_outdoors, monkeypatch
+):
+    """Same early-break as above, for `battle.in_battle` - covers the
+    sight-triggered-trainer case the docstring calls out explicitly."""
+    before = extract_game_state(pyboy_outdoors)
+    target = NavigationTarget(
+        map_id=before.map_id, x=before.player_x + 3, y=before.player_y
+    )
+    in_battle = replace(before, battle=replace(before.battle, in_battle=True))
+    monkeypatch.setattr(
+        "jev_plays_pokemon.navigation.extract_game_state", lambda pyboy: in_battle
+    )
+
+    moved = execute_navigation_macro(pyboy_outdoors, target)
+
+    after = extract_game_state(pyboy_outdoors)
+    assert moved is False
+    assert (after.player_x, after.player_y) == (before.player_x, before.player_y)
+
+
+def test_navigation_macro_stops_as_soon_as_a_battle_starts_mid_walk(
+    pyboy_outdoors, monkeypatch
+):
+    """The early-break isn't just an entry check - it must also catch a
+    sight-triggered trainer partway through a real, in-progress walk (the
+    scenario the function's own docstring names), stopping well short of
+    the target rather than burning the rest of `max_steps` on stale
+    collision data."""
+    before = extract_game_state(pyboy_outdoors)
+    target = NavigationTarget(
+        map_id=before.map_id, x=before.player_x + 10, y=before.player_y
+    )
+    real_extract_game_state = extract_game_state
+    call_count = {"n": 0}
+
+    def fake_extract_game_state(pyboy):
+        call_count["n"] += 1
+        state = real_extract_game_state(pyboy)
+        if call_count["n"] >= 3:
+            return replace(state, battle=replace(state.battle, in_battle=True))
+        return state
+
+    monkeypatch.setattr(
+        "jev_plays_pokemon.navigation.extract_game_state", fake_extract_game_state
+    )
+
+    moved = execute_navigation_macro(pyboy_outdoors, target)
+
+    after = extract_game_state(pyboy_outdoors)
+    assert moved is True
+    assert after.player_x - before.player_x < 10
 
 
 def test_navigation_macro_reaches_a_milestones_target_end_to_end(pyboy_outdoors):

@@ -292,7 +292,7 @@ def _next_step_toward(collision, goal_col: int, goal_row: int) -> str | None:
 
 
 def execute_navigation_macro(
-    pyboy: PyBoy, target: NavigationTarget, max_steps: int = 32
+    pyboy: PyBoy, target: NavigationTarget, max_steps: int = 128
 ) -> bool:
     """Walk the player toward `target` over multiple emulator frames.
 
@@ -301,10 +301,31 @@ def execute_navigation_macro(
     to one upfront route. Returns whether it moved the player at all.
     Cross-map travel isn't in scope: if the player isn't already on
     `target.map_id`, this is a no-op.
+
+    `max_steps` (default 128, up from an earlier 32) bounds how far a
+    single call walks before returning - the local A* below only ever gives
+    up when the player's own cell has no walkable neighbour at all, so in
+    practice this cap, not a real decision point, is what ends most calls.
+    128 is meant to cross a typical multi-screen corridor in one Jev turn
+    (cutting down on redundant "keep going to the same place" calls) while
+    still being bounded against a maze-like dead-end pocket that this
+    local-only planner has no memory of previously-visited cells to avoid
+    (see `docs/adr/0002-travel-graph-for-cross-map-navigation.md`, accepted
+    but not yet implemented, for the planned fix).
+
+    Also returns early - before touching the collision grid or pressing
+    anything - the instant `state.dialog_open` or `state.battle.in_battle`
+    is true, even mid-walk (e.g. a sight-triggered trainer). That keeps a
+    long `max_steps` budget from turning into a burst of blind presses
+    against a battle menu or a dialog box: control goes back to `run_turn`
+    so Jev gets a fresh, per-turn decision there, exactly as it already does
+    for every other in-battle/dialog action.
     """
     moved = False
     for _ in range(max_steps):
         state = extract_game_state(pyboy)
+        if state.dialog_open or state.battle.in_battle:
+            break
         if state.map_id != target.map_id:
             break
         dx = target.x - state.player_x
