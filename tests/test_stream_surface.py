@@ -446,6 +446,31 @@ def test_video_route_streams_frames_the_fake_source_produced():
         server.server_close()
 
 
+def test_video_route_honors_a_custom_poll_interval_seconds():
+    # Proves `poll_interval_seconds` actually reaches `_mjpeg_parts`, rather
+    # than the route silently always re-yielding on its own fast default: a
+    # deliberately slow interval means a second frame can't arrive until a
+    # full interval after the first.
+    surface = StreamSurface()
+    source = _FakeFrameSource(_solid_image((10, 80, 200)))
+    capture = FrameCapture(source)
+    capture.capture()
+    poll_interval_seconds = 0.5
+    server = start_stream_surface_server(
+        surface, frame_capture=capture, poll_interval_seconds=poll_interval_seconds
+    )
+    try:
+        start = time.monotonic()
+        frames = _read_mjpeg_frames(server, count=2)
+        elapsed = time.monotonic() - start
+
+        assert len(frames) == 2
+        assert elapsed >= poll_interval_seconds
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_two_concurrent_viewers_never_trigger_extra_capture_or_encode_work():
     # This ticket's other acceptance criterion, checked against a *real*
     # background `FrameCaptureTimer` rather than a manually-invoked

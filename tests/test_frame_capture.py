@@ -1,9 +1,12 @@
 import io
 
+import pytest
 from PIL import Image
 
 from jev_plays_pokemon.frame_capture import (
+    DEFAULT_DISPLAY_FPS,
     FrameCapture,
+    interval_seconds_for_fps,
     start_frame_capture,
 )
 
@@ -93,6 +96,22 @@ def test_frame_capture_never_calls_anything_resembling_pyboy_tick():
     capture.capture()
 
     assert capture.read() is not None
+
+
+def test_default_display_fps_is_60():
+    assert DEFAULT_DISPLAY_FPS == 60.0
+
+
+def test_interval_seconds_for_fps_is_the_reciprocal_of_the_rate():
+    assert interval_seconds_for_fps(60.0) == pytest.approx(1.0 / 60.0)
+    assert interval_seconds_for_fps(10.0) == pytest.approx(0.1)
+
+
+def test_interval_seconds_for_fps_rejects_zero_or_negative():
+    with pytest.raises(ValueError):
+        interval_seconds_for_fps(0.0)
+    with pytest.raises(ValueError):
+        interval_seconds_for_fps(-5.0)
 
 
 def test_start_frame_capture_returns_a_handle_that_stops_cleanly():
