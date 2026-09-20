@@ -343,6 +343,133 @@ _DIALOG_TEXT_ROW = 14
 _DIALOG_TEXT_BLANK_TILE = 383
 _DIALOG_TEXT_COLUMNS = range(1, 19)
 
+_PARTY_COUNT_ADDRESS = 0xD163
+_PARTY_SPECIES_LIST_ADDRESS = 0xD164
+_PARTY_MON_1_ADDRESS = 0xD16B  # matches game_state.py's own
+# _PARTY_MON_BASE_ADDRESS
+
+
+def _give_overpowered_party(pyboy: PyBoy) -> None:
+    """Writes one absurdly-strong party Pokemon directly into WRAM.
+
+    Milestones past Pewter City sit behind Route 2's mandatory Viridian
+    Forest crossing, which cannot be walked through blind without ever
+    risking a trainer's sight-triggered battle (`pret/pokered`'s Bug
+    Catchers) - trainer battles, unlike wild ones, can't be fled, so
+    surviving them is a precondition for the walk itself, not something
+    these tests are trying to verify. This is exactly the kind of
+    prerequisite state the issue says to set directly.
+
+    HP/Attack/Defense/Speed/Special are all set to 999 - not higher:
+    999 survived every fight encountered while building this; 65000 was
+    tried and once produced a real, reproducible battle-engine freeze
+    (a "but it failed!" exchange that never advanced across hundreds of
+    presses), so this deliberately stays well clear of extreme values.
+    EXP is maxed so any EXP gained from winning doesn't get used to
+    recompute real (tiny) stats from the species' own growth curve -
+    confirmed to happen otherwise: a single win silently dropped this
+    from level 100 back to level ~2, stats and all, regardless of what
+    MON_EXP was set to going in. `_resolve_any_battle` re-applies this
+    after every battle for the same reason - the recalculation happens
+    the instant EXP is gained, not something set once up front survives.
+    """
+    pyboy.memory[_PARTY_COUNT_ADDRESS] = 1
+    pyboy.memory[_PARTY_SPECIES_LIST_ADDRESS] = 1  # RHYDON's internal index
+    pyboy.memory[_PARTY_SPECIES_LIST_ADDRESS + 1] = 0xFF  # list terminator
+
+    stat = (999).to_bytes(2, "big")
+    mon = bytearray(44)  # PARTYMON_STRUCT_LENGTH, per game_state.py's own
+    # party_struct offset comments
+    mon[0] = 1  # species
+    mon[1:3] = stat  # current HP
+    mon[4] = 0  # status: healthy
+    mon[8] = 33  # move 1: TACKLE (real, damaging, nonzero)
+    mon[14:17] = (0xFFFFFF).to_bytes(3, "big")  # EXP: maxed
+    mon[29] = 35  # move 1 PP
+    mon[33] = 100  # level
+    mon[34:36] = stat  # max HP
+    mon[36:38] = stat  # attack
+    mon[38:40] = stat  # defense
+    mon[40:42] = stat  # speed
+    mon[42:44] = stat  # special
+    for offset, value in enumerate(mon):
+        pyboy.memory[_PARTY_MON_1_ADDRESS + offset] = value
+
+
+def _in_battle(pyboy: PyBoy) -> bool:
+    battle = extract_game_state(pyboy).battle
+    return bool(battle and battle.in_battle)
+
+
+def _resolve_any_battle(pyboy: PyBoy, max_presses: int = 2000) -> None:
+    """Mashes A through a wild or trainer battle already in progress,
+    relying on `_give_overpowered_party`'s stats for a guaranteed win, and
+    re-applies that party afterward (see its own docstring for why).
+
+    Settles 30 extra frames after every press - confirmed necessary by a
+    direct A/B test: without it, a fight where our own Pokemon gets put
+    to sleep can run 100,000+ presses without ever ending, because each
+    press lands mid print/animation and never actually completes a turn -
+    pret/pokered only decrements the sleep counter when a move is
+    actually attempted, so a turn that never completes never wakes it up.
+    With the extra settle, the same fight resolves normally. Even a
+    "normal" trainer fight can still take several hundred presses (real
+    turns, not a stall) if our own Pokemon keeps getting put back to
+    sleep, hence the generous default budget.
+    """
+    for _ in range(max_presses):
+        if not _in_battle(pyboy):
+            _give_overpowered_party(pyboy)
+            return
+        execute_button(pyboy, "a")
+        pyboy.tick(30, True)
+    raise AssertionError(f"battle did not resolve within {max_presses} presses")
+
+
+def _advance_past_any_encounter(pyboy: PyBoy) -> None:
+    """Viridian Forest's Bug Catchers (and Pewter Gym's own trainer) are
+    sight-triggered: walking into view opens a "Hey, wait up!"-style
+    greeting dialog *before* the battle itself actually starts, so a
+    dialog box goes up a few steps before `BattleState.in_battle` does.
+    A step-by-step walker that only checks `_in_battle` can stall here
+    indefinitely (the dialog blocks movement, so every direction reads as
+    "blocked" without this). If either is showing, mash through into the
+    fight and resolve it; otherwise this is a no-op.
+
+    Uses `_dialog_text_visible`, not `GameState.dialog_open`, for both
+    checks - confirmed necessary the hard way: a trainer's own greeting
+    and post-battle quote are exactly the short, single-page kind
+    `_dialog_text_visible`'s own docstring describes, which never draw
+    `dialog_open`'s continuation-arrow tile at all. Missing that left a
+    real, still-open text box undetected (`dialog_open=False` even while
+    text was visibly on screen) - and since arrow presses don't dismiss a
+    Gen 1 dialog box, only A/B do, every direction then reads as
+    "blocked" with no way to tell that from a genuine dead end.
+    """
+    if not (_dialog_text_visible(pyboy) or _in_battle(pyboy)):
+        return
+    for _ in range(20):
+        if _in_battle(pyboy):
+            break
+        execute_button(pyboy, "a")
+        pyboy.tick(20, True)
+    _resolve_any_battle(pyboy)
+    pyboy.tick(60, True)  # let the fade back to the overworld finish
+    # before any caller reads game_area_collision() again - confirmed
+    # necessary: without it, the very next on-screen A* replan can read
+    # a stale/transitional collision buffer and give up immediately.
+    for _ in range(10):
+        # a trainer's post-battle quote ("Oh, I lost...") can still be
+        # showing right after `BattleState.in_battle` already reads
+        # False - confirmed to otherwise silently block all movement
+        # afterward (arrow presses don't dismiss a dialog box in Gen 1,
+        # only A/B do, so every direction looks "blocked" until this is
+        # cleared).
+        if not _dialog_text_visible(pyboy):
+            break
+        execute_button(pyboy, "a")
+        pyboy.tick(20, True)
+
 
 def _bypass_oaks_route_1_interception(pyboy: PyBoy) -> None:
     """Sets pret/pokered's EVENT_FOLLOWED_OAK_INTO_LAB directly rather than
@@ -511,6 +638,113 @@ def test_walking_to_viridian_mart_cooltrainer_reaches_a_rom_verified_tile(pyboy_
             dialog_visible = True
             break
     assert dialog_visible
+
+
+_PEWTER_GYM_INTERIOR_STATE_PATH = Path(__file__).resolve().parent / "fixtures" / "pewter_gym_interior.state"
+
+
+def _load_pewter_gym_interior_fixture(pyboy: PyBoy) -> None:
+    """Loads a captured save state already past Route 2's boulder maze,
+    Viridian Forest, Pewter City's own street layout, and Pewter Gym's own
+    door - landing just inside the gym itself (map 54, tile (4, 13)) -
+    with `_bypass_oaks_route_1_interception`/`_bypass_viridian_old_man`
+    already applied, wild encounters already disabled, and
+    `_give_overpowered_party`'s own party already in place.
+
+    None of the ground covered to reach this point is what this test
+    verifies (the milestone under test is Brock's own tile, past all of
+    it) - but getting here by actually walking it, tried first, wasn't
+    reliable enough to keep:
+    - Blind `_explore_toward` search across Viridian Forest worked in
+      isolated tries but wasn't reliably fast: a Bug Catcher fight's exact
+      frame length varies run to run, which cascades into wildly
+      different amounts of backtracking - one otherwise identical run
+      took over 3x as long and covered a fraction of the distance.
+    - A same-map RAM position write (safe for ordinary movement, since it
+      never needs the engine's map-load routine) was tried next for both
+      mazes and rejected outright: an exhaustive grid search over every
+      tile near a real, ROM-confirmed warp coordinate found that none of
+      them trigger the actual map transition after a teleport - Gen 1's
+      warp-detection apparently depends on some internal step/animation
+      state a raw position write never sets up, even though ordinary
+      non-warp movement from the same teleported position works
+      completely normally afterward. Repeated teleporting also once left
+      the emulator reading a corrupted, invalid map ID.
+    - Even Pewter City's own streets, crossed with the same
+      `_explore_toward` search once past both mazes, turned out just as
+      unreliable: repeated runs from the identical starting tile landed at
+      wildly different, unrelated dead ends without ever reaching the
+      gym's door, despite the town not being maze-like at all.
+    - `_walk_toward` chained through hand-found waypoints got close but
+      still couldn't finish: like Viridian Mart's own door
+      (`_TO_VIRIDIAN_MART_DOOR_PATH`, above), the gym's door tile itself
+      reads as collision-blocked in PyBoy's static map (real Gen 1 doors
+      are drawn as part of the building wall), so the on-screen A* refuses
+      to route onto it at all - confirmed by dumping the collision grid
+      at the tiles adjacent to it. Unlike the mart, no single nearby
+      raw-button detour was found within a reasonable amount of manual
+      probing; the gym building's footprint blocks the direct approaches
+      tried from every side but one, which itself needs a longer detour
+      than seemed worth hand-deriving.
+
+    A captured save state sidesteps all of this: it already reflects real
+    play on the other side of every warp and door above, so nothing here
+    needs to find or trigger one - only the gym's own trainer fight and
+    Brock's tile itself are still walked for real. Captured once from a
+    real, manually-verified crossing of the whole route; regenerate by
+    replaying that crossing again and re-saving over this file if the ROM
+    or PyBoy's save-state format ever changes.
+    """
+    with _PEWTER_GYM_INTERIOR_STATE_PATH.open("rb") as f:
+        pyboy.load_state(f)
+    pyboy.tick(1, False)
+    _disable_wild_encounters(pyboy)
+
+
+def test_walking_to_pewter_gym_brock_reaches_a_rom_verified_tile(pyboy_outdoors):
+    """#99's boot verification for the `boulder_badge` milestone: Pewter
+    Gym's PEWTERGYM_BROCK object (`milestone_targets.py`), map 54 tile
+    (4, 1).
+
+    Reaching Pewter Gym's interior at all needs crossing Route 2's boulder
+    maze, Viridian Forest, Pewter City's own streets, and the gym's own
+    door, past a couple of prerequisite gates
+    (`_bypass_oaks_route_1_interception`, `_bypass_viridian_old_man`) and
+    with `_give_overpowered_party` in place (Viridian Forest's Bug
+    Catchers can't be fled from if bumped into, unlike a wild encounter,
+    so crossing it at all requires being able to win a fight no matter
+    what) - none of which is what this milestone verifies, so
+    `_load_pewter_gym_interior_fixture` starts the test already on the
+    other side of all of it (see its own docstring for why a live
+    crossing isn't done here instead).
+
+    Brock's own gym has one trainer guarding the way to him
+    (`pret/pokered`'s `PewterGymTrainerHeader0`) who is also sight-
+    triggered; that fight is resolved the same way as the forest's before
+    reaching Brock himself. Talking to Brock before beating him
+    immediately starts their gym battle (`PewterGymBrockText`'s
+    `.beforeBeat` branch calls `EngageMapTrainer` directly, no sight line
+    needed) - but the pre-battle dialog it shows on the way in already
+    satisfies this test's own check (`GameState.dialog_open`), the same
+    as `got_starter`'s worked example above not needing to complete the
+    starter selection either.
+    """
+    _load_pewter_gym_interior_fixture(pyboy_outdoors)
+    assert extract_game_state(pyboy_outdoors).map_id == 54  # Pewter Gym
+
+    _walk_toward(pyboy_outdoors, 4, 6)
+    _advance_past_any_encounter(pyboy_outdoors)  # PewterGymTrainerHeader0
+
+    _walk_toward(pyboy_outdoors, 4, 1)
+
+    pyboy_outdoors.button("a", 2)
+    dialog_opened = False
+    for _ in range(10):
+        pyboy_outdoors.tick(30, True)
+        if extract_game_state(pyboy_outdoors).dialog_open:
+            dialog_opened = True
+            break
+    assert dialog_opened
 
 
 def _milestone(target_x: int | None = None, target_y: int | None = None) -> Milestone:
