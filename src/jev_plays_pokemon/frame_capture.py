@@ -1,12 +1,13 @@
 """Frame capture: a cached, JPEG-encoded copy of the live PyBoy screen.
 
 Part of #36 (Watch It Live - visual viewer for streaming), building on #41's
-architecture decision: a pull-based ~10fps capture reads whatever screen
-image the caller exposes, independent of the tactical decision loop's own
-~3.3 turns/s cadence (`docs/turn-rate-budget.md`) - it never blocks on, or is
-blocked by, that loop. A later ticket wires the frame source to
-`pyboy.screen.image` and serves the cached bytes over a `GET /video.mjpg`
-endpoint on `stream_surface.py`'s FastAPI app.
+architecture decision: a pull-based, configurable-fps capture (default
+`DEFAULT_DISPLAY_FPS`, overridable via `jev-plays-pokemon`'s `--display-fps`)
+reads whatever screen image the caller exposes, independent of the tactical
+decision loop's own ~3.3 turns/s cadence (`docs/turn-rate-budget.md`) - it
+never blocks on, or is blocked by, that loop. A later ticket wires the frame
+source to `pyboy.screen.image` and serves the cached bytes over a
+`GET /video.mjpg` endpoint on `stream_surface.py`'s FastAPI app.
 
 Structurally mirrors `StreamSurface` (`stream_surface.py`): an update side
 (`capture`, driven by the background timer) and a read side (`read`), guarded
@@ -28,12 +29,31 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 # Fixed, not configurable - #41's decision. Trades a little visible
-# artifacting for smaller/cheaper-to-encode frames at 160x144, ~10 times/sec.
+# artifacting for smaller/cheaper-to-encode frames at 160x144.
 _JPEG_QUALITY = 75
 
-# ~10fps (~100ms), per #41 - independent of, and well under, the tactical
-# decision loop's own ~3.3 turns/s budget (`docs/turn-rate-budget.md`).
-_CAPTURE_INTERVAL_SECONDS = 0.1
+# The default capture rate, configurable via `jev-plays-pokemon`'s
+# `--display-fps` (default 60) - independent of, and typically well above,
+# the tactical decision loop's own ~3.3 turns/s budget
+# (`docs/turn-rate-budget.md`). `stream_surface.py` derives its own MJPEG
+# re-yield default from this same constant rather than a separate literal.
+DEFAULT_DISPLAY_FPS = 60.0
+
+
+def interval_seconds_for_fps(fps: float) -> float:
+    """Convert a target frames-per-second into a tick interval in seconds.
+
+    Raises `ValueError` for `fps <= 0` - the one place every caller's value
+    (CLI, direct call, or subprocess-forwarded) funnels through, so a bad
+    `--display-fps` fails here with a clear message instead of surfacing
+    later as a bare `ZeroDivisionError` or a negative `asyncio.sleep`.
+    """
+    if fps <= 0:
+        raise ValueError(f"fps must be positive, got {fps}")
+    return 1.0 / fps
+
+
+_CAPTURE_INTERVAL_SECONDS = interval_seconds_for_fps(DEFAULT_DISPLAY_FPS)
 
 # A zero-argument callable returning the current screen image - injected
 # rather than a direct PyBoy reference, so this module never holds (or
@@ -103,8 +123,8 @@ def start_frame_capture(
 ) -> FrameCaptureTimer:
     """Run `capture.capture()` on its own background daemon thread, forever.
 
-    Ticks at a fixed ~10fps (`interval_seconds`, default
-    `_CAPTURE_INTERVAL_SECONDS`) independent of, and never blocking on, the
+    Ticks at `interval_seconds` (default `_CAPTURE_INTERVAL_SECONDS`, derived
+    from `DEFAULT_DISPLAY_FPS`) independent of, and never blocking on, the
     tactical decision loop's own cadence.
 
     A `source` that raises is logged and the loop continues onto the next

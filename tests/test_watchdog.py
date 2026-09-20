@@ -304,6 +304,30 @@ def test_spawn_run_subprocess_forwards_the_rom_path_and_max_calls_per_second_whe
     ]
 
 
+def test_spawn_run_subprocess_forwards_display_fps_when_given(monkeypatch):
+    calls = _fake_popen(monkeypatch)
+
+    spawn_run_subprocess(
+        rom_path=None,
+        stream_port=8080,
+        max_calls_per_second=None,
+        display_fps=30.0,
+    )
+
+    assert calls == [
+        [
+            sys.executable,
+            "-m",
+            "jev_plays_pokemon.cli",
+            "run",
+            "--stream-port",
+            "8080",
+            "--display-fps",
+            "30.0",
+        ]
+    ]
+
+
 def test_spawn_run_subprocess_forwards_only_the_given_global_settings(monkeypatch):
     calls = _fake_popen(monkeypatch)
 

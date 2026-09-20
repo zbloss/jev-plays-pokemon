@@ -160,6 +160,7 @@ def spawn_run_subprocess(
     rom_path: str | None,
     stream_port: int,
     max_calls_per_second: float | None,
+    display_fps: float | None = None,
     openai_api_key: str | None = None,
     openai_base_url: str | None = None,
     openai_vision_model: str | None = None,
@@ -177,6 +178,11 @@ def spawn_run_subprocess(
     Global settings are re-emitted before the ``run`` subcommand name (see
     `cli.py`), only for the ones that are set - an unset one is simply
     omitted rather than forwarded as an explicit empty value.
+
+    ``display_fps`` (like ``max_calls_per_second``) is only forwarded when
+    given - `cli.py`'s ``watchdog_command`` always passes its own resolved
+    Typer option (default 60.0), so the live CLI path always forwards a
+    concrete value; ``None`` here just lets a direct caller/test omit it.
     """
     args = [sys.executable, "-m", "jev_plays_pokemon.cli"]
     global_overrides = {
@@ -194,6 +200,8 @@ def spawn_run_subprocess(
     if rom_path is not None:
         args += ["--rom-path", rom_path]
     args += ["--stream-port", str(stream_port)]
+    if display_fps is not None:
+        args += ["--display-fps", str(display_fps)]
     if max_calls_per_second is not None:
         args += ["--max-calls-per-second", str(max_calls_per_second)]
     return subprocess.Popen(args)

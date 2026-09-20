@@ -45,6 +45,12 @@ app = typer.Typer(
 )
 
 _DEFAULT_STREAM_PORT = 8080
+# An independent literal, not imported from frame_capture.py (which pulls in
+# PIL at module level) - matches _DEFAULT_STREAM_PORT's own precedent of
+# duplicating rather than importing a callee's default, so a
+# watchdog-only invocation of this CLI stays free of heavy, unrelated
+# imports (see this module's own docstring).
+_DEFAULT_DISPLAY_FPS = 60.0
 _MAX_CALLS_PER_SECOND_HELP = (
     "Debug mode: cap TypeSafe API calls/sec so a human can watch decisions "
     "without burning many real calls (e.g. 0.5 = one call every 2s). "
@@ -54,6 +60,11 @@ _STREAM_PORT_HELP = (
     "Port for the read-only stream surface (see "
     "stream_surface.start_stream_surface_server). Default 8080."
 )
+_DISPLAY_FPS_HELP = (
+    "Frames per second for the live MJPEG viewer feed (frame_capture.py's "
+    "capture tick and stream_surface.py's re-yield cadence, kept in sync). "
+    "Independent of TypeSafe call timing. Default 60."
+)
 _ROM_PATH_HELP = "Passed through to emulator.boot_or_resume."
 
 
@@ -62,6 +73,7 @@ def _run(
     *,
     rom_path: str | None,
     stream_port: int,
+    display_fps: float,
     max_calls_per_second: float | None,
 ) -> None:
     from jev_plays_pokemon.main import main as run_main
@@ -69,6 +81,7 @@ def _run(
     run_main(
         rom_path,
         stream_port=stream_port,
+        display_fps=display_fps,
         max_calls_per_second=max_calls_per_second,
         settings=settings,
     )
@@ -103,6 +116,9 @@ def main_callback(
     stream_port: int = typer.Option(
         _DEFAULT_STREAM_PORT, "--stream-port", help=_STREAM_PORT_HELP
     ),
+    display_fps: float = typer.Option(
+        _DEFAULT_DISPLAY_FPS, "--display-fps", help=_DISPLAY_FPS_HELP
+    ),
     max_calls_per_second: float | None = typer.Option(
         None, "--max-calls-per-second", help=_MAX_CALLS_PER_SECOND_HELP
     ),
@@ -122,6 +138,7 @@ def main_callback(
             settings,
             rom_path=rom_path,
             stream_port=stream_port,
+            display_fps=display_fps,
             max_calls_per_second=max_calls_per_second,
         )
 
@@ -133,6 +150,9 @@ def run_command(
     stream_port: int = typer.Option(
         _DEFAULT_STREAM_PORT, "--stream-port", help=_STREAM_PORT_HELP
     ),
+    display_fps: float = typer.Option(
+        _DEFAULT_DISPLAY_FPS, "--display-fps", help=_DISPLAY_FPS_HELP
+    ),
     max_calls_per_second: float | None = typer.Option(
         None, "--max-calls-per-second", help=_MAX_CALLS_PER_SECOND_HELP
     ),
@@ -142,6 +162,7 @@ def run_command(
         ctx.obj,
         rom_path=rom_path,
         stream_port=stream_port,
+        display_fps=display_fps,
         max_calls_per_second=max_calls_per_second,
     )
 
@@ -187,6 +208,11 @@ def watchdog_command(
         "--stream-port",
         help=f"{_STREAM_PORT_HELP} Forwarded to the spawned `run` process.",
     ),
+    display_fps: float = typer.Option(
+        _DEFAULT_DISPLAY_FPS,
+        "--display-fps",
+        help=f"{_DISPLAY_FPS_HELP} Forwarded to the spawned `run` process.",
+    ),
     max_calls_per_second: float | None = typer.Option(
         None,
         "--max-calls-per-second",
@@ -207,6 +233,7 @@ def watchdog_command(
         lambda: spawn_run_subprocess(
             rom_path=rom_path,
             stream_port=stream_port,
+            display_fps=display_fps,
             max_calls_per_second=max_calls_per_second,
             openai_api_key=settings.openai_api_key,
             openai_base_url=settings.openai_base_url,

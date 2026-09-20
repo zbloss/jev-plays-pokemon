@@ -66,7 +66,11 @@ from PIL import Image
 from pydantic import BaseModel, Field
 
 from jev_plays_pokemon.decision import Decision, DecisionLogger, log_decision
-from jev_plays_pokemon.frame_capture import FrameCapture
+from jev_plays_pokemon.frame_capture import (
+    DEFAULT_DISPLAY_FPS,
+    FrameCapture,
+    interval_seconds_for_fps,
+)
 from jev_plays_pokemon.milestones import Milestone
 
 logger = logging.getLogger(__name__)
@@ -86,11 +90,14 @@ _VIEWER_POLL_INTERVAL_MS = 750
 # marker line reference.
 _MJPEG_BOUNDARY = "frame"
 
-# How often the route re-yields whatever's cached, independent of the
-# frame-capture component's own tick rate (`frame_capture.py`'s
-# ~10fps/`_CAPTURE_INTERVAL_SECONDS`) - this loop never triggers a capture,
-# it only decides how often to re-check the cache.
-_STREAM_POLL_INTERVAL_SECONDS = 0.1
+# The default re-yield cadence, independent of the frame-capture component's
+# own tick rate (`frame_capture.py`'s `_CAPTURE_INTERVAL_SECONDS`) - this
+# loop never triggers a capture, it only decides how often to re-check the
+# cache. Derived from the same `DEFAULT_DISPLAY_FPS` frame_capture.py uses,
+# so the two stay in sync by default; overridable per call via
+# `poll_interval_seconds` (see `start_stream_surface_server`), which
+# `main.py` sets from `--display-fps` so both loops share one live value.
+_STREAM_POLL_INTERVAL_SECONDS = interval_seconds_for_fps(DEFAULT_DISPLAY_FPS)
 
 
 class MilestoneRef(BaseModel):
@@ -184,14 +191,17 @@ def _no_frame_source() -> Image.Image:
     raise RuntimeError("no frame source wired for this stream surface (see #51)")
 
 
-async def _mjpeg_parts(frame_capture: FrameCapture) -> AsyncIterator[bytes]:
+async def _mjpeg_parts(
+    frame_capture: FrameCapture,
+    poll_interval_seconds: float = _STREAM_POLL_INTERVAL_SECONDS,
+) -> AsyncIterator[bytes]:
     """Re-yield `frame_capture`'s cached JPEG bytes as multipart parts.
 
     Never triggers or waits for a capture - each iteration just re-checks
     whatever `read()` currently has cached, on this loop's own cadence
-    (`_STREAM_POLL_INTERVAL_SECONDS`), so any number of concurrent viewers
-    of `/video.mjpg` share the one capture timer's work. Runs until the
-    client disconnects, at which point Starlette cancels this generator.
+    (`poll_interval_seconds`), so any number of concurrent viewers of
+    `/video.mjpg` share the one capture timer's work. Runs until the client
+    disconnects, at which point Starlette cancels this generator.
     """
     while True:
         jpeg_bytes = frame_capture.read()
@@ -205,7 +215,7 @@ async def _mjpeg_parts(frame_capture: FrameCapture) -> AsyncIterator[bytes]:
                 + jpeg_bytes
                 + b"\r\n"
             )
-        await asyncio.sleep(_STREAM_POLL_INTERVAL_SECONDS)
+        await asyncio.sleep(poll_interval_seconds)
 
 
 # The combined "Dossier Sidebar" page (#42's chosen layout): video pinned
@@ -386,7 +396,11 @@ _VIEWER_HTML = (
 )
 
 
-def _build_app(surface: StreamSurface, frame_capture: FrameCapture | None) -> FastAPI:
+def _build_app(
+    surface: StreamSurface,
+    frame_capture: FrameCapture | None,
+    poll_interval_seconds: float = _STREAM_POLL_INTERVAL_SECONDS,
+) -> FastAPI:
     app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
     video_source = (
         frame_capture if frame_capture is not None else FrameCapture(_no_frame_source)
@@ -406,7 +420,7 @@ def _build_app(surface: StreamSurface, frame_capture: FrameCapture | None) -> Fa
     def get_video() -> StreamingResponse:
         logger.debug("GET %s", VIDEO_PATH)
         return StreamingResponse(
-            _mjpeg_parts(video_source),
+            _mjpeg_parts(video_source, poll_interval_seconds),
             media_type=f"multipart/x-mixed-replace; boundary={_MJPEG_BOUNDARY}",
         )
 
@@ -464,6 +478,7 @@ def start_stream_surface_server(
     host: str = "127.0.0.1",
     port: int = 8000,
     frame_capture: FrameCapture | None = None,
+    poll_interval_seconds: float = _STREAM_POLL_INTERVAL_SECONDS,
 ) -> StreamSurfaceServer:
     """Serve `surface` over HTTP on its own daemon thread; return the server.
 
@@ -475,13 +490,17 @@ def start_stream_surface_server(
     `frame_capture` (`frame_capture.py`, #48) backs `/video.mjpg` - pass the
     same instance a background `FrameCaptureTimer` is filling for a live
     feed. Omitted, `/video.mjpg` still exists but never yields a frame,
-    since nothing wires a real capture until #51.
+    since nothing wires a real capture until #51. `poll_interval_seconds`
+    sets how often `/video.mjpg` re-checks that instance's cache (default
+    derived from `frame_capture.DEFAULT_DISPLAY_FPS`) - `main.py` passes the
+    same interval it hands the capture timer itself, so both stay in sync
+    with `--display-fps`.
 
     Raises `RuntimeError` if the server fails to start (e.g. the port is
     already in use) and `TimeoutError` if it neither starts nor fails within
     `_STARTUP_TIMEOUT_SECONDS`.
     """
-    app = _build_app(surface, frame_capture)
+    app = _build_app(surface, frame_capture, poll_interval_seconds)
     config = uvicorn.Config(app, host=host, port=port, log_level="warning")
     server = uvicorn.Server(config)
     thread = threading.Thread(target=server.run, name="stream-surface", daemon=True)

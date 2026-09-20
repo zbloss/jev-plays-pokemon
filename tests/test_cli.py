@@ -31,6 +31,7 @@ def test_bare_invocation_runs_the_game_with_defaults(monkeypatch, tmp_path):
     args, kwargs = calls[0]
     assert args == (None,)
     assert kwargs["stream_port"] == 8080
+    assert kwargs["display_fps"] == 60.0
     assert kwargs["max_calls_per_second"] is None
     # Isolated from the real repo-root `.env` via `--env-file`, so every
     # field should be unset.
@@ -83,6 +84,8 @@ def test_run_subcommand_forwards_its_own_options(monkeypatch, tmp_path):
             "run",
             "--stream-port",
             "9999",
+            "--display-fps",
+            "30",
             "--max-calls-per-second",
             "0.5",
         ],
@@ -92,6 +95,7 @@ def test_run_subcommand_forwards_its_own_options(monkeypatch, tmp_path):
     args, kwargs = calls[0]
     assert args == (None,)
     assert kwargs["stream_port"] == 9999
+    assert kwargs["display_fps"] == 30.0
     assert kwargs["max_calls_per_second"] == 0.5
     assert kwargs["settings"].typesafe_api_key == "tsk-cli"
 
@@ -167,6 +171,7 @@ def test_watchdog_subcommand_builds_a_spawn_seam_and_runs_it(monkeypatch, tmp_pa
         {
             "rom_path": "x.gb",
             "stream_port": 8080,
+            "display_fps": 60.0,
             "max_calls_per_second": None,
             "openai_api_key": "sk-cli",
             "openai_base_url": None,

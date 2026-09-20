@@ -59,7 +59,12 @@ from jev_plays_pokemon.decision import (
 )
 from jev_plays_pokemon.dialog_decode import DialogDecoder, load_dialog_decoder_or_none
 from jev_plays_pokemon.dialog_vision import capture_screen
-from jev_plays_pokemon.frame_capture import FrameCapture, start_frame_capture
+from jev_plays_pokemon.frame_capture import (
+    DEFAULT_DISPLAY_FPS,
+    FrameCapture,
+    interval_seconds_for_fps,
+    start_frame_capture,
+)
 from jev_plays_pokemon.game_state import (
     BattleResultTracker,
     GameState,
@@ -203,6 +208,7 @@ def main(
     rom_path: str | None = None,
     *,
     stream_port: int = 8080,
+    display_fps: float = DEFAULT_DISPLAY_FPS,
     jev_client: JevClient | None = None,
     max_calls_per_second: float | None = None,
     settings: Settings | None = None,
@@ -215,6 +221,13 @@ def main(
     own ROM through :mod:`emulator`, and binds the read-only stream surface to
     an ephemeral loopback port (see
     :func:`stream_surface.start_stream_surface_server` for reading it back).
+
+    ``display_fps`` (default :data:`frame_capture.DEFAULT_DISPLAY_FPS`, 60)
+    sets how often the live viewer's frame-capture timer and its MJPEG
+    re-yield loop both tick - one interval, shared by both, so the feed's
+    rate stays coherent. Neither loop is ever driven by, or waits on, a
+    TypeSafe decision: this only changes how often they sample/re-serve
+    whatever's already on screen.
 
     ``max_calls_per_second``, when given, wraps the resolved client in
     :class:`rate_limit.RateLimitedJevClient` - debug mode: slow enough for a
@@ -259,11 +272,17 @@ def main(
     # call (#81, itself either `navigation.execute_button`'s own `render=True`
     # tick (#47) or an explicit extra one when the turn's action was a no-op)
     # keeps the buffer continuously fresh once play starts, independent of
-    # this capture timer's own ~10fps pull cadence (#48).
+    # this capture timer's own `display_fps` pull cadence (#48).
+    display_interval_seconds = interval_seconds_for_fps(display_fps)
     frame_capture = FrameCapture(lambda: capture_screen(pyboy))
-    frame_capture_timer = start_frame_capture(frame_capture)
+    frame_capture_timer = start_frame_capture(
+        frame_capture, interval_seconds=display_interval_seconds
+    )
     server = start_stream_surface_server(
-        surface, port=stream_port, frame_capture=frame_capture
+        surface,
+        port=stream_port,
+        frame_capture=frame_capture,
+        poll_interval_seconds=display_interval_seconds,
     )
     logger.info(
         "stream surface viewer at http://127.0.0.1:%d%s",
