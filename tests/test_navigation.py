@@ -647,9 +647,11 @@ def _load_pewter_gym_interior_fixture(pyboy: PyBoy) -> None:
     """Loads a captured save state already past Route 2's boulder maze,
     Viridian Forest, Pewter City's own street layout, and Pewter Gym's own
     door - landing just inside the gym itself (map 54, tile (4, 13)) -
-    with `_bypass_oaks_route_1_interception`/`_bypass_viridian_old_man`
-    already applied, wild encounters already disabled, and
-    `_give_overpowered_party`'s own party already in place.
+    with `_bypass_oaks_route_1_interception`'s own EVENT_FOLLOWED_OAK_INTO_LAB
+    flag set, along with EVENT_GOT_POKEDEX (which otherwise plants a
+    sleeping old man blocking the only road out of Viridian City), wild
+    encounters already disabled, and `_give_overpowered_party`'s own
+    party already in place.
 
     None of the ground covered to reach this point is what this test
     verifies (the milestone under test is Brock's own tile, past all of
@@ -708,9 +710,10 @@ def test_walking_to_pewter_gym_brock_reaches_a_rom_verified_tile(pyboy_outdoors)
 
     Reaching Pewter Gym's interior at all needs crossing Route 2's boulder
     maze, Viridian Forest, Pewter City's own streets, and the gym's own
-    door, past a couple of prerequisite gates
-    (`_bypass_oaks_route_1_interception`, `_bypass_viridian_old_man`) and
-    with `_give_overpowered_party` in place (Viridian Forest's Bug
+    door, past a couple of prerequisite gates (Oak's Route 1 interception
+    and the Viridian old man - see `_load_pewter_gym_interior_fixture`'s
+    docstring for the event flags involved) and with
+    `_give_overpowered_party` in place (Viridian Forest's Bug
     Catchers can't be fled from if bumped into, unlike a wild encounter,
     so crossing it at all requires being able to win a fight no matter
     what) - none of which is what this milestone verifies, so
