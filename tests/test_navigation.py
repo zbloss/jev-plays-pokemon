@@ -593,7 +593,9 @@ def test_walking_to_oaks_lab_oak1_reaches_a_rom_verified_tile(pyboy_outdoors):
 _TO_VIRIDIAN_MART_DOOR_PATH: tuple[str, ...] = ("down", "right", "right", "up")
 
 
-def test_walking_to_viridian_mart_cooltrainer_reaches_a_rom_verified_tile(pyboy_outdoors):
+def test_walking_to_viridian_mart_cooltrainer_reaches_a_rom_verified_tile(
+    pyboy_outdoors,
+):
     """#99's boot verification for the `got_oaks_parcel` milestone: Viridian
     Mart's VIRIDIANMART_COOLTRAINER_M object (`milestone_targets.py`), map
     42 tile (3, 3).
@@ -640,7 +642,9 @@ def test_walking_to_viridian_mart_cooltrainer_reaches_a_rom_verified_tile(pyboy_
     assert dialog_visible
 
 
-_PEWTER_GYM_INTERIOR_STATE_PATH = Path(__file__).resolve().parent / "fixtures" / "pewter_gym_interior.state"
+_PEWTER_GYM_INTERIOR_STATE_PATH = (
+    Path(__file__).resolve().parent / "fixtures" / "pewter_gym_interior.state"
+)
 
 
 def _load_pewter_gym_interior_fixture(pyboy: PyBoy) -> None:
