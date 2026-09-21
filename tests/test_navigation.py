@@ -511,6 +511,13 @@ def test_walking_to_oaks_lab_starter_table_reaches_a_rom_verified_tile(pyboy_out
 
 _EVENT_FLAGS_START_ADDRESS = 0xD747  # matches game_state.py's own constant
 _EVENT_FOLLOWED_OAK_INTO_LAB_BIT = 0  # pret/pokered's event_constants.asm
+_EVENT_BEAT_BROCK_BIT = 119  # pret/pokered's event_constants.asm: Pewter
+# City events start at `const_next $68` (=104) for EVENT_BOUGHT_MUSEUM_TICKET,
+# +1 for EVENT_GOT_OLD_AMBER, `const_skip 8` to EVENT_BEAT_PEWTER_GYM_TRAINER_0
+# (114), `const_skip 3` to EVENT_GOT_TM34 (118), +1 for EVENT_BEAT_BROCK (119).
+# #113: this, not `wObtainedBadges`'s Boulder Badge bit, is what actually
+# gates Pewter City's own east-exit escort - see
+# `_load_pewter_to_route3_fixture`'s docstring for the full story.
 _GRASS_RATE_ADDRESS = 0xD887  # wGrassRate, right after wEventFlags's 320
 # bytes (0xD747 + flag_array(2560 events) == 0xD887) - re-derives the
 # already-verified 0xD747/0xD886 pair from a different anchor, cross-
@@ -1062,6 +1069,126 @@ def test_walking_to_pewter_gym_brock_reaches_a_rom_verified_tile(pyboy_outdoors)
     assert dialog_opened
 
 
+_PEWTER_TO_ROUTE3_STATE_PATH = (
+    Path(__file__).resolve().parent / "fixtures" / "pewter_to_route3.state"
+)
+_MAP_ROUTE_3 = 14
+
+
+def _load_pewter_to_route3_fixture(pyboy: PyBoy) -> None:
+    """#113: loads a captured save state that has already crossed Pewter
+    City's real, ROM-verified connection to Route 3 - landing at Route 3's
+    own tile (0, 8), matching `travel_graph.py`'s own computed hop
+    (`Hop(from_map=PewterCity, from_x=39, from_y=16, to_map=Route3,
+    to_x=0, to_y=8)`) - with `_give_overpowered_party`'s own party already
+    in place and wild encounters already disabled (reapplied below anyway,
+    per `_disable_wild_encounters`'s own docstring on why every map
+    transition needs it reapplied).
+
+    Captured from `pewter_gym_interior.state` (past Route 2's boulder maze,
+    Viridian Forest, and Pewter's own streets already) rather than a fresh
+    cold boot, the same reuse `_load_pewter_gym_interior_fixture` itself
+    is built on - none of that ground is what this fixture's own crossing
+    exercises.
+
+    ## The real gate: `EVENT_BEAT_BROCK`, not the Boulder Badge
+
+    #113's own issue text names a real, useful lead: walking east out of
+    Pewter Gym before beating Brock triggers a scripted escort
+    ("You're a trainer! Follow me!") that auto-walks the player back
+    toward the gym - confirmed directly to move the player from world
+    `(36, 17)` on Pewter City all the way back to `(11, 18)`, a 25-tile
+    round-trip - and the issue's own notes guessed this was gated on
+    `wObtainedBadges`'s Boulder Badge bit. Setting that bit directly
+    (`_set_badges`'s own pattern) does *not* clear it, confirmed directly
+    (the escort still fires with the badge bit set) - `pret/pokered`'s
+    `scripts/PewterCity.asm` (`PewterCityCheckPlayerLeavingEastScript`)
+    settles it precisely:
+
+    ```
+    PewterCityCheckPlayerLeavingEastScript:
+        CheckEvent EVENT_BEAT_BROCK
+        ret nz
+        ...
+        ld hl, PewterCityPlayerLeavingEastCoords
+        call ArePlayerCoordsInArray
+        ret nc
+        ...
+        ld a, TEXT_PEWTERCITY_YOUNGSTER
+        ldh [hTextID], a
+        jp DisplayTextID
+
+    PewterCityPlayerLeavingEastCoords:
+        dbmapcoord 35, 17
+        dbmapcoord 36, 17
+        dbmapcoord 37, 18
+        dbmapcoord 37, 19
+        db -1 ; end
+    ```
+
+    It's `EVENT_BEAT_BROCK` (`_EVENT_BEAT_BROCK_BIT`, set the same direct
+    way `_bypass_oaks_route_1_interception` sets a different event flag)
+    that gates it, checked against four specific Pewter City tiles - and
+    setting it directly clears the escort completely, the same "set
+    prerequisite story state directly" pattern the issue itself names.
+
+    ## Why a captured state, not a recorded button sequence
+
+    Once free of the escort, Pewter City's own east edge has exactly one
+    real, walkable crossing onto Route 3: world tiles `(39, 16)` through
+    `(39, 19)` - found by an exhaustive, save-state-forked BFS (every
+    reachable tile from the gym's exit walked via real button presses,
+    not `game_area_collision()`'s static reads, queue emptied naturally
+    rather than hitting a depth cap) rather than hand-walked and recorded,
+    the same reasoning `_load_pewter_gym_interior_fixture`'s own docstring
+    gives for why a captured state beats a fixed button tuple here.
+
+    ## What's past this fixture: a second, separate blocker
+
+    Reaching any of `cascade_badge`/`got_ss_ticket`/`thunder_badge`/
+    `rainbow_badge` (all reachable, per `travel_graph.py`'s own scope,
+    only via Route 3 -> Route 4 -> Cerulean City) needs walking further
+    east across Route 3 to its own north connection to Route 4 (world tile
+    `(59, 0)`, `travel_graph.py`'s own computed hop). The same exhaustive
+    BFS approach, extended east from this fixture's own landing tile (and
+    resolving every sight-triggered trainer it met along the way with
+    `_give_overpowered_party`), found a real, bounded, dead-end region -
+    every tile reachable by ordinary walking caps out at world x=22 (out
+    of Route 3's full 70-tile width) across the whole y=4-13 band tried,
+    confirmed against a published Route 3 map (serebii.net's own
+    `kanto-rb` map image) showing a solid boulder-cluster obstacle
+    starting around world x=23 with no gap found in that band. This is a
+    second, separate blocker from the escort above - past it, not
+    something #113's own EVENT_BEAT_BROCK fix touches - and unlike the
+    escort, finding the real gap needs either a corrected understanding of
+    that boulder formation's true shape or a from-scratch static
+    ROM/tileset collision decode, neither of which this pass had budget
+    for (see #113's follow-up).
+    """
+    with _PEWTER_TO_ROUTE3_STATE_PATH.open("rb") as f:
+        pyboy.load_state(f)
+    pyboy.tick(1, False)
+    _disable_wild_encounters(pyboy)
+
+
+def test_pewter_to_route3_fixture_lands_on_a_rom_verified_tile(pyboy_outdoors):
+    """#113's own acceptance criterion: the captured fixture crosses
+    Pewter City's real connection to Route 3 and lands at Route 3's own
+    tile `(0, 8)` - `travel_graph.py`'s own computed hop tile, not a
+    hand-typed guess - with no dialog or battle left open (safe to build
+    further milestone tests on top of once #113's own follow-up finds a
+    way past the second blocker `_load_pewter_to_route3_fixture`'s
+    docstring documents).
+    """
+    _load_pewter_to_route3_fixture(pyboy_outdoors)
+
+    state = extract_game_state(pyboy_outdoors)
+    assert state.map_id == _MAP_ROUTE_3
+    assert (state.player_x, state.player_y) == (0, 8)
+    assert not state.dialog_open
+    assert not state.battle.in_battle
+
+
 # #100: per-milestone boot verification, batch 2 (parent #96, sibling of
 # #99's batch 1 above). `_walk_to_milestone_target` (unlike #99's
 # `_walk_toward`) lets the target sit on a different map than wherever the
@@ -1083,6 +1210,14 @@ def test_walking_to_pewter_gym_brock_reaches_a_rom_verified_tile(pyboy_outdoors)
 # nudge; this is a real, town-wide unreachable region) - it needs either a
 # corrected ROM-parsed door coordinate or real visual investigation to
 # find the actual approach, neither of which this pass had budget for.
+#
+# cascade_badge/got_ss_ticket/thunder_badge/rainbow_badge (#99's original
+# remaining 4, all reachable only via Route 3 -> Route 4 -> Cerulean City
+# per `travel_graph.py`'s own scope) are also NOT covered below, for the
+# same class of reason as earth_badge above - see
+# `_load_pewter_to_route3_fixture`'s own docstring (#113) for the second,
+# separate blocker its own investigation found past Pewter City's escort:
+# a real, exhaustively-confirmed dead end partway across Route 3 itself.
 
 
 def _milestone(target_x: int | None = None, target_y: int | None = None) -> Milestone:
