@@ -165,6 +165,25 @@ def test_pallet_town_connections_match_known_kanto_geography(rom):
     assert by_direction == {"north": 12, "south": 32}  # Route 1, Route 21
 
 
+def test_pallet_town_connection_alignment_bytes(rom):
+    """Pallet Town and Route 1 are the same width with no horizontal
+    offset between them (`travel_graph.py`'s connection-hop tile math
+    relies on these signed alignment bytes): walking off Pallet's north
+    edge lands on Route 1's south edge (y = height_tiles - 1 = 35) with no
+    x shift; walking off the south edge lands on Route 21's north edge
+    (y = 0), also with no x shift."""
+    pallet_town = rom_maps.parse_map(rom, 0)
+    by_direction = {c.direction: c for c in pallet_town.connections}
+    assert (by_direction["north"].y_alignment, by_direction["north"].x_alignment) == (
+        35,
+        0,
+    )
+    assert (by_direction["south"].y_alignment, by_direction["south"].x_alignment) == (
+        0,
+        0,
+    )
+
+
 def test_viridian_city_three_way_connections_match_known_geography(rom):
     viridian_city = rom_maps.parse_map(rom, 1)
     by_direction = {c.direction: c.dest_map for c in viridian_city.connections}
