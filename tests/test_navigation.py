@@ -34,7 +34,12 @@ pytestmark = pytest.mark.skipif(
 # real, known hops in the milestone travel graph.
 _MAP_PALLET_TOWN = 0
 _MAP_OAKS_LAB = 40
-_MAP_CASCADE_GYM_NOT_YET_ROUTED = 65  # outside travel_graph.MILESTONE_MAP_IDS
+# Silph Co 2F: one of the 7 maps #96's own "Out of Scope" section names as
+# never getting a travel-graph route (its parsed ROM records disagreed with
+# upstream pret/pokered during that ticket's research) - a permanently safe
+# "no known route yet" example, unlike map 65 (Cerulean Gym), which #99
+# brought into MILESTONE_MAP_IDS.
+_MAP_NOT_YET_ROUTED = 207
 
 
 def _position(pyboy: PyBoy) -> tuple[int, int, int]:
@@ -228,7 +233,7 @@ def test_navigation_macro_is_a_noop_when_the_target_map_has_no_known_route(
     a route to (see `test_navigation_macro_routes_across_maps_via_a_known_hop`
     below), which is no longer a no-op."""
     before = extract_game_state(pyboy_outdoors)
-    target = NavigationTarget(map_id=_MAP_CASCADE_GYM_NOT_YET_ROUTED, x=4, y=2)
+    target = NavigationTarget(map_id=_MAP_NOT_YET_ROUTED, x=4, y=2)
 
     moved = execute_navigation_macro(pyboy_outdoors, target)
 
@@ -976,7 +981,7 @@ def test_resolve_navigation_target_returns_none_without_a_known_route_yet():
         milestone_id="test_milestone_not_yet_routed",
         description="a milestone used only by this test",
         target=MilestoneTarget(
-            map_id=_MAP_CASCADE_GYM_NOT_YET_ROUTED,
+            map_id=_MAP_NOT_YET_ROUTED,
             map_name="Cerulean Gym",
             target_x=4,
             target_y=2,
