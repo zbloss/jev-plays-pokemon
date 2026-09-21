@@ -22,11 +22,14 @@ tests:
   a scripted fake Jev client.
 - ``main`` is the production wiring: it boots the ROM (resuming from the
   latest snapshot if one exists - #55), constructs the real Jev and
-  dialog-decode clients, starts the read-only stream surface and its
+  dialog-decode clients, starts the read-only stream surface, its
   frame-capture timer (#51, reading the same live screen the vision fallback
-  captures), wraps its state/action seams for stuck detection (#57), and
-  runs ``run_loop`` until interrupted - catching (and logging) a crash
-  in-process and exiting nonzero, for ``watchdog.py`` (#58) to restart.
+  captures), and a free-running ``emulator_clock`` (#109, keeping the feed
+  live at ``display_fps`` independent of Jev's decision rate) - all three
+  synchronized against ``pyboy`` by one shared lock - wraps its state/action
+  seams for stuck detection (#57), and runs ``run_loop`` until interrupted -
+  catching (and logging) a crash in-process and exiting nonzero, for
+  ``watchdog.py`` (#58) to restart.
 
 The ``jev-plays-pokemon`` console script (``cli.py``, ADR 0001) is what
 actually invokes ``main`` in production; this module has no CLI parsing of
@@ -42,8 +45,10 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
 import time
 from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 
 from pyboy import PyBoy
 
@@ -59,6 +64,7 @@ from jev_plays_pokemon.decision import (
 )
 from jev_plays_pokemon.dialog_decode import DialogDecoder, load_dialog_decoder_or_none
 from jev_plays_pokemon.dialog_vision import capture_screen
+from jev_plays_pokemon.emulator_clock import start_emulator_clock
 from jev_plays_pokemon.frame_capture import (
     DEFAULT_DISPLAY_FPS,
     FrameCapture,
@@ -100,6 +106,7 @@ def build_dialog_text_source(
     decoder: DialogDecoder | None,
     *,
     render: Callable[[PyBoy], None] = emulator.render_current_frame,
+    lock: AbstractContextManager[object] | None = None,
 ) -> DialogTextSource:
     """Build the loop's ``dialog_text_source`` seam from a dialog decoder.
 
@@ -115,6 +122,14 @@ def build_dialog_text_source(
     ``emulator.render_current_frame``). It is a seam so the ordering can be
     asserted without a real PyBoy.
 
+    ``lock`` (#109) is held only around ``render``/``capture_screen`` - the
+    two calls that actually touch ``pyboy`` - so it composes with
+    ``emulator_clock``'s own lock use without ever holding it across the
+    decode call below, which is a real network round trip to a vision
+    endpoint and must never block that background clock. Defaults to a
+    no-op context manager, matching this function's pre-#109 behaviour when
+    no lock is given.
+
     Never raises: a decode failure returns ``None`` (with a warning) rather
     than propagating into ``run_turn``, so one bad frame from a flaky or
     misconfigured endpoint can't stall the live tactical loop - the chosen
@@ -125,8 +140,10 @@ def build_dialog_text_source(
         if not state.dialog_open or decoder is None:
             return None
         try:
-            render(pyboy)
-            return decoder(capture_screen(pyboy))
+            with lock or nullcontext():
+                render(pyboy)
+                screen = capture_screen(pyboy)
+            return decoder(screen)
         except Exception:
             logger.warning(
                 "dialog decode failed; continuing with no dialog text", exc_info=True
@@ -223,18 +240,21 @@ def main(
     :func:`stream_surface.start_stream_surface_server` for reading it back).
 
     ``display_fps`` (default :data:`frame_capture.DEFAULT_DISPLAY_FPS`, 60)
-    sets how often the live viewer's frame-capture timer and its MJPEG
-    re-yield loop both tick - one interval, shared by both, so the feed's
-    rate stays coherent. Neither loop is ever driven by, or waits on, a
-    TypeSafe decision: this only changes how often they sample/re-serve
-    whatever's already on screen.
+    sets how often the live viewer's frame-capture timer, its MJPEG re-yield
+    loop, and (#109) the emulator itself all tick - one interval, shared by
+    all three, so the feed's rate stays coherent. ``emulator_clock`` (#109)
+    keeps ``pyboy`` advancing at this rate on its own background thread, so
+    the live feed stays real-time no matter how slowly (or quickly) Jev is
+    deciding - it is never driven by, or waits on, a TypeSafe decision.
 
     ``max_calls_per_second``, when given, wraps the resolved client in
     :class:`rate_limit.RateLimitedJevClient` - debug mode: slow enough for a
     human (or a log tail) to watch each decision, without changing anything
     about production behaviour when left unset. Pass a low rate (e.g. ``0.5``
     - one call every two seconds) to investigate a stuck-loop symptom like
-    #59's without burning hundreds of real API calls doing it.
+    #59's without burning hundreds of real API calls doing it. Since #109,
+    this only throttles Jev's decision cadence - the emulator clock above
+    keeps running at ``display_fps`` regardless of how low this is set.
 
     ``settings`` (see :mod:`settings`, ADR 0001) supplies the CLI-/``.env``-
     resolved ``TYPESAFE_API_KEY``/``OPENAI_*``/``DIALOG_DECODE_BACKEND``
@@ -263,20 +283,36 @@ def main(
     )
 
     pyboy = emulator.boot_or_resume(rom_path or emulator.DEFAULT_ROM_PATH)
+    # Serializes every touchpoint of `pyboy` across threads (#109): the
+    # tactical loop below, `emulator_clock`'s free-running tick, and the
+    # frame-capture read all share this one lock, so ticks from the clock
+    # and a turn's own dispatch never actually run concurrently - just take
+    # turns. See `decision.make_pyboy_action_executor`'s docstring for why
+    # that used to be a hard "only one thread ever ticks pyboy" rule.
+    pyboy_lock = threading.Lock()
+
+    def with_pyboy_lock(fn: Callable) -> Callable:
+        def wrapped(*args: object, **kwargs: object) -> object:
+            with pyboy_lock:
+                return fn(*args, **kwargs)
+
+        return wrapped
+
     surface = StreamSurface()
     # `capture_screen` (not `pyboy.screen.image`, which is `None` under this
     # project's `window="null"` backend - see its own docstring) is the same
     # PIL-Image-from-`ndarray` read `dialog_vision.py` already uses, so
     # `/video.mjpg` JPEG-encodes the same pixels the vision fallback would
-    # decode. `decision.make_pyboy_action_executor`'s per-turn `render_frame`
-    # call (#81, itself either `navigation.execute_button`'s own `render=True`
-    # tick (#47) or an explicit extra one when the turn's action was a no-op)
-    # keeps the buffer continuously fresh once play starts, independent of
-    # this capture timer's own `display_fps` pull cadence (#48).
+    # decode. Since #109, `emulator_clock` keeps the buffer continuously
+    # fresh on its own background thread at `display_fps`, independent of
+    # whatever the tactical loop's own turns render.
     display_interval_seconds = interval_seconds_for_fps(display_fps)
-    frame_capture = FrameCapture(lambda: capture_screen(pyboy))
+    frame_capture = FrameCapture(with_pyboy_lock(lambda: capture_screen(pyboy)))
     frame_capture_timer = start_frame_capture(
         frame_capture, interval_seconds=display_interval_seconds
+    )
+    emulator_clock = start_emulator_clock(
+        pyboy, pyboy_lock, interval_seconds=display_interval_seconds
     )
     server = start_stream_surface_server(
         surface,
@@ -296,15 +332,16 @@ def main(
         api_key=settings.openai_api_key,
         model=settings.openai_vision_model,
     )
-    dialog_text_source = build_dialog_text_source(pyboy, decoder)
-    execute_action = make_pyboy_action_executor(pyboy)
-    save_snapshot = emulator.make_pyboy_snapshot_saver(pyboy)
+    dialog_text_source = build_dialog_text_source(pyboy, decoder, lock=pyboy_lock)
+    execute_action = with_pyboy_lock(make_pyboy_action_executor(pyboy))
+    save_snapshot = with_pyboy_lock(emulator.make_pyboy_snapshot_saver(pyboy))
 
     def load_snapshot_if_present() -> None:
         # A stuck escalation before any snapshot has ever been saved has
         # nothing to reload yet - log and continue rather than crash.
         if emulator.DEFAULT_SNAPSHOT_PATH.exists():
-            emulator.load_snapshot(pyboy)
+            with pyboy_lock:
+                emulator.load_snapshot(pyboy)
         else:
             logger.warning(
                 "stuck escalated to a snapshot reload, but no snapshot exists "
@@ -321,7 +358,11 @@ def main(
     # run_turn goes on to execute, and injects a nudge/reload as a side
     # effect when the rolling history says the run is stuck.
     state_source, execute_action = wrap_for_stuck_detection(
-        lambda: extract_game_state(pyboy, battle_result_tracker=battle_result_tracker),
+        with_pyboy_lock(
+            lambda: extract_game_state(
+                pyboy, battle_result_tracker=battle_result_tracker
+            )
+        ),
         execute_action,
         load_snapshot=load_snapshot_if_present,
     )
@@ -358,6 +399,7 @@ def main(
         server.shutdown()
         server.server_close()
         frame_capture_timer.stop()
+        emulator_clock.stop()
         pyboy.stop(save=False)
 
     if crashed:

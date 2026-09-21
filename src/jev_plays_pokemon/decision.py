@@ -665,17 +665,18 @@ def make_pyboy_action_executor(
     macro never renders a single frame, so `/video.mjpg` stays solid white
     forever.
 
-    This is a deliberate narrower fix than #81's other two "worth checking"
-    angles: it doesn't add any cross-thread ticking of `pyboy` from
-    `frame_capture.py`'s own background capture thread (the tactical loop's
-    thread is the only thread that ever calls `pyboy.tick()`, and it stays
-    that way - ticking `pyboy` from two threads at once is unsupported and
-    would risk corrupting `navigation.execute_button`'s own precisely-counted
-    tick loops), and it doesn't address a possible read/tick data race
-    between that capture thread and the tactical loop (pre-existing, not
-    introduced or worsened here - #81's own symptom, a clean uniform-white
-    frame with no corruption/errors, matches a screen that was simply never
-    rendered, not a torn or raced one).
+    This was a deliberate narrower fix than #81's other two "worth checking"
+    angles: at the time, it didn't add any cross-thread ticking of `pyboy`
+    from `frame_capture.py`'s own background capture thread (the tactical
+    loop's thread was the only thread that ever called `pyboy.tick()` -
+    ticking `pyboy` from two threads at once with no synchronization would
+    risk corrupting `navigation.execute_button`'s own precisely-counted tick
+    loops). #109 lifted that constraint: `main.main` now also runs a
+    free-running `emulator_clock` thread so the live feed keeps advancing
+    independent of Jev's decision cadence, and every `pyboy` touchpoint
+    (this executor included, via `main.main`'s wiring) is serialized behind
+    one shared `threading.Lock` so the two threads never actually tick
+    concurrently - the risk #81 flagged is exactly what that lock removes.
     """
 
     def execute_action(action: str) -> None:
