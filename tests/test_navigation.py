@@ -12,6 +12,7 @@ from jev_plays_pokemon.milestones import Milestone, MilestoneTarget
 from jev_plays_pokemon.navigation import (
     RAW_BUTTONS,
     NavigationTarget,
+    _travel_graph,
     execute_button,
     execute_navigation_macro,
     main_battle_menu_delta_buttons,
@@ -19,6 +20,7 @@ from jev_plays_pokemon.navigation import (
     read_menu_cursor,
     resolve_navigation_target,
 )
+from jev_plays_pokemon.travel_graph import next_hop
 
 ROM_PATH = Path(__file__).resolve().parent.parent / "pokemon_red.gb"
 
@@ -525,6 +527,32 @@ _PARTY_SPECIES_LIST_ADDRESS = 0xD164
 _PARTY_MON_1_ADDRESS = 0xD16B  # matches game_state.py's own
 # _PARTY_MON_BASE_ADDRESS
 
+_BADGES_ADDRESS = 0xD356  # matches game_state.py's own _BADGES_ADDRESS
+# Bit position per badge, matching game_state.py's own _BADGE_ITEM_IDS order
+# (BOULDERBADGE..EARTHBADGE, items.py 0x15..0x1C) - one bit per badge, set
+# directly rather than earned by playing the earlier gyms, per #100's own
+# "set prerequisite story state directly" instruction for milestones that
+# sit behind several earlier badges.
+_BADGE_BITS: dict[str, int] = {
+    "BOULDERBADGE": 0,
+    "CASCADEBADGE": 1,
+    "THUNDERBADGE": 2,
+    "RAINBOWBADGE": 3,
+    "SOULBADGE": 4,
+    "MARSHBADGE": 5,
+    "VOLCANOBADGE": 6,
+    "EARTHBADGE": 7,
+}
+
+
+def _set_badges(pyboy: PyBoy, badges: tuple[str, ...]) -> None:
+    """Sets exactly `badges` on `wObtainedBadges`, directly - see
+    `_BADGE_BITS`'s own docstring for why this is set rather than earned."""
+    mask = 0
+    for badge in badges:
+        mask |= 1 << _BADGE_BITS[badge]
+    pyboy.memory[_BADGES_ADDRESS] = mask
+
 
 def _give_overpowered_party(pyboy: PyBoy) -> None:
     """Writes one absurdly-strong party Pokemon directly into WRAM.
@@ -690,6 +718,98 @@ def _walk_toward(pyboy: PyBoy, x: int, y: int, max_calls: int = 20) -> None:
         target = NavigationTarget(map_id=state.map_id, x=x, y=y)
         if not execute_navigation_macro(pyboy, target):
             return
+
+
+def _direction_toward(from_x: int, from_y: int, player_x: int, player_y: int) -> str | None:
+    """Which of the four raw directions moves the player toward
+    `(from_x, from_y)` - a hop's own source tile - along whichever single
+    axis it actually differs on (a hop tile only ever differs from the
+    approach on one axis: the map-edge/door's own perpendicular axis).
+    `None` if already aligned on both (nothing to nudge)."""
+    if from_y < player_y:
+        return "up"
+    if from_y > player_y:
+        return "down"
+    if from_x < player_x:
+        return "left"
+    if from_x > player_x:
+        return "right"
+    return None
+
+
+def _nudge_across_hop(pyboy: PyBoy, hop, player_x: int, player_y: int, max_offset: int = 3) -> None:
+    """Crosses a stalled hop with a raw directional press toward its own
+    tile (`_cross_map_edge`) - and, since that exact tile can itself sit on
+    a real, physically-blocked tile a few tiles off from the actual
+    walkable gap in the map edge's tree/fence line (confirmed directly:
+    Route 1's own north edge into Viridian City blocks dead straight-on at
+    the hop's exact computed x, a couple of tiles either side crosses
+    fine - `connection_hop`'s own docstring already notes any tile in a
+    connection's overlap range is an equally valid crossing, not just the
+    midpoint it picks), searches a short lateral offset either side (still
+    pressing the same primary direction to actually cross) before giving
+    up.
+    """
+    direction = _direction_toward(hop.from_x, hop.from_y, player_x, player_y)
+    if direction is None:
+        return
+    start_map = extract_game_state(pyboy).map_id
+
+    def crossed() -> bool:
+        _cross_map_edge(pyboy, direction)
+        return extract_game_state(pyboy).map_id != start_map
+
+    if crossed():
+        return
+    lateral_a, lateral_b = ("left", "right") if direction in ("up", "down") else ("up", "down")
+    for lateral, opposite in ((lateral_a, lateral_b), (lateral_b, lateral_a)):
+        for _ in range(max_offset):
+            execute_button(pyboy, lateral)
+            if crossed():
+                return
+        for _ in range(max_offset):
+            execute_button(pyboy, opposite)  # back to center before the other side
+
+
+def _walk_to_milestone_target(
+    pyboy: PyBoy, map_id: int, x: int, y: int, max_calls: int = 40
+) -> None:
+    """Like `_walk_toward`, but for a target that may sit on a different map
+    than wherever the player currently is - #102's cross-map routing (see
+    `travel_graph.MILESTONE_MAP_IDS`) does the actual map-crossing, one hop
+    per `execute_navigation_macro` call, as long as every map on the route
+    is in that scoped graph. A higher default `max_calls` than
+    `_walk_toward`'s, since a milestone's target can sit several maps and
+    screens away rather than a single nearby tile.
+
+    A hop's own tile can itself misread as collision-blocked in PyBoy's
+    on-screen `game_area_collision()` - the same pre-existing limitation
+    `_NEAR_OAKS_LAB_DOOR_PATH`'s comment documents for Pallet Town's fence
+    tile (confirmed directly: the on-screen A* walks right up to within a
+    tile or two of a hop tile, then reports no further progress, even
+    though the real game lets the player step onto it) - so when
+    `execute_navigation_macro` stops making progress while still short of
+    `map_id`, this nudges across the map edge (`_nudge_across_hop`) rather
+    than treating "the on-screen A* gave up" as "no route exists."
+    """
+    for _ in range(max_calls):
+        state = extract_game_state(pyboy)
+        if state.dialog_open or state.battle.in_battle:
+            return
+        if state.map_id == map_id and (state.player_x, state.player_y) == (x, y):
+            return
+        target = NavigationTarget(map_id=map_id, x=x, y=y)
+        if execute_navigation_macro(pyboy, target):
+            continue
+        if state.map_id == map_id:
+            return
+        hop = next_hop(_travel_graph(), state.map_id, map_id)
+        if hop is None:
+            return
+        before = extract_game_state(pyboy)
+        _nudge_across_hop(pyboy, hop, before.player_x, before.player_y)
+        if extract_game_state(pyboy).map_id == before.map_id:
+            return  # the nudge search exhausted every offset without crossing
 
 
 def _cross_map_edge(pyboy: PyBoy, direction: str, max_presses: int = 5) -> None:
@@ -929,6 +1049,29 @@ def test_walking_to_pewter_gym_brock_reaches_a_rom_verified_tile(pyboy_outdoors)
             dialog_opened = True
             break
     assert dialog_opened
+
+
+# #100: per-milestone boot verification, batch 2 (parent #96, sibling of
+# #99's batch 1 above). `_walk_to_milestone_target` (unlike #99's
+# `_walk_toward`) lets the target sit on a different map than wherever the
+# player currently is - #102's cross-map routing does the actual crossing,
+# one travel-graph hop per `execute_navigation_macro` call, as long as
+# every map on the route is in `travel_graph.MILESTONE_MAP_IDS` (extended
+# per milestone below).
+#
+# earth_badge (Viridian Gym, map 45) is NOT covered below despite being a
+# direct warp off Viridian City (already in scope alongside Pallet Town/
+# Route 1) - confirmed via an exhaustive real-emulator BFS (save-state-
+# forked, every reachable tile from the Route 1 entrance explored, 530
+# distinct tiles, queue emptied naturally rather than hitting a depth cap)
+# that the gym's own door tile, and the two tiles south of it, are
+# genuinely unreachable by ordinary walking from Viridian City's only
+# in-scope entrance - with or without the other 7 badges set. This isn't
+# the known "door tiles misread as collision-blocked" limitation
+# `_nudge_across_hop` already works around (that's a local, few-tile
+# nudge; this is a real, town-wide unreachable region) - it needs either a
+# corrected ROM-parsed door coordinate or real visual investigation to
+# find the actual approach, neither of which this pass had budget for.
 
 
 def _milestone(target_x: int | None = None, target_y: int | None = None) -> Milestone:
