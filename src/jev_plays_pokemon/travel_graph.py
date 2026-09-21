@@ -50,13 +50,20 @@ set of map IDs - not the whole ~223-map graph - per ADR-0002's incremental-
 build decision ("this ticket doesn't need to build routes for every
 milestone"). It currently covers Pallet Town -> Oak's Lab (`got_starter`/
 `got_pokedex`), Pallet Town -> Viridian City -> Viridian Mart
-(`got_oaks_parcel`), and the full Pallet Town -> Route 1 -> Viridian City
--> Route 2 -> Pewter City -> Pewter Gym chain (`boulder_badge`) - the
-multi-hop, connection-crossing case ADR-0002 names by example. Milestones
-outside this set (e.g. `cascade_badge`) aren't yet reachable in the graph;
-`next_hop`/`find_route` signal that as `None`, per ADR-0002's statelessness
-(#102 treats a `None` route as a graceful no-op, matching today's
-same-map-only behavior), rather than raising - a gap here is expected,
+(`got_oaks_parcel`), the full Pallet Town -> Route 1 -> Viridian City ->
+Route 2 -> Pewter City -> Pewter Gym chain (`boulder_badge`) - the
+multi-hop, connection-crossing case ADR-0002 names by example - and (#99)
+the overland corridor onward from Pewter City through Route 3/Route 4 to
+Cerulean City and Cerulean Gym (`cascade_badge`), Cerulean -> Route 24 ->
+Route 25 -> Bill's House (`got_ss_ticket`), and Cerulean -> Route 5 ->
+Saffron City -> Route 6 -> Vermilion City/Gym (`thunder_badge`) and
+Saffron -> Route 7 -> Celadon City/Gym (`rainbow_badge`) - all real,
+walkable land routes (no Surf/water crossing), confirmed against this
+repo's own ROM data. Milestones outside this set (e.g. `soul_badge`)
+aren't yet reachable in the graph; `next_hop`/`find_route` signal that as
+`None`, per ADR-0002's statelessness (#102 treats a `None` route as a
+graceful no-op, matching today's same-map-only behavior), rather than
+raising - a gap here is expected,
 incremental-build territory, not a bug.
 
 ## Search
@@ -312,27 +319,58 @@ def build_travel_graph(
 # Map IDs, per `constants/map_constants.asm`'s `const_def` position (same
 # source `milestones.py` uses). The outdoor maps here are exactly the ones
 # needed to route Pallet Town -> Pewter City (ADR-0002's own named example)
-# plus Pallet Town -> Viridian City for the Viridian Mart leg - see module
-# docstring's "Scope" section.
+# plus Pallet Town -> Viridian City for the Viridian Mart leg, and (#99)
+# onward to Cerulean/Bill's House/Vermilion/Celadon - see module docstring's
+# "Scope" section.
 _MAP_PALLET_TOWN = 0
 _MAP_VIRIDIAN_CITY = 1
 _MAP_PEWTER_CITY = 2
+_MAP_CERULEAN_CITY = 3
+_MAP_VERMILION_CITY = 5
+_MAP_CELADON_CITY = 6
+_MAP_SAFFRON_CITY = 10
 _MAP_ROUTE_1 = 12
 _MAP_ROUTE_2 = 13
+_MAP_ROUTE_3 = 14
+_MAP_ROUTE_4 = 15
+_MAP_ROUTE_5 = 16
+_MAP_ROUTE_6 = 17
+_MAP_ROUTE_7 = 18
+_MAP_ROUTE_24 = 35
+_MAP_ROUTE_25 = 36
 _MAP_OAKS_LAB = 40
 _MAP_VIRIDIAN_MART = 42
 _MAP_PEWTER_GYM = 54
+_MAP_CERULEAN_GYM = 65
+_MAP_BILLS_HOUSE = 88
+_MAP_VERMILION_GYM = 92
+_MAP_CELADON_GYM = 134
 
 MILESTONE_MAP_IDS: frozenset[int] = frozenset(
     {
         _MAP_PALLET_TOWN,
         _MAP_VIRIDIAN_CITY,
         _MAP_PEWTER_CITY,
+        _MAP_CERULEAN_CITY,
+        _MAP_VERMILION_CITY,
+        _MAP_CELADON_CITY,
+        _MAP_SAFFRON_CITY,
         _MAP_ROUTE_1,
         _MAP_ROUTE_2,
+        _MAP_ROUTE_3,
+        _MAP_ROUTE_4,
+        _MAP_ROUTE_5,
+        _MAP_ROUTE_6,
+        _MAP_ROUTE_7,
+        _MAP_ROUTE_24,
+        _MAP_ROUTE_25,
         _MAP_OAKS_LAB,
         _MAP_VIRIDIAN_MART,
         _MAP_PEWTER_GYM,
+        _MAP_CERULEAN_GYM,
+        _MAP_BILLS_HOUSE,
+        _MAP_VERMILION_GYM,
+        _MAP_CELADON_GYM,
     }
 )
 

@@ -21,10 +21,20 @@ pytestmark = pytest.mark.skipif(
 
 _MAP_PALLET_TOWN = 0
 _MAP_PEWTER_CITY = 2
+_MAP_CERULEAN_CITY = 3
 _MAP_OAKS_LAB = 40
 _MAP_VIRIDIAN_MART = 42
 _MAP_PEWTER_GYM = 54
-_MAP_CASCADE_GYM_NOT_YET_ROUTED = 65
+_MAP_CERULEAN_GYM = 65
+_MAP_BILLS_HOUSE = 88
+_MAP_VERMILION_GYM = 92
+_MAP_CELADON_GYM = 134
+# Silph Co 2F: one of the 7 maps #96's "Out of Scope" section names as never
+# getting a travel-graph route (its parsed ROM records disagreed with
+# upstream pret/pokered during that ticket's research) - a permanently safe
+# "no known route yet" example, unlike map 65 (Cerulean Gym), which #99
+# brought into MILESTONE_MAP_IDS.
+_MAP_NOT_YET_ROUTED = 207
 
 
 @pytest.fixture(scope="module")
@@ -84,9 +94,34 @@ def test_pallet_town_to_pewter_gym_crosses_multiple_outdoor_connections(graph):
     assert route[-1].from_map == _MAP_PEWTER_CITY
 
 
+def test_pallet_town_to_cerulean_gym_crosses_the_northbound_overland_corridor(graph):
+    """#99: Pallet Town -> Route 1 -> Viridian City -> Route 2 -> Pewter
+    City -> Route 3 -> Route 4 -> Cerulean City -> Cerulean Gym."""
+    route = tg.find_route(graph, _MAP_PALLET_TOWN, _MAP_CERULEAN_GYM)
+    assert route is not None
+    assert route[-1].to_map == _MAP_CERULEAN_GYM
+    assert route[-1].from_map == _MAP_CERULEAN_CITY
+
+
+def test_cerulean_city_to_bills_house_crosses_routes_24_and_25(graph):
+    route = tg.find_route(graph, _MAP_CERULEAN_CITY, _MAP_BILLS_HOUSE)
+    assert route is not None
+    assert route[-1].to_map == _MAP_BILLS_HOUSE
+
+
+def test_cerulean_city_to_vermilion_gym_crosses_saffron_city(graph):
+    route = tg.find_route(graph, _MAP_CERULEAN_CITY, _MAP_VERMILION_GYM)
+    assert route is not None
+    assert route[-1].to_map == _MAP_VERMILION_GYM
+
+
+def test_cerulean_city_to_celadon_gym_crosses_saffron_city(graph):
+    route = tg.find_route(graph, _MAP_CERULEAN_CITY, _MAP_CELADON_GYM)
+    assert route is not None
+    assert route[-1].to_map == _MAP_CELADON_GYM
+
+
 def test_no_known_route_yet_for_a_milestone_outside_this_tickets_scope(graph):
-    """Cascade Badge's gym isn't in `MILESTONE_MAP_IDS` yet (ADR-0002's
-    incremental build) - the search must signal that cleanly, not raise."""
-    assert (
-        tg.find_route(graph, _MAP_PALLET_TOWN, _MAP_CASCADE_GYM_NOT_YET_ROUTED) is None
-    )
+    """Silph Co 2F isn't in `MILESTONE_MAP_IDS` (#96's own "Out of Scope"
+    list) - the search must signal that cleanly, not raise."""
+    assert tg.find_route(graph, _MAP_PALLET_TOWN, _MAP_NOT_YET_ROUTED) is None
