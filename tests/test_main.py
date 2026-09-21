@@ -145,6 +145,78 @@ def test_dialog_text_source_swallows_a_decode_failure_and_continues(
     assert any("dialog decode failed" in r.getMessage() for r in caplog.records)
 
 
+class _RecordingLock:
+    """Stands in for a real `threading.Lock` - records whether it was held
+    (#109) while `render`/`capture_screen` ran, and whether it was still
+    held during the decoder call."""
+
+    def __init__(self) -> None:
+        self.held = False
+        self.held_during_render = False
+        self.held_during_decode = False
+
+    def __enter__(self):
+        self.held = True
+        return self
+
+    def __exit__(self, *exc_info):
+        self.held = False
+        return False
+
+
+def test_dialog_text_source_holds_the_lock_around_render_and_capture(monkeypatch):
+    lock = _RecordingLock()
+
+    def fake_render(pyboy):
+        lock.held_during_render = lock.held
+
+    monkeypatch.setattr("jev_plays_pokemon.main.capture_screen", lambda pyboy: "img")
+    source = build_dialog_text_source(
+        cast(PyBoy, _FakePyBoy()),
+        lambda screen: "text",
+        render=fake_render,
+        lock=lock,
+    )
+
+    assert source(_game_state(dialog_open=True)) == "text"
+    assert lock.held_during_render is True
+    assert lock.held is False  # released again once the callable returns
+
+
+def test_dialog_text_source_releases_the_lock_before_calling_the_decoder(monkeypatch):
+    # The decoder is a real network round trip to a vision endpoint (#109) -
+    # it must never run while the shared pyboy lock is held, or it would
+    # stall the free-running emulator clock for the whole call.
+    lock = _RecordingLock()
+
+    def fake_decoder(screen):
+        lock.held_during_decode = lock.held
+        return "text"
+
+    monkeypatch.setattr("jev_plays_pokemon.main.capture_screen", lambda pyboy: "img")
+    source = build_dialog_text_source(
+        cast(PyBoy, _FakePyBoy()),
+        fake_decoder,
+        render=lambda pyboy: None,
+        lock=lock,
+    )
+
+    assert source(_game_state(dialog_open=True)) == "text"
+    assert lock.held_during_decode is False
+
+
+def test_dialog_text_source_works_with_no_lock_given(monkeypatch):
+    # Pre-#109 behaviour: no lock argument at all still works, unlocked.
+    monkeypatch.setattr("jev_plays_pokemon.main.capture_screen", lambda pyboy: "img")
+    source = build_dialog_text_source(
+        cast(PyBoy, _FakePyBoy()),
+        lambda screen: "text",
+        render=lambda pyboy: None,
+    )
+
+    assert source(_game_state(dialog_open=True)) == "text"
+
+
 # -- run_loop: the pure, repeated per-turn cycle ------------------------------
 
 
