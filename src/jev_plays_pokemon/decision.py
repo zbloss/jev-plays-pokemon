@@ -81,18 +81,22 @@ NAVIGATION_MACRO_ACTION = "NAVIGATE_TO_OBJECTIVE"
 ACTION_SPACE: tuple[str, ...] = (*RAW_BUTTONS, NAVIGATION_MACRO_ACTION)
 
 
-def out_of_battle_action_space(milestone: Milestone | None) -> tuple[str, ...]:
+def out_of_battle_action_space(
+    milestone: Milestone | None, current_map: int
+) -> tuple[str, ...]:
     """The out-of-battle actions actually legal to offer/nudge with this
-    turn, for `milestone`: `ACTION_SPACE` is the flat, milestone-independent
-    full space (every raw button plus the macro); this is the turn-specific
-    subset of it (#83) - the macro drops out whenever it would be a no-op.
+    turn, for `milestone` given the player's `current_map`: `ACTION_SPACE`
+    is the flat, milestone-independent full space (every raw button plus
+    the macro); this is the turn-specific subset of it (#83) - the macro
+    drops out whenever it would be a no-op, including a not-yet-routed
+    cross-map milestone (#102).
 
     Consults `resolve_navigation_target` - the same resolver `make_pyboy_
     action_executor`'s macro branch calls at execution time - so the offer
     predicate and the execution path can't drift apart into two different
     "does this milestone have a target yet?" checks.
     """
-    if resolve_navigation_target(milestone) is not None:
+    if resolve_navigation_target(milestone, current_map) is not None:
         return ACTION_SPACE
     return RAW_BUTTONS
 
@@ -530,7 +534,7 @@ def _build_action_question(state: GameState, milestone: Milestone | None) -> Cho
             instructions="Which single battle action should be taken next?",
             criteria=_battle_action_criteria(state),
         )
-    action_space = out_of_battle_action_space(milestone)
+    action_space = out_of_battle_action_space(milestone, state.map_id)
     criteria = {action: _ACTION_CRITERIA[action] for action in action_space}
     return Choice(
         instructions="Which single action should be taken next?",
@@ -619,7 +623,7 @@ def make_pyboy_action_executor(
     *,
     extract_state: Callable[[PyBoy], GameState] = extract_game_state,
     resolve_target: Callable[
-        [Milestone | None], NavigationTarget | None
+        [Milestone | None, int], NavigationTarget | None
     ] = resolve_navigation_target,
     run_macro: Callable[[PyBoy, NavigationTarget], bool] = execute_navigation_macro,
     press_button: Callable[[PyBoy, str], None] = execute_button,
@@ -678,7 +682,7 @@ def make_pyboy_action_executor(
         if action == NAVIGATION_MACRO_ACTION:
             state = extract_state(pyboy)
             milestone_progress = track_milestones(state.event_flags, state.badges)
-            target = resolve_target(milestone_progress.current)
+            target = resolve_target(milestone_progress.current, state.map_id)
             if target is not None:
                 run_macro(pyboy, target)
             else:

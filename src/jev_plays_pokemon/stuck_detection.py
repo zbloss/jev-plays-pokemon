@@ -188,7 +188,7 @@ def wrap_for_stuck_detection(
             pool = (
                 legal_actions
                 if legal_actions is not None
-                else out_of_battle_action_space(last_milestone[0])
+                else out_of_battle_action_space(last_milestone[0], position[0])
             )
             nudge_action = random_choice(pool)
             logger.warning("stuck detected; nudging with action=%s", nudge_action)

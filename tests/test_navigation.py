@@ -29,6 +29,13 @@ pytestmark = pytest.mark.skipif(
     not ROM_PATH.exists(), reason=f"{ROM_PATH} not present locally"
 )
 
+# Map IDs, matching `travel_graph.py`'s own (`constants/map_constants.asm`
+# `const_def` position) - used to exercise #102's cross-map routing against
+# real, known hops in the milestone travel graph.
+_MAP_PALLET_TOWN = 0
+_MAP_OAKS_LAB = 40
+_MAP_CASCADE_GYM_NOT_YET_ROUTED = 65  # outside travel_graph.MILESTONE_MAP_IDS
+
 
 def _position(pyboy: PyBoy) -> tuple[int, int, int]:
     memory = pyboy.memory
@@ -212,17 +219,109 @@ def test_navigation_macro_can_reach_a_nearby_target_exactly(pyboy_outdoors):
     assert (after.player_x, after.player_y) == (target.x, target.y)
 
 
-def test_navigation_macro_is_a_noop_when_player_is_on_a_different_map(pyboy_outdoors):
+def test_navigation_macro_is_a_noop_when_the_target_map_has_no_known_route(
+    pyboy_outdoors,
+):
+    """#102's graceful-degradation case: a target map the travel graph
+    doesn't (yet) know how to reach from here stays a no-op, exactly like
+    pre-#102 cross-map behavior - unlike a target map the graph *does* know
+    a route to (see `test_navigation_macro_routes_across_maps_via_a_known_hop`
+    below), which is no longer a no-op."""
     before = extract_game_state(pyboy_outdoors)
-    target = NavigationTarget(
-        map_id=before.map_id + 1, x=before.player_x, y=before.player_y
-    )
+    target = NavigationTarget(map_id=_MAP_CASCADE_GYM_NOT_YET_ROUTED, x=4, y=2)
 
     moved = execute_navigation_macro(pyboy_outdoors, target)
 
     after = extract_game_state(pyboy_outdoors)
     assert moved is False
     assert (after.player_x, after.player_y) == (before.player_x, before.player_y)
+
+
+# The first 14 presses of `_TO_OAKS_LAB_TABLE_PATH` below (same fixed,
+# ROM-verified sequence, from the same `pyboy_outdoors` spawn) - far enough
+# from the house to clear a real Pallet Town obstacle (a fence/hedge tile
+# pair) this ticket found `game_area_collision()` reports as walkable when
+# the real game engine doesn't allow crossing it, a pre-existing limitation
+# of PyBoy 2.2.0's exposed collision data unrelated to #102's own routing
+# logic - and still short of Oak's Lab's own door, so the macro is the one
+# actually crossing the map boundary below, not this fixed prefix.
+_NEAR_OAKS_LAB_DOOR_PATH: tuple[str, ...] = (
+    "down",
+    "down",
+    "down",
+    "down",
+    "right",
+    "right",
+    "right",
+    "down",
+    "down",
+    "down",
+    "right",
+    "up",
+    "down",
+    "down",
+)
+
+
+def test_navigation_macro_routes_across_maps_via_a_known_hop(pyboy_outdoors):
+    """#102's core acceptance criterion: booted on a map that isn't the
+    current milestone's target map, running the macro across the resulting
+    travel-graph route - over multiple invocations, since #102 re-derives
+    the next hop fresh every call rather than committing to one upfront
+    route - ends the player up on the target map, at or closer to the
+    milestone's own tile than wherever they first land there.
+
+    A deliberately small `max_steps` (2, versus the real default of 128)
+    forces the crossing to actually span several `execute_navigation_macro`
+    calls rather than finishing within a single one - from this test's
+    starting position, one call at the real default is enough to walk the
+    whole remaining route, which would leave every call after the first a
+    no-op and never actually exercise re-deriving the route across calls.
+
+    "At or closer" rather than "exactly reaches" because Oak's Lab is an
+    indoor map: PyBoy's `game_area_collision()` is only verified accurate
+    outdoors (see `_walk_out_of_the_house`'s docstring above), so last-mile
+    A* may not be able to walk the player any further once inside - this
+    still proves #102's routing itself (leaving Pallet Town via the correct
+    door, landing on the target map) without depending on that separate,
+    pre-existing indoor-collision limitation.
+    """
+    for direction in _NEAR_OAKS_LAB_DOOR_PATH:
+        execute_button(pyboy_outdoors, direction)
+    before = extract_game_state(pyboy_outdoors)
+    assert before.map_id == _MAP_PALLET_TOWN
+    milestone = Milestone(
+        milestone_id="test_cross_map_milestone",
+        description="a milestone used only by this test",
+        target=MilestoneTarget(
+            map_id=_MAP_OAKS_LAB, map_name="Oaks Lab", target_x=8, target_y=3
+        ),
+    )
+    target = resolve_navigation_target(milestone, before.map_id)
+    assert target is not None
+
+    landing_distance: int | None = None
+    crossed_on_invocation: int | None = None
+    for invocation in range(10):
+        state = extract_game_state(pyboy_outdoors)
+        if state.map_id == target.map_id and landing_distance is None:
+            landing_distance = abs(state.player_x - target.x) + abs(
+                state.player_y - target.y
+            )
+            crossed_on_invocation = invocation
+        execute_navigation_macro(pyboy_outdoors, target, max_steps=2)
+
+    # Confirms the crossing genuinely took more than one call - otherwise
+    # the loop above wouldn't actually be exercising #102's cross-call
+    # statelessness (re-deriving the next hop fresh every invocation).
+    assert crossed_on_invocation is not None
+    assert crossed_on_invocation > 0
+
+    after = extract_game_state(pyboy_outdoors)
+    assert after.map_id == target.map_id
+    assert landing_distance is not None
+    final_distance = abs(after.player_x - target.x) + abs(after.player_y - target.y)
+    assert final_distance <= landing_distance
 
 
 def test_navigation_macro_stops_immediately_if_dialog_is_already_open(
@@ -327,7 +426,7 @@ def test_navigation_macro_reaches_a_milestones_target_end_to_end(pyboy_outdoors)
         ),
     )
 
-    target = resolve_navigation_target(milestone)
+    target = resolve_navigation_target(milestone, before.map_id)
     assert target is not None
     moved = execute_navigation_macro(pyboy_outdoors, target)
 
@@ -843,19 +942,48 @@ def _milestone(target_x: int | None = None, target_y: int | None = None) -> Mile
 
 
 def test_resolve_navigation_target_returns_none_when_there_is_no_current_milestone():
-    assert resolve_navigation_target(None) is None
+    assert resolve_navigation_target(None, 40) is None
 
 
 def test_resolve_navigation_target_returns_none_without_verified_tile_coordinates():
-    assert resolve_navigation_target(_milestone()) is None
+    assert resolve_navigation_target(_milestone(), 40) is None
 
 
 def test_resolve_navigation_target_returns_the_milestones_tile_coordinates():
     milestone = _milestone(target_x=4, target_y=5)
 
-    target = resolve_navigation_target(milestone)
+    target = resolve_navigation_target(milestone, current_map=40)
 
     assert target == NavigationTarget(map_id=40, x=4, y=5)
+
+
+def test_resolve_navigation_target_resolves_a_target_across_maps_with_a_known_route():
+    """`current_map` differing from the milestone's own map isn't itself a
+    reason to return `None` (#102): Pallet Town -> Oak's Lab is a known
+    single-hop route in `travel_graph.py`'s milestone graph."""
+    milestone = _milestone(target_x=4, target_y=5)
+
+    target = resolve_navigation_target(milestone, current_map=_MAP_PALLET_TOWN)
+
+    assert target == NavigationTarget(map_id=40, x=4, y=5)
+
+
+def test_resolve_navigation_target_returns_none_without_a_known_route_yet():
+    """A milestone whose target map has no known travel-graph route yet
+    (ADR-0002's incremental build) degrades to `None`, not a crash - the
+    same "can't resolve a destination" signal as unverified coordinates."""
+    milestone = Milestone(
+        milestone_id="test_milestone_not_yet_routed",
+        description="a milestone used only by this test",
+        target=MilestoneTarget(
+            map_id=_MAP_CASCADE_GYM_NOT_YET_ROUTED,
+            map_name="Cerulean Gym",
+            target_x=4,
+            target_y=2,
+        ),
+    )
+
+    assert resolve_navigation_target(milestone, current_map=_MAP_PALLET_TOWN) is None
 
 
 # #76: battle-menu cursor delta helpers - pure, no PyBoy required.

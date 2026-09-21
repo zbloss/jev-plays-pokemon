@@ -45,19 +45,41 @@ tile data at once, and this pinned PyBoy version doesn't expose the
 WRAM-buffered full-map block data either (see `game_state.py`'s docstring
 for the same 2.2.0-vs-dev-branch API gap). The macro therefore re-plans a
 fresh local path every step from whatever's on screen right then, rather
-than computing one global route up front; it walks *toward* the target,
-it doesn't guarantee arrival, and doesn't attempt cross-map routing (if the
-player isn't already on the target's map, it's a no-op - see
-`execute_navigation_macro`).
+than computing one global route up front; it walks *toward* the target, it
+doesn't guarantee arrival.
+
+Cross-map routing (`docs/adr/0002-travel-graph-for-cross-map-navigation.md`,
+#102): when the player isn't on the current milestone's target map yet,
+`execute_navigation_macro` queries `travel_graph.py`'s (#101) hand-authored
+hop graph, on every step, for the next hop from wherever the player
+currently is toward the milestone's target map, and hands local A* the
+current map's side of that hop's tile instead of the milestone's own tile -
+once local A* walks the player onto it, the game's own warp/connection
+handling does the actual map transition, and the next step (possibly the
+next `execute_navigation_macro` call entirely) picks up the following hop
+from there. No route is planned or cached up front: each step re-derives
+the next hop from current game state, per ADR-0002's "Statelessness"
+section, so a player knocked off course (a battle, a stray screen, an NPC)
+still makes progress from wherever they actually ended up on the very next
+call. A milestone whose target map has no known route in the graph yet
+(ADR-0002's incremental build) is a graceful no-op, matching today's
+same-map-only behavior, rather than a crash. Local A* also treats every
+other known hop tile on the player's current map as an obstacle by default
+(`_walkable`) - it won't route the player onto a warp/connection tile that
+isn't the one it's actually trying to reach - except the current step's own
+intended goal tile, which is always walkable (ADR-0002's "context-dependent"
+warp treatment).
 
 All 14 scripted milestones now carry ROM-derived tile coordinates
 (`milestones.py`, #98), so `resolve_navigation_target` resolves a real
-`NavigationTarget` for any of them; it still returns `None` only when there's
-no current milestone (every milestone complete) or - for some future
-milestone added without a resolved target - when `target_x`/`target_y` are
-unset. `execute_navigation_macro` is still exercised directly with an
-explicit `NavigationTarget` in most tests (see tests) for isolation from
-milestone-tracking state, not because real milestones lack one.
+`NavigationTarget` for any of them; it still returns `None` when there's no
+current milestone (every milestone complete), when `target_x`/`target_y`
+are unset - for some future milestone added without a resolved target, or
+when the player isn't on the milestone's target map and the travel graph
+doesn't (yet) know a route there. `execute_navigation_macro` is still
+exercised directly with an explicit `NavigationTarget` in most tests (see
+tests) for isolation from milestone-tracking state, not because real
+milestones lack one.
 """
 
 from __future__ import annotations
@@ -65,11 +87,19 @@ from __future__ import annotations
 import heapq
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 
 from pyboy import PyBoy
 
+from jev_plays_pokemon import rom_maps
 from jev_plays_pokemon.game_state import extract_game_state
 from jev_plays_pokemon.milestones import Milestone
+from jev_plays_pokemon.travel_graph import (
+    MILESTONE_MAP_IDS,
+    TravelGraph,
+    build_milestone_travel_graph,
+    next_hop,
+)
 
 RAW_BUTTONS: tuple[str, ...] = (
     "up",
@@ -203,6 +233,40 @@ def main_battle_menu_delta_buttons(current: int, target: int) -> tuple[str, ...]
     return tuple(buttons)
 
 
+@lru_cache(maxsize=1)
+def _travel_graph() -> TravelGraph:
+    """The travel graph (`travel_graph.py`, #101), built once from the
+    pinned ROM and cached for the process lifetime.
+
+    This caches fixed, ROM-derived hop *data*, not route state - ADR-0002's
+    "Statelessness" section is about not persisting a chosen *route* across
+    turns (`find_route`/`next_hop` still re-search from scratch on every
+    call, per that module's own docstring); the graph itself never changes
+    for a given ROM, so rebuilding it from scratch on every step/turn would
+    just be wasted parsing.
+
+    Falls back to an empty graph when `pokemon_red.gb` isn't present (it's
+    gitignored - see `tests/test_navigation.py`'s own `ROM_PATH.exists()`
+    gate): an empty graph makes every cross-map lookup resolve to "no known
+    route", the same graceful-no-op signal ADR-0002 already defines for a
+    milestone outside the graph's incrementally-built scope, rather than a
+    crash. `decision.py`'s `resolve_navigation_target`/`out_of_battle_
+    action_space` call this on every turn regardless of whether the current
+    milestone is same-map, so tests exercising those against a plain fake
+    `GameState` - no PyBoy, no ROM, by design (see `decision.py`'s module
+    docstring) - must not be forced to boot a real ROM just to determine an
+    unrelated milestone's map is out of reach.
+    """
+    try:
+        rom = rom_maps.load_rom()
+    except FileNotFoundError:
+        return TravelGraph()
+    rom_maps_by_id = {
+        map_id: rom_maps.parse_map(rom, map_id) for map_id in MILESTONE_MAP_IDS
+    }
+    return build_milestone_travel_graph(rom_maps_by_id)
+
+
 @dataclass(frozen=True)
 class NavigationTarget:
     map_id: int
@@ -210,27 +274,62 @@ class NavigationTarget:
     y: int
 
 
-def resolve_navigation_target(milestone: Milestone | None) -> NavigationTarget | None:
+def resolve_navigation_target(
+    milestone: Milestone | None, current_map: int
+) -> NavigationTarget | None:
     """Pull the navigation macro's destination from the current milestone.
 
+    `current_map` is the player's current map ID: when it differs from the
+    milestone's own target map, this checks that `travel_graph.py`'s (#101)
+    hop graph actually knows a route there yet - if it doesn't (ADR-0002's
+    incremental build), this returns `None` so the macro isn't offered/run
+    for a milestone it can't make any progress toward, exactly as it
+    already does for a milestone with no verified tile coordinates at all.
+    The returned target is always the milestone's own tile, regardless of
+    `current_map` - `execute_navigation_macro` resolves the next hop's tile
+    itself, fresh, on every step it takes (see module docstring).
+
     Returns `None` when there's no current milestone (every milestone
-    complete) or when it has no verified tile-level target yet (see this
-    module's docstring and `milestones.py`'s own).
+    complete), when it has no verified tile-level target yet, or when
+    `current_map` isn't the target map and no route there is known yet (see
+    this module's docstring and `milestones.py`'s own).
     """
     if milestone is None:
         return None
     target = milestone.target
     if target.target_x is None or target.target_y is None:
         return None
+    if current_map != target.map_id and (
+        next_hop(_travel_graph(), current_map, target.map_id) is None
+    ):
+        return None
     return NavigationTarget(target.map_id, target.target_x, target.target_y)
 
 
-def _walkable(collision, col: int, row: int) -> bool:
+def _walkable(
+    collision,
+    col: int,
+    row: int,
+    warp_cells: frozenset[tuple[int, int]],
+    goal: tuple[int, int],
+) -> bool:
+    """Whether `(col, row)` is walkable: on the collision grid, not blocked
+    terrain, and - per ADR-0002's context-dependent warp treatment - not a
+    known hop tile from `warp_cells` unless it's `goal`, this step's own
+    intended destination (the next hop's tile, or the milestone's own final
+    tile - see `execute_navigation_macro`)."""
     height, width = collision.shape
-    return 0 <= col < width and 0 <= row < height and collision[row, col] != 0
+    if not (0 <= col < width and 0 <= row < height and collision[row, col] != 0):
+        return False
+    return (col, row) == goal or (col, row) not in warp_cells
 
 
-def _next_step_toward(collision, goal_col: int, goal_row: int) -> str | None:
+def _next_step_toward(
+    collision,
+    goal_col: int,
+    goal_row: int,
+    warp_cells: frozenset[tuple[int, int]] = frozenset(),
+) -> str | None:
     """A* from the player's fixed grid cell toward `(goal_col, goal_row)`.
 
     The goal is expressed in the same screen-relative grid as `collision`
@@ -241,6 +340,11 @@ def _next_step_toward(collision, goal_col: int, goal_row: int) -> str | None:
     ends up closest to it by Manhattan distance, so the macro still makes
     real progress instead of giving up. Returns `None` if the player's own
     cell has no walkable neighbours at all.
+
+    `warp_cells` are this map's known hop tiles (screen-relative, see
+    `execute_navigation_macro`), treated as obstacles by `_walkable` unless
+    a cell is `(goal_col, goal_row)` itself - ADR-0002's context-dependent
+    warp treatment.
     """
     start = (_PLAYER_GRID_COL, _PLAYER_GRID_ROW)
     goal = (goal_col, goal_row)
@@ -270,7 +374,9 @@ def _next_step_toward(collision, goal_col: int, goal_row: int) -> str | None:
 
         for dx, dy in _DIRECTIONS.values():
             neighbor = (current[0] + dx, current[1] + dy)
-            if neighbor in closed or not _walkable(collision, *neighbor):
+            if neighbor in closed or not _walkable(
+                collision, *neighbor, warp_cells, goal
+            ):
                 continue
             tentative_cost = cost + 1
             if tentative_cost < best_cost.get(neighbor, math.inf):
@@ -291,6 +397,31 @@ def _next_step_toward(collision, goal_col: int, goal_row: int) -> str | None:
     return _DIRECTION_BY_DELTA.get(step)
 
 
+def _screen_cell(
+    player_x: int, player_y: int, world_x: int, world_y: int
+) -> tuple[int, int]:
+    """`(world_x, world_y)` as a screen-relative grid cell, anchored off the
+    player's own current world position - the same world-to-screen delta
+    both a step's goal tile and a known hop tile need converting through."""
+    return (
+        _PLAYER_GRID_COL + world_x - player_x,
+        _PLAYER_GRID_ROW + world_y - player_y,
+    )
+
+
+def _warp_cells_on_screen(
+    map_id: int, player_x: int, player_y: int
+) -> frozenset[tuple[int, int]]:
+    """Screen-relative grid cells for every hop tile known to leave
+    `map_id` (`travel_graph.py`'s `hops_from`), anchored off the player's
+    current world position. Empty when the graph has no hops for this map
+    yet - degrading to plain collision-only pathing."""
+    return frozenset(
+        _screen_cell(player_x, player_y, hop.from_x, hop.from_y)
+        for hop in _travel_graph().hops_from(map_id)
+    )
+
+
 def execute_navigation_macro(
     pyboy: PyBoy, target: NavigationTarget, max_steps: int = 128
 ) -> bool:
@@ -299,8 +430,18 @@ def execute_navigation_macro(
     Re-reads position and re-plans from the freshly-read local collision
     grid before every step (see module docstring), rather than committing
     to one upfront route. Returns whether it moved the player at all.
-    Cross-map travel isn't in scope: if the player isn't already on
-    `target.map_id`, this is a no-op.
+
+    Cross-map routing (ADR-0002, #102): on every step, if the player isn't
+    on `target.map_id` yet, this queries `travel_graph.py`'s hop graph for
+    the next hop from wherever the player currently is toward
+    `target.map_id`, and paths local A* toward that hop's tile on the
+    current map instead of `target`'s own tile - walking onto it triggers
+    the game's own map transition, and the following step (in this call or
+    a later one) picks up the next hop from the new map. If the graph has
+    no route from the current map yet (ADR-0002's incremental build), this
+    is a no-op for the milestone, matching pre-#102 same-map-only behavior,
+    rather than a crash. Once on `target.map_id`, this paths straight to
+    `target`'s own tile, unchanged from before #102.
 
     `max_steps` (default 128, up from an earlier 32) bounds how far a
     single call walks before returning - the local A* below only ever gives
@@ -309,9 +450,7 @@ def execute_navigation_macro(
     128 is meant to cross a typical multi-screen corridor in one Jev turn
     (cutting down on redundant "keep going to the same place" calls) while
     still being bounded against a maze-like dead-end pocket that this
-    local-only planner has no memory of previously-visited cells to avoid
-    (see `docs/adr/0002-travel-graph-for-cross-map-navigation.md`, accepted
-    but not yet implemented, for the planned fix).
+    local-only planner has no memory of previously-visited cells to avoid.
 
     Also returns early - before touching the collision grid or pressing
     anything - the instant `state.dialog_open` or `state.battle.in_battle`
@@ -326,17 +465,24 @@ def execute_navigation_macro(
         state = extract_game_state(pyboy)
         if state.dialog_open or state.battle.in_battle:
             break
-        if state.map_id != target.map_id:
-            break
-        dx = target.x - state.player_x
-        dy = target.y - state.player_y
-        if dx == 0 and dy == 0:
+
+        if state.map_id == target.map_id:
+            goal_x, goal_y = target.x, target.y
+        else:
+            hop = next_hop(_travel_graph(), state.map_id, target.map_id)
+            if hop is None:
+                break
+            goal_x, goal_y = hop.from_x, hop.from_y
+
+        if goal_x == state.player_x and goal_y == state.player_y:
             break
 
         collision = pyboy.game_area_collision()
-        goal_col = _PLAYER_GRID_COL + dx
-        goal_row = _PLAYER_GRID_ROW + dy
-        step = _next_step_toward(collision, goal_col, goal_row)
+        goal_col, goal_row = _screen_cell(
+            state.player_x, state.player_y, goal_x, goal_y
+        )
+        warp_cells = _warp_cells_on_screen(state.map_id, state.player_x, state.player_y)
+        step = _next_step_toward(collision, goal_col, goal_row, warp_cells)
         if step is None:
             break
 
