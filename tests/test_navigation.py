@@ -720,7 +720,9 @@ def _walk_toward(pyboy: PyBoy, x: int, y: int, max_calls: int = 20) -> None:
             return
 
 
-def _direction_toward(from_x: int, from_y: int, player_x: int, player_y: int) -> str | None:
+def _direction_toward(
+    from_x: int, from_y: int, player_x: int, player_y: int
+) -> str | None:
     """Which of the four raw directions moves the player toward
     `(from_x, from_y)` - a hop's own source tile - along whichever single
     axis it actually differs on (a hop tile only ever differs from the
@@ -737,7 +739,9 @@ def _direction_toward(from_x: int, from_y: int, player_x: int, player_y: int) ->
     return None
 
 
-def _nudge_across_hop(pyboy: PyBoy, hop, player_x: int, player_y: int, max_offset: int = 3) -> None:
+def _nudge_across_hop(
+    pyboy: PyBoy, hop, player_x: int, player_y: int, max_offset: int = 3
+) -> None:
     """Crosses a stalled hop with a raw directional press toward its own
     tile (`_cross_map_edge`) - and, since that exact tile can itself sit on
     a real, physically-blocked tile a few tiles off from the actual
@@ -761,7 +765,9 @@ def _nudge_across_hop(pyboy: PyBoy, hop, player_x: int, player_y: int, max_offse
 
     if crossed():
         return
-    lateral_a, lateral_b = ("left", "right") if direction in ("up", "down") else ("up", "down")
+    lateral_a, lateral_b = (
+        ("left", "right") if direction in ("up", "down") else ("up", "down")
+    )
     for lateral, opposite in ((lateral_a, lateral_b), (lateral_b, lateral_a)):
         for _ in range(max_offset):
             execute_button(pyboy, lateral)
