@@ -174,11 +174,11 @@ def test_decide_action_offers_the_macro_when_the_milestone_has_a_resolvable_targ
 
 
 def test_out_of_battle_action_space_excludes_the_macro_without_a_resolvable_target():
-    assert out_of_battle_action_space(None) == RAW_BUTTONS
+    assert out_of_battle_action_space(None, 40) == RAW_BUTTONS
 
 
 def test_out_of_battle_action_space_includes_the_macro_with_a_resolvable_target():
-    assert out_of_battle_action_space(_RESOLVABLE_MILESTONE) == ACTION_SPACE
+    assert out_of_battle_action_space(_RESOLVABLE_MILESTONE, 40) == ACTION_SPACE
 
 
 def test_offer_predicate_and_executor_consult_the_same_navigation_resolver():
@@ -204,17 +204,19 @@ def test_out_of_battle_action_space_delegates_to_the_shared_resolver(monkeypatch
     # Complements the identity pin above with a behavioral check: the offer
     # predicate must call through to whatever `resolve_navigation_target` is
     # bound to, not a hardcoded copy of its "has tile coordinates?" check.
-    calls: list[Milestone | None] = []
+    calls: list[tuple[Milestone | None, int]] = []
 
-    def fake_resolver(milestone: Milestone | None) -> NavigationTarget | None:
-        calls.append(milestone)
+    def fake_resolver(
+        milestone: Milestone | None, current_map: int
+    ) -> NavigationTarget | None:
+        calls.append((milestone, current_map))
         return None
 
     monkeypatch.setattr(decision_module, "resolve_navigation_target", fake_resolver)
 
-    out_of_battle_action_space(_RESOLVABLE_MILESTONE)
+    out_of_battle_action_space(_RESOLVABLE_MILESTONE, 40)
 
-    assert calls == [_RESOLVABLE_MILESTONE]
+    assert calls == [(_RESOLVABLE_MILESTONE, 40)]
 
 
 def test_decide_action_low_confidence_is_still_returned_with_no_special_handling():
@@ -743,7 +745,7 @@ def test_pyboy_action_executor_does_not_render_an_extra_frame_when_the_macro_run
         pyboy,
         render_frame=lambda pyboy: render_calls.append(pyboy),
         extract_state=lambda pyboy: state,
-        resolve_target=lambda milestone: target,
+        resolve_target=lambda milestone, current_map: target,
         run_macro=lambda pyboy, t: True,
     )
 
@@ -760,7 +762,7 @@ def test_pyboy_action_executor_renders_a_frame_when_the_macro_is_a_noop():
         pyboy,
         render_frame=lambda pyboy: render_calls.append(pyboy),
         extract_state=lambda pyboy: state,
-        resolve_target=lambda milestone: None,
+        resolve_target=lambda milestone, current_map: None,
     )
 
     execute_action(NAVIGATION_MACRO_ACTION)
@@ -805,7 +807,7 @@ def test_pyboy_action_executor_dispatches_the_macro_using_the_current_milestones
     execute_action = make_pyboy_action_executor(
         pyboy,
         extract_state=lambda pyboy: state,
-        resolve_target=lambda milestone: target,
+        resolve_target=lambda milestone, current_map: target,
         run_macro=run_macro,
     )
 
@@ -825,7 +827,7 @@ def test_pyboy_action_executor_macro_is_a_noop_without_a_resolvable_target():
     execute_action = make_pyboy_action_executor(
         cast(PyBoy, _FakePyBoy()),
         extract_state=lambda pyboy: state,
-        resolve_target=lambda milestone: None,
+        resolve_target=lambda milestone, current_map: None,
         run_macro=run_macro,
     )
 
