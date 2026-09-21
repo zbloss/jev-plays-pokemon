@@ -244,8 +244,23 @@ def _travel_graph() -> TravelGraph:
     call, per that module's own docstring); the graph itself never changes
     for a given ROM, so rebuilding it from scratch on every step/turn would
     just be wasted parsing.
+
+    Falls back to an empty graph when `pokemon_red.gb` isn't present (it's
+    gitignored - see `tests/test_navigation.py`'s own `ROM_PATH.exists()`
+    gate): an empty graph makes every cross-map lookup resolve to "no known
+    route", the same graceful-no-op signal ADR-0002 already defines for a
+    milestone outside the graph's incrementally-built scope, rather than a
+    crash. `decision.py`'s `resolve_navigation_target`/`out_of_battle_
+    action_space` call this on every turn regardless of whether the current
+    milestone is same-map, so tests exercising those against a plain fake
+    `GameState` - no PyBoy, no ROM, by design (see `decision.py`'s module
+    docstring) - must not be forced to boot a real ROM just to determine an
+    unrelated milestone's map is out of reach.
     """
-    rom = rom_maps.load_rom()
+    try:
+        rom = rom_maps.load_rom()
+    except FileNotFoundError:
+        return TravelGraph()
     rom_maps_by_id = {
         map_id: rom_maps.parse_map(rom, map_id) for map_id in MILESTONE_MAP_IDS
     }
