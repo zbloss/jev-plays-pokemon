@@ -1,5 +1,8 @@
 import threading
 import time
+from typing import cast
+
+from pyboy import PyBoy
 
 from jev_plays_pokemon.emulator_clock import start_emulator_clock
 
@@ -21,42 +24,41 @@ class _RaisingPyBoy:
 
 
 def test_start_emulator_clock_ticks_pyboy_with_render_true_while_running():
-    pyboy = _FakePyBoy()
+    fake = _FakePyBoy()
     lock = threading.Lock()
 
-    clock = start_emulator_clock(pyboy, lock, interval_seconds=0.01)
+    clock = start_emulator_clock(cast(PyBoy, fake), lock, interval_seconds=0.01)
     time.sleep(0.1)
     clock.stop()
 
-    assert len(pyboy.tick_calls) >= 2
-    assert all(call == (1, True) for call in pyboy.tick_calls)
+    assert len(fake.tick_calls) >= 2
+    assert all(call == (1, True) for call in fake.tick_calls)
 
 
 def test_start_emulator_clock_returns_a_handle_that_stops_cleanly():
-    pyboy = _FakePyBoy()
     lock = threading.Lock()
 
-    clock = start_emulator_clock(pyboy, lock, interval_seconds=0.01)
+    clock = start_emulator_clock(cast(PyBoy, _FakePyBoy()), lock, interval_seconds=0.01)
     clock.stop()
 
 
 def test_start_emulator_clock_acquires_the_shared_lock_for_each_tick():
-    pyboy = _FakePyBoy()
+    fake = _FakePyBoy()
     lock = threading.Lock()
 
     # Hold the lock ourselves before starting the clock: if the clock
     # ticked without acquiring it, tick_calls would grow immediately.
     lock.acquire()
     try:
-        clock = start_emulator_clock(pyboy, lock, interval_seconds=0.01)
+        clock = start_emulator_clock(cast(PyBoy, fake), lock, interval_seconds=0.01)
         time.sleep(0.05)
-        assert pyboy.tick_calls == []
+        assert fake.tick_calls == []
     finally:
         lock.release()
 
     time.sleep(0.05)
     clock.stop()
-    assert len(pyboy.tick_calls) >= 1
+    assert len(fake.tick_calls) >= 1
 
 
 def test_start_emulator_clock_survives_a_tick_that_raises():
@@ -64,7 +66,7 @@ def test_start_emulator_clock_survives_a_tick_that_raises():
     # tick rather than silently dying - a dead clock would freeze the feed
     # with no visible error.
     clock = start_emulator_clock(
-        _RaisingPyBoy(), threading.Lock(), interval_seconds=0.01
+        cast(PyBoy, _RaisingPyBoy()), threading.Lock(), interval_seconds=0.01
     )
     time.sleep(0.05)
     clock.stop()
