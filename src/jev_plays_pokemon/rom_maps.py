@@ -118,6 +118,15 @@ _CONNECTION_BITS: tuple[tuple[int, str], ...] = (
 )
 _CONNECTION_RECORD_SIZE = 11
 
+# Connection record layout (`macros/scripts/maps.asm`'s `connection` macro,
+# 11 bytes): +0 dest map id, +1..2 block pointer, +3..4 overworld-map
+# pointer, +5 strip length, +6 dest map width (blocks), +7 y alignment,
+# +8 x alignment, +9..10 window pointer. Only the fields this module
+# surfaces (dest map, the two alignment bytes) are decoded; the rest are
+# VRAM-scrolling bookkeeping `travel_graph.py` has no use for.
+_CONNECTION_Y_ALIGNMENT_OFFSET = 7
+_CONNECTION_X_ALIGNMENT_OFFSET = 8
+
 # `constants/map_object_constants.asm`: object flag byte high bits.
 _TRAINER_FLAG = 0x40
 _ITEM_FLAG = 0x80
@@ -155,10 +164,30 @@ class MapWarp:
 
 @dataclass(frozen=True)
 class MapConnection:
-    """One decoded map-edge connection - walk-off continuity to another map."""
+    """One decoded map-edge connection - walk-off continuity to another map.
+
+    `y_alignment`/`x_alignment` are the connection record's two signed
+    alignment bytes (`home/overworld.asm`'s `CheckMapConnections`, copied
+    verbatim into `wNorthConnectedMapYAlignment`/`...XAlignment` and the
+    South/East/West equivalents by `CopyMapConnectionHeader`). Per that
+    routine's own arithmetic - confirmed against this repo's ROM by cross-
+    checking both directions of the Pallet Town <-> Route 1 and Viridian
+    City <-> Route 1/Route 22 pairs, which agree with each other and with
+    known Kanto geography:
+
+    - north/south: the perpendicular axis (Y) snaps to `y_alignment`
+      (a fixed tile row on the destination map - e.g. `height_tiles - 1`,
+      the destination's south edge, for a north connection); the along-edge
+      axis (X) carries over with `x_alignment` added (`dest_x = src_x +
+      x_alignment`).
+    - east/west: the perpendicular axis (X) snaps to `x_alignment`; the
+      along-edge axis (Y) carries over with `y_alignment` added.
+    """
 
     direction: str  # "east" | "west" | "south" | "north"
     dest_map: int
+    y_alignment: int
+    x_alignment: int
 
 
 @dataclass(frozen=True)
@@ -193,6 +222,13 @@ def _file_offset(bank: int, cpu_address: int) -> int:
     return bank * _ROM_BANK_SIZE + (cpu_address - _BANKED_CPU_BASE)
 
 
+def _signed_byte(value: int) -> int:
+    """A ROM byte (0-255) as the Game Boy's two's-complement signed 8-bit
+    value (-128 to 127) - how `CheckMapConnections` uses the alignment
+    bytes in an `add` instruction."""
+    return value - 256 if value >= 128 else value
+
+
 def _parse_connections(
     rom: bytes, offset: int, mask: int
 ) -> tuple[tuple[MapConnection, ...], int]:
@@ -202,7 +238,18 @@ def _parse_connections(
     connections = []
     for bit, direction in _CONNECTION_BITS:
         if mask & bit:
-            connections.append(MapConnection(direction=direction, dest_map=rom[offset]))
+            connections.append(
+                MapConnection(
+                    direction=direction,
+                    dest_map=rom[offset],
+                    y_alignment=_signed_byte(
+                        rom[offset + _CONNECTION_Y_ALIGNMENT_OFFSET]
+                    ),
+                    x_alignment=_signed_byte(
+                        rom[offset + _CONNECTION_X_ALIGNMENT_OFFSET]
+                    ),
+                )
+            )
             offset += _CONNECTION_RECORD_SIZE
     return tuple(connections), offset
 
