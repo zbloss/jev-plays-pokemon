@@ -20,6 +20,12 @@ from jev_plays_pokemon.navigation import (
     read_menu_cursor,
     resolve_navigation_target,
 )
+from jev_plays_pokemon.rom_maps import load_rom, parse_all_maps
+from jev_plays_pokemon.tileset_collision import (
+    is_walkable,
+    parse_tileset_headers,
+    raw_tile_id,
+)
 from jev_plays_pokemon.travel_graph import next_hop
 
 ROM_PATH = Path(__file__).resolve().parent.parent / "pokemon_red.gb"
@@ -511,6 +517,13 @@ def test_walking_to_oaks_lab_starter_table_reaches_a_rom_verified_tile(pyboy_out
 
 _EVENT_FLAGS_START_ADDRESS = 0xD747  # matches game_state.py's own constant
 _EVENT_FOLLOWED_OAK_INTO_LAB_BIT = 0  # pret/pokered's event_constants.asm
+_EVENT_GOT_POKEDEX = 37  # the same `event_constants.asm` ordinal
+# `milestones.py`'s own `_EVENT_GOT_POKEDEX` carries, and the reason
+# `_load_pewter_gym_interior_fixture` already re-applies it on load: before it
+# is set, `scripts/ViridianCity.asm`'s `ViridianCityCheckGotPokedexScript`
+# treats tile (19, 9) - the gap beside the sleeping Old Man, on the only street
+# that reaches the Gym's pocket from the north - as a personal insult, answering
+# any step onto it with "You can't go through here!" and a simulated D-pad-down.
 _EVENT_BEAT_BROCK_BIT = 119  # pret/pokered's event_constants.asm: Pewter
 # City events start at `const_next $68` (=104) for EVENT_BOUGHT_MUSEUM_TICKET,
 # +1 for EVENT_GOT_OLD_AMBER, `const_skip 8` to EVENT_BEAT_PEWTER_GYM_TRAINER_0
@@ -674,7 +687,7 @@ def _resolve_any_battle(pyboy: PyBoy, max_presses: int = 2000) -> None:
 _POST_DIALOG_SETTLE_CHECKS = 8
 
 
-def _advance_past_any_encounter(pyboy: PyBoy) -> None:
+def _advance_past_any_encounter(pyboy: PyBoy) -> bool:
     """Viridian Forest's Bug Catchers (and Pewter Gym's own trainer) are
     sight-triggered: walking into view opens a "Hey, wait up!"-style
     greeting dialog *before* the battle itself actually starts, so a
@@ -705,6 +718,12 @@ def _advance_past_any_encounter(pyboy: PyBoy) -> None:
     trainers that way - the flag genuinely said "beaten", the dialog
     genuinely did clear, and the loop was the whole problem.
 
+    Returns whether a battle was actually fought and finished. A caller that
+    just pressed "up" into a tile needs that distinction: a tile answered by a
+    trainer who then gets beaten is a tile that is free one dialog later, while
+    a tile answered by an NPC who cannot be fought stays answered, and a walker
+    that learns from the first one blacklists a route it could simply have won.
+
     "Both checks read clear" is not the same moment as "nothing is coming",
     though, and the first cut of that fix got this wrong: a sight-triggered
     trainer's greeting closes on its last press and only *then* starts its
@@ -715,15 +734,33 @@ def _advance_past_any_encounter(pyboy: PyBoy) -> None:
     failing on. The settle loop below waits that window out - pressing
     nothing, since pressing is exactly what #113 had to stop - and only
     returns once a battle has had every chance to show up.
+
+    Neither check can be trusted as the *gate*, for the reason recorded in
+    `_dialog_text_visible`'s own docstring: on any map tall enough to fill the
+    window's bottom rows it reads True with nothing on screen, so gating on it
+    mashed the full 20 + 10 presses into every single step of a walk across
+    Route 3 or Route 4. "A press the text row doesn't answer" is the close
+    signal instead, which is equally right on a short map (its row just stays
+    blank) - so nothing here depends on how tall the current map happens to be.
     """
     if not (_dialog_text_visible(pyboy) or _in_battle(pyboy)):
-        return
+        return False
+    if not _in_battle(pyboy):
+        # One press, sampled: a text row that did not move was the map's own
+        # tiles, not a box (see `_dialog_text_visible`'s own docstring for why
+        # the check alone can't tell those apart on a tall map).
+        row = _dialog_row_tiles(pyboy)
+        execute_button(pyboy, "a")
+        pyboy.tick(20, True)
+        if not _in_battle(pyboy) and _dialog_row_tiles(pyboy) == row:
+            return False
     for _ in range(20):
         if _in_battle(pyboy):
             break
+        row = _dialog_row_tiles(pyboy)
         execute_button(pyboy, "a")
         pyboy.tick(20, True)
-        if not (_dialog_text_visible(pyboy) or _in_battle(pyboy)):
+        if not _in_battle(pyboy) and _dialog_row_tiles(pyboy) == row:
             # #113: stop here. Pressing "a" any further re-talks to the
             # stationary NPC this player is left standing adjacent to and
             # facing, re-opening the very dialog just closed - which from
@@ -731,17 +768,25 @@ def _advance_past_any_encounter(pyboy: PyBoy) -> None:
             # "already beaten" canned line takes exactly this branch (no
             # battle to break into), so the old unconditional mash kept
             # pressing 14+ more times after the dialog was already gone.
+            closed_row = _dialog_row_tiles(pyboy)
             for _ in range(_POST_DIALOG_SETTLE_CHECKS):
                 # Waiting is safe where pressing isn't. Confirmed against
                 # Pewter Gym's own trainer: the greeting closes on press 12
                 # and `wIsInBattle` goes nonzero 30 frames later, so this is
                 # the window its fight opens in - and the reason a single
-                # 30-frame re-check was not enough to be sure.
+                # 30-frame re-check was not enough to be sure. A row that
+                # starts moving again reads the same way: some new box is
+                # coming up, which is not an empty screen.
                 pyboy.tick(30, True)
-                if _dialog_text_visible(pyboy) or _in_battle(pyboy):
+                if _in_battle(pyboy) or _dialog_row_tiles(pyboy) != closed_row:
                     break
             else:
-                return
+                return False
+    # Every way into `_resolve_any_battle` from here has just seen
+    # `wIsInBattle` go nonzero - the loop above only leaves it two ways, a
+    # `break` on the flag or a fall-through after a battle was already up -
+    # so this is the answer the caller wants, read before the fight is gone.
+    fought = _in_battle(pyboy)
     _resolve_any_battle(pyboy)
     pyboy.tick(60, True)  # let the fade back to the overworld finish
     # before any caller reads game_area_collision() again - confirmed
@@ -753,11 +798,14 @@ def _advance_past_any_encounter(pyboy: PyBoy) -> None:
         # False - confirmed to otherwise silently block all movement
         # afterward (arrow presses don't dismiss a dialog box in Gen 1,
         # only A/B do, so every direction looks "blocked" until this is
-        # cleared).
-        if not _dialog_text_visible(pyboy):
-            break
+        # cleared). Sampled the same way as above: a press the text row
+        # doesn't answer is the quote being gone, not a page to advance.
+        row = _dialog_row_tiles(pyboy)
         execute_button(pyboy, "a")
         pyboy.tick(20, True)
+        if _dialog_row_tiles(pyboy) == row:
+            break
+    return fought
 
 
 def _bypass_oaks_route_1_interception(pyboy: PyBoy) -> None:
@@ -772,6 +820,20 @@ def _bypass_oaks_route_1_interception(pyboy: PyBoy) -> None:
     state this issue says to set directly rather than play through.
     """
     pyboy.memory[_EVENT_FLAGS_START_ADDRESS] |= 1 << _EVENT_FOLLOWED_OAK_INTO_LAB_BIT
+
+
+def _set_event_flag(pyboy: PyBoy, flag: int) -> None:
+    """Sets one `wEventFlags` bit by its `event_constants.asm` ordinal.
+
+    `game_state.py`'s `_read_event_flags` numbers flags `offset * 8 + bit` from
+    `_EVENT_FLAGS_START_ADDRESS` (`milestones.py`'s module docstring records the
+    same convention), so an ordinal is a byte offset and a bit within it - no
+    hand-counted bit position to get wrong, which is the whole reason
+    `milestones.py` carries the ordinals in the first place.
+    """
+    byte, bit = divmod(flag, 8)
+    address = _EVENT_FLAGS_START_ADDRESS + byte
+    pyboy.memory[address] |= 1 << bit
 
 
 def _disable_wild_encounters(pyboy: PyBoy) -> None:
@@ -931,12 +993,478 @@ def _dialog_text_visible(pyboy: PyBoy) -> bool:
     the dialog text row for anything other than the blank tile, which
     both styles share, so it still confirms interactivity for a tile
     whose real text happens to be a one-page remark.
+
+    The tile row alone is not enough, and #99's Route 4 crossing is where
+    that was caught: the row only reads blank when the window's bottom rows
+    fall outside the map, which is true of Pallet Town from the starting
+    position and of small interior maps, but not of any map tall enough to
+    fill the window. Route 4 is 18 tiles tall - exactly the window's height -
+    so its own fence and ground tiles occupy the text row permanently, and the
+    check returned True with nothing at all on screen (screenshot-confirmed,
+    with the player walking normally throughout). Read this as "text *could* be
+    showing", never as "a box is open": `_advance_past_any_encounter` used to
+    gate on it directly, which turned every single step of a walk across such a
+    map into 20 + 10 mashed "a" presses into whatever tile the player happened
+    to face - and re-talking to the NPC standing there is exactly the failure
+    #113's note above had already identified as the thing to stop doing.
+
+    A memory flag would settle it, and the obvious candidate was ruled out:
+    reading 0xFF8C does distinguish the two states here (0x06 with Viridian
+    City's "The GYM's doors are locked..." box up, 0x00 on Route 4 with
+    nothing up), but counting `ram/hram.asm`'s declarations from its $FF80
+    start puts that byte on scratch (`hSpriteHeight` in one count,
+    `hMultiplicand`/`hMultiplier` in a union-aware one), so its agreement with
+    the dialog was coincidence and it is not safe to rely on. What _advance_
+    past_any_encounter does instead - press once and see whether the text row
+    moved - is confirmed by the same two states and asks nothing of any
+    address.
     """
     tilemap = pyboy.tilemap_window
     return any(
         tilemap[col, _DIALOG_TEXT_ROW] != _DIALOG_TEXT_BLANK_TILE
         for col in _DIALOG_TEXT_COLUMNS
     )
+
+
+def _dialog_row_tiles(pyboy: PyBoy) -> tuple[int, ...]:
+    """The dialog text row itself, for comparing it across a press: see
+    `_advance_past_any_encounter`'s use."""
+    tilemap = pyboy.tilemap_window
+    return tuple(tilemap[col, _DIALOG_TEXT_ROW] for col in _DIALOG_TEXT_COLUMNS)
+
+
+# ## Walking a whole map by the ROM's own collision data
+#
+# `execute_navigation_macro` plans with PyBoy's `game_area_collision()` over the
+# on-screen window only, and for the single-screen hops every test above needs,
+# that is enough. It is not enough to cross a town. Two separate failures, both
+# confirmed by reading the tile grid under the player at the tile a walk stopped
+# on:
+#
+# * A sprite is solid in-game and invisible to `game_area_collision()`. The
+#   approach to Viridian Gym's door stops dead at `(19, 9)` with nothing on
+#   screen except that the Old Man asleep at `(18, 9)` has started talking - and
+#   `pret/pokered`'s `scripts/ViridianCity.asm` (`ViridianCityOldManSleepyText`)
+#   shows what talking to him does: `PrintText`, then
+#   `call ViridianCityMovePlayerDownScript`, then
+#   `SCRIPT_VIRIDIANCITY_PLAYER_MOVING_DOWN`. He is not an obstacle the A* can be
+#   nudged past; bump him and the ROM answers with text and *pushes the player one
+#   tile back the way they came*, which is exactly how a walk aimed at `(32, 8)`
+#   finished at `(32, 10)`. #113 wrote the same lesson up for Route 3's stationary
+#   trainers.
+# * `execute_navigation_macro` refuses to move at all while
+#   `GameState.dialog_open` reads `True` - correct behaviour in a game where a
+#   text box owns the D-pad, and the reason a walk that keeps getting spoken to by
+#   an NPC makes no progress at all.
+#
+# So the helpers below plan on the ROM's own data instead: `tileset_collision`'s
+# per-tile decode for the terrain, every `rom_maps` object record as solid (the
+# second obstacle layer, which no terrain decode can see), and - on top of both -
+# every tile this particular walk has tried to enter and failed to enter, because
+# a sprite that wanders, a one-way ledge, or an Old Man who shoves you south is
+# not in any of the ROM's static tables.
+
+_MAP_GEOMETRY: dict[
+    int, tuple[frozenset[tuple[int, int]], frozenset[tuple[int, int]]]
+] = {}
+_ROM_CACHE: list = []
+
+
+def _rom_parse() -> tuple[bytes, dict, tuple]:
+    """The ROM bytes, its parsed maps, and its parsed tileset headers - parsed
+    once per module, since every one of these walks asks for the same three."""
+    if not _ROM_CACHE:
+        rom = load_rom(ROM_PATH)
+        _ROM_CACHE.extend((rom, parse_all_maps(rom), parse_tileset_headers(rom)))
+    return _ROM_CACHE[0], _ROM_CACHE[1], _ROM_CACHE[2]
+
+
+# Maps whose tiles throw the player, by the raw tile IDs that do it.
+# `pret/pokered`'s `engine/overworld/spinners.asm` picks its table with
+# `ld a, [wCurMapTileset]` / `cp FACILITY` - every tileset but `FACILITY` gets
+# `GymSpinnerArrows`, whose four IDs are `$3c`, `$3d`, `$4c`, `$4d` - and
+# `scripts/ViridianGym.asm` / `scripts/RocketHideoutB2F.asm` /
+# `scripts/RocketHideoutB3F.asm` are what call it. Keyed by map rather than
+# tileset deliberately: `$3C` is in the Overworld tileset's own passable list,
+# so a tileset-keyed rule would wall off ordinary Viridian City ground.
+# Giovanni's room is reachable without touching a single one (`(16, 16)` to his
+# tile `(2, 1)` is 39 steps that cross none), which is why treating these as
+# walls is enough - no walk planned here needs a spinner's ride.
+_SPINNER_TILE_IDS: dict[int, frozenset[int]] = {
+    45: frozenset({0x3C, 0x3D, 0x4C, 0x4D}),
+}
+
+
+def _map_obstacles(
+    map_id: int,
+) -> tuple[frozenset[tuple[int, int]], frozenset[tuple[int, int]]]:
+    """`(solid, warps)` for a map: every tile its own tileset collision lists
+    report as impassable, plus every object record's tile, plus the spinner
+    tiles above; and separately its warp tiles, which are walkable in the sense
+    that the player can stand on them and unusable in the sense that no route
+    may be planned *through* them.
+
+    The decode reads a stair or door tile as solid, so warp tiles are lifted out
+    of the solid set here and put back by `_route_across_map` for every tile
+    except the walk's own start and goal. Mt Moon's first crossing showed why
+    both halves of that matter: with its exit warp at `(14, 35)` left plain
+    walkable, the planner routed the cave crossing *through* it and the player
+    left the dungeon mid-walk. Spinners are the same trap from the other side -
+    the decode calls them walkable, which is true, and the game then moves the
+    player to wherever the arrow points, so a plan that steps on one is not a
+    plan the walk can follow.
+    """
+    if map_id not in _MAP_GEOMETRY:
+        rom, maps, headers = _rom_parse()
+        rmap = maps[map_id]
+        width = rmap.width_blocks * 2
+        height = rmap.height_blocks * 2
+        solid = {(o.x, o.y) for o in rmap.objects}
+        solid |= {
+            (x, y)
+            for y in range(height)
+            for x in range(width)
+            if is_walkable(rom, rmap, headers, x, y) is not True
+        }
+        spinners = _SPINNER_TILE_IDS.get(map_id)
+        if spinners is not None:
+            solid |= {
+                (x, y)
+                for y in range(height)
+                for x in range(width)
+                if raw_tile_id(rom, rmap, headers, x, y) in spinners
+            }
+        warps = {(w.x, w.y) for w in rmap.warps}
+        _MAP_GEOMETRY[map_id] = (
+            frozenset(solid - warps),
+            frozenset(warps),
+        )
+    return _MAP_GEOMETRY[map_id]
+
+
+def _route_across_map(
+    map_id: int,
+    start: tuple[int, int],
+    goal: tuple[int, int],
+    learned: frozenset[tuple[int, int]],
+) -> tuple[tuple[int, int], ...] | None:
+    """Shortest walkable tile sequence from `start` to `goal` on one map, or
+    `None` if there is none. Breadth-first over the four plain directions - the
+    same shape as `travel_graph.find_route`, one tile at a time instead of one
+    map at a time."""
+    solid, warps = _map_obstacles(map_id)
+    blocked = (solid | learned | warps) - {start, goal}
+    _rom, maps, _headers = _rom_parse()
+    rmap = maps[map_id]
+    width, height = rmap.width_blocks * 2, rmap.height_blocks * 2
+    seen = {start}
+    frontier = [start]
+    came_from: dict[tuple[int, int], tuple[int, int]] = {}
+    while frontier:
+        nxt = []
+        for x, y in frontier:
+            for dx, dy in ((0, -1), (0, 1), (-1, 0), (1, 0)):
+                step = (x + dx, y + dy)
+                if not (0 <= step[0] < width and 0 <= step[1] < height):
+                    continue
+                if step in seen or step in blocked:
+                    continue
+                seen.add(step)
+                came_from[step] = (x, y)
+                if step == goal:
+                    path = [step]
+                    while path[-1] != start:
+                        path.append(came_from[path[-1]])
+                    return tuple(reversed(path))
+                nxt.append(step)
+        frontier = nxt
+    return None
+
+
+_DIRECTION_OFFSETS = {
+    "up": (0, -1),
+    "down": (0, 1),
+    "left": (-1, 0),
+    "right": (1, 0),
+}
+
+
+# How many samples in a row a new tile has to be read on before a press is taken
+# to have landed there. One is the bug this exists to avoid (see
+# `_press_and_settle`); two more is enough to sit out a step's own animation.
+_SETTLED_REPEATS = 2
+
+# How long (in presses of the walk that refused it) a *first* refusal is held
+# against a tile, and how many refusals make one permanent. See `_walk_tiles`.
+_LEARNED_PRESSES = 25
+_LEARNED_LIMIT = 2
+
+# How many 20-frame windows `_press_and_settle` waits out, pressing nothing, for
+# a press that so far has no answer at all. 20 = 400 frames, which is the
+# sight-triggered trainer's whole measured sequence from the "!" to the fight -
+# see the wait inside `_press_and_settle` for the numbers.
+_SCRIPT_SETTLE_CHECKS = 20
+
+# How many "a" presses a walk is willing to spend answering whatever its
+# directional press walked into. Measured on Viridian Gym's corridor trainer:
+# twelve, of which the first three move nothing at all.
+_ANSWER_PRESS_LIMIT = 25
+
+
+def _fight_what_is_in_the_way(pyboy: PyBoy) -> bool:
+    """Answers whatever a directional press walked into, and fights it. Returns
+    whether a battle actually happened.
+
+    `_advance_past_any_encounter` cannot be the one to do this, and calling it
+    here is what let a walk stall for press after press on the only corridor
+    into Viridian Gym's northwest pocket: its first move is one "a" press
+    sampled, and on any map tall enough for the window's bottom rows to be the
+    map's own tiles - the case its own docstring says makes
+    `_dialog_text_visible` useless as a gate - a trainer who has spotted the
+    player and is still walking over answers that probe with an unchanged row,
+    so it returns having done nothing. Measured directly at the stall: the
+    trainer's text row first moves on the third press and `wIsInBattle` goes
+    nonzero on the twelfth, with presses nought through two reading nothing but
+    map tiles.
+
+    So this presses "a" a fixed, generous number of times instead and only
+    looks for a battle. It gives up without fighting anything on a tile whose
+    answer is an NPC who cannot be fought, which is what `_walk_tiles` needs to
+    hear in order to hold that refusal against the tile - #113's lesson about
+    re-talking to a stationary NPC still stands, it is just not the right answer
+    for an NPC who is about to battle you and disappear.
+    """
+    for _ in range(_ANSWER_PRESS_LIMIT):
+        if _in_battle(pyboy):
+            break
+        execute_button(pyboy, "a")
+        pyboy.tick(20, True)
+    if not _in_battle(pyboy):
+        return False
+    _resolve_any_battle(pyboy)
+    pyboy.tick(60, True)  # let the fade back to the overworld finish
+    # his "Oh, I lost..." quote is still up when `wIsInBattle` is already 0
+    _advance_past_any_encounter(pyboy)
+    return True
+
+
+def _press_and_settle(pyboy: PyBoy, direction: str) -> tuple[int, int, int, bool]:
+    """Presses `direction`, waits for whatever that press can start to finish,
+    and returns `((map, x, y), fought)` - where the player comes to rest, and
+    whether the press's own story gate (a text box and/or a battle) had to be
+    fought through to get there.
+
+    Waiting for a fixed number of frames is not enough, and neither is asking
+    either available dialog check. One tile of walking does not always finish
+    inside a short tick budget, so a press that really worked gets scored as a
+    failure - which, once failures are blacklisted, lets a walker declare the tile
+    it is standing on impassable and quit. And of the two checks,
+    `GameState.dialog_open` only sees the continuation arrow (which single-page
+    NPC lines never draw at all, per `_dialog_text_visible` above) while
+    `_dialog_text_visible` reads `True` permanently on any map tall enough to fill
+    the window's bottom rows. What works is the *difference* `_advance_past_any_encounter`
+    already relied on: sample the text row, press, and see whether it changed.
+
+    Returning where the player ended up - rather than whether they moved - is
+    what makes the caller's verdict about a tile mean anything, because two
+    things here move `wX`/`wY` without ever being a step. Gen 1 writes them at
+    the *start* of a tile step and puts them back when the step collides, so one
+    differing sample is not evidence of a step; and a map script can move the
+    player a whole tile in a direction nobody pressed (Viridian City's
+    `ViridianCityCheckGotPokedexScript` does exactly that, quoted in
+    `test_walking_to_viridian_gym_giovanni_reaches_a_rom_verified_tile`). A
+    walker that stops looking at the first difference believes both, blacklists
+    nothing, and presses into the same refusal forever - which is precisely how
+    the first version of this walker spent sixty presses going nowhere on
+    `(19, 9)`. So a tile only counts once it has been *stayed* on.
+    """
+    for _ in range(3):
+        before = extract_game_state(pyboy)
+        row = _dialog_row_tiles(pyboy)
+        execute_button(pyboy, direction)
+        resting: tuple[int, int] | None = None
+        repeats = 0
+        answered = False
+        for _ in range(40):
+            pyboy.tick(10, True)
+            now = extract_game_state(pyboy)
+            if now.map_id != before.map_id:
+                return now.map_id, now.player_x, now.player_y, False
+            tile = (now.player_x, now.player_y)
+            if tile != (before.player_x, before.player_y):
+                if tile == resting:
+                    repeats += 1
+                    if repeats >= _SETTLED_REPEATS:
+                        return now.map_id, tile[0], tile[1], False
+                else:
+                    resting, repeats = tile, 0
+                continue
+            if _in_battle(pyboy):
+                answered = True
+                break
+            if _dialog_row_tiles(pyboy) != row:
+                answered = True
+                break
+        if resting is not None:
+            # Something moved the player and then moved them back inside one
+            # press; that is an answer about the pressed tile, not noise.
+            break
+        if not answered:
+            # Nothing has answered the press at all yet - which is also what a
+            # sight-triggered trainer looks like for the second or so between
+            # spotting the player and arriving to talk. Measured on Viridian
+            # Gym's corridor: the "!" goes up on the press, his text row first
+            # moves about 200 frames later, and `wIsInBattle` goes nonzero
+            # about 120 frames after that. Clearing the screen without waiting
+            # for him finds an empty one, so the press gets re-attempted into a
+            # script that still owns the map and the walk reads the whole
+            # corridor - the only way into Giovanni's half of the room - as a
+            # wall. Waiting is what makes the clear below able to see the
+            # dialog this press is on its way to producing.
+            for _ in range(_SCRIPT_SETTLE_CHECKS):
+                pyboy.tick(20, True)
+                if _in_battle(pyboy) or _dialog_row_tiles(pyboy) != row:
+                    break
+        # Either a text box ate the press, or a battle did, or the tile really is
+        # solid - and the first two are indistinguishable from the third from
+        # outside, so answer whatever is standing there and give the same press
+        # another chance before anyone is called a wall.
+        if _fight_what_is_in_the_way(pyboy):
+            _disable_wild_encounters(pyboy)
+            after = extract_game_state(pyboy)
+            return after.map_id, after.player_x, after.player_y, True
+        _disable_wild_encounters(pyboy)
+    after = extract_game_state(pyboy)
+    return after.map_id, after.player_x, after.player_y, False
+
+
+def _walk_tiles(
+    pyboy: PyBoy,
+    x: int,
+    y: int,
+    max_steps: int = 200,
+    map_id: int | None = None,
+) -> tuple[int, int, int]:
+    """Walks the player, one real tile per press, to `(x, y)` on whatever map
+    they are currently on, and returns the final `(map, x, y)`. Give it
+    `map_id` and it stops the moment the player is anywhere else - a walk that
+    wanders onto a warp tile it wasn't aimed at has left the map it was planning
+    on, and continuing to press toward a tile on a map it is no longer on is how
+    a walker ends up in Pallet Town.
+
+    One refusal is held against a tile for `_LEARNED_PRESSES` presses and then
+    forgotten, because most of the reasons a tile refuses a single press - a
+    sprite mid-stride, an NPC that has stepped into the gap, a page of text still
+    on the screen - are gone within a few, and a walk that remembers those
+    forever has usually just blacklisted the one tile it had no way round: a
+    traced run up the west side of Viridian City lost its whole route that way,
+    with one press at `(13, 4)` coming back without moving, `(14, 4)` becoming a
+    permanent wall, and the walk spending the next 178 presses walking one tile
+    backwards and forwards between `(6, 4)` and `(7, 4)`. A tile refused
+    `_LEARNED_LIMIT` times is held for the rest of the walk instead, because the
+    other kind of refusal does not expire: `(19, 9)` answered the same press the
+    same way eighty presses apart, and a walker that forgets the sleeping Old Man
+    every 25 presses spends the whole budget rediscovering him. That same trace is
+    why the plan-less greedy press stops on a repeat of itself: a press this
+    walker cannot improve on is not a discovery in progress, it is the walk
+    standing in a hole it has already dug, and pressing it again only spends the
+    step budget.
+
+    The plan is re-run from the player's *live* position before every single
+    press, and the tile a press failed to put the player *on* is added to that
+    walk's own set of blocked tiles. "Put the player on" is the whole test - not
+    "the player moved" - because the ROM
+    moves `wX`/`wY` for reasons that are not the pressed step, a collided step
+    included, and a map script that shoves the player back down the tile they
+    were standing on (Viridian City's `ViridianCityCheckGotPokedexScript`, in
+    `test_walking_to_viridian_gym_giovanni_reaches_a_rom_verified_tile` below)
+    moves them a whole tile. Re-planning is what makes the learned set worth
+    having: a sprite that wanders, a sight-triggered trainer who walked over, an
+    NPC who answers a bump with text, and a scripted refusal like that one all
+    look like the same thing from inside - a tile that will not have you - and
+    the route goes around it from the next press on. For `(19, 9)` that means the
+    walk stops trying to go up column 19 at all: with that one tile blacklisted
+    the only complete route the planner can still find runs round the west side
+    of town, 81 steps where the direct way was 57.
+
+    When the plan runs out entirely the walker presses toward the goal anyway
+    rather than giving up. That is deliberate and it is the only way through the
+    one thing no static decode can express: Gen 1 ledges, which let the player
+    step off and not back on. `tileset_collision.py`'s own "What this doesn't
+    model" section says it does not model them, and Mt Moon B2F's `(5, 7)` stair
+    sits in a chamber with no opening in the decoded terrain at all - it is
+    reached by stepping down into it, so a walker that only ever presses where the
+    decode says `walkable` can never arrive.
+    """
+    strikes: dict[tuple[int, int], int] = {}
+    expires: dict[tuple[int, int], int] = {}
+    pressed_before: set[tuple[tuple[int, int], str]] = set()
+
+    def refused_tiles(press: int) -> frozenset[tuple[int, int]]:
+        return frozenset(
+            tile
+            for tile, count in strikes.items()
+            if count >= _LEARNED_LIMIT or expires.get(tile, -1) > press
+        )
+
+    for press in range(max_steps):
+        state = extract_game_state(pyboy)
+        pos = (state.player_x, state.player_y)
+        if pos == (x, y) or (map_id is not None and state.map_id != map_id):
+            break
+        path = _route_across_map(state.map_id, pos, (x, y), refused_tiles(press))
+        if path is not None and len(path) > 1:
+            step_tile = path[1]
+            direction = next(
+                name
+                for name, (dx, dy) in _DIRECTION_OFFSETS.items()
+                if (pos[0] + dx, pos[1] + dy) == step_tile
+            )
+        else:
+            direction = _press_at_the_goal(pos, (x, y), refused_tiles(press))
+            if (pos, direction) in pressed_before:
+                break
+            pressed_before.add((pos, direction))
+        dx, dy = _DIRECTION_OFFSETS[direction]
+        aimed = (pos[0] + dx, pos[1] + dy)
+        landed_map, landed_x, landed_y, fought = _press_and_settle(pyboy, direction)
+        if (landed_map, landed_x, landed_y) == (state.map_id, *aimed):
+            continue
+        if fought:
+            # Nothing refused this press - a trainer stood on the tile, the
+            # press walked into him, and he is not standing there any more.
+            # Learning from that blacklists a corridor the walk can only
+            # finish by winning, which is what Viridian Gym's own is.
+            continue
+        strikes[aimed] = strikes.get(aimed, 0) + 1
+        expires[aimed] = press + _LEARNED_PRESSES
+    final = extract_game_state(pyboy)
+    return final.map_id, final.player_x, final.player_y
+
+
+def _press_at_the_goal(
+    pos: tuple[int, int],
+    goal: tuple[int, int],
+    learned: frozenset[tuple[int, int]],
+) -> str:
+    """Which way to press when `_route_across_map` has no plan: along whichever
+    axis is further off, preferring a direction whose tile this walk has not
+    already given up on. Only falls back to an exhausted direction once every
+    tile around the player has refused them, which is a genuinely boxed-in
+    player and not something a press can fix."""
+    dx, dy = goal[0] - pos[0], goal[1] - pos[1]
+    preferred = ["up", "down"] if abs(dy) >= abs(dx) else ["left", "right"]
+    order = preferred + [name for name in _DIRECTION_OFFSETS if name not in preferred]
+    free = [
+        name
+        for name in order
+        if (
+            pos[0] + _DIRECTION_OFFSETS[name][0],
+            pos[1] + _DIRECTION_OFFSETS[name][1],
+        )
+        not in learned
+    ]
+    return free[0] if free else order[0]
 
 
 def test_walking_to_oaks_lab_oak1_reaches_a_rom_verified_tile(pyboy_outdoors):
@@ -1386,6 +1914,294 @@ def test_route3_to_route4_fixture_lands_on_a_rom_verified_tile(pyboy_outdoors):
     assert not state.battle.in_battle
 
 
+_MAP_VIRIDIAN_CITY = 1
+_MAP_ROUTE_1 = 12
+_MAP_VIRIDIAN_GYM = 45
+
+# The seven badges Earth Badge excluded. Not an arbitrary "enough progress"
+# stand-in: `pret/pokered`'s `scripts/ViridianCity.asm` tests for exactly this
+# value with `cp`, not a mask - `ld a, [wObtainedBadges]` /
+# `cp ~(1 << BIT_EARTHBADGE)` - so `wObtainedBadges == 0x7F` is what the ROM
+# itself accepts to open the Gym, and `_set_badges` is the same primitive
+# `cascade_badge`'s milestone needs for its own reasons.
+_GYM_OPENING_BADGES: tuple[str, ...] = (
+    "BOULDERBADGE",
+    "CASCADEBADGE",
+    "THUNDERBADGE",
+    "RAINBOWBADGE",
+    "SOULBADGE",
+    "MARSHBADGE",
+    "VOLCANOBADGE",
+)
+
+
+def _bump_into_viridian_gym_door(pyboy: PyBoy, max_bumps: int = 3) -> None:
+    """Presses "up" into the Gym's door tile until the warp fires.
+
+    More than one bump can be needed, and the ROM says why: the lock branch
+    above ends by latching `SCRIPT_VIRIDIANCITY_PLAYER_MOVING_DOWN` and pushing
+    the player back down the one tile they were standing on, so a first bump
+    that lands while that script still owns the map answers with its text and
+    swallows the press (`xor a` / `ldh [hJoyHeld], a`, verbatim). Measured both
+    ways: with the story gate released the second bump warps; with nothing set
+    at all, eight bumps in a row produced eight lock dialogs and no warp.
+    """
+    start_map = extract_game_state(pyboy).map_id
+    for _ in range(max_bumps):
+        _advance_past_any_encounter(pyboy)
+        execute_button(pyboy, "up")
+        pyboy.tick(90, True)
+        if extract_game_state(pyboy).map_id != start_map:
+            return
+
+
+def _leave_and_reenter_viridian_gym(pyboy: PyBoy) -> None:
+    """Walks back out of the Gym and in through the same door, which is how a
+    beaten Gym trainer's sprite is removed.
+
+    Gen 1 leaves a defeated trainer standing on whatever tile the fight ended on
+    for the rest of the visit. His object record's flag is set by the win, but
+    the sprites on a map are only rebuilt from those records by
+    `LoadObjectEvents`, which runs on the next load of the map - so the win is
+    half the answer, and the reload is the other half. Measured on the corridor
+    this is for: `game_area_collision()` reports the tile north of `(10, 4)` as
+    walkable and `tileset_collision`'s decode agrees, yet pressing into it sixty
+    times produces neither a step nor a battle, because the Hiker whose object
+    record is at `(10, 1)` ended the fight on that tile and is in neither of
+    those two sources. It is the same blind spot #113 wrote up for Route 3's
+    trainers - sprites are a layer the collision grid does not contain - with the
+    extra twist that here he is a sprite the walk has already beaten.
+
+    Getting out needs the presses in a particular order. A D-pad press made
+    while a text box is up is thrown away, and the box is up because answering
+    the NPC standing directly in front of the player is what puts it there -
+    #113's finding, and the reason `_fight_what_is_in_the_way` presses "a" at
+    all. So the way out is "a" and then the step, which is the ordering
+    `vgym_escape.py` measured as the one that moves the player out of that
+    corridor ("then down: (10,5) ... moved!"), while "up" - into him - never
+    does. It takes the pair more than once, and not because the first is
+    ignored: which half of the pair does the work depends on whether his quote
+    is already up when the pair starts, so the first "a" can be the press that
+    opens it rather than the one that closes it. Measured at (10, 4) both ways -
+    one pair and the walk to the door came back (10, 4); the pair repeated, the
+    door walk came back (16, 17).
+    """
+    leaving = extract_game_state(pyboy)
+    for _ in range(6):
+        execute_button(pyboy, "a")
+        pyboy.tick(10, True)
+        execute_button(pyboy, "down")
+        pyboy.tick(20, True)
+        now = extract_game_state(pyboy)
+        if (now.player_x, now.player_y) != (leaving.player_x, leaving.player_y):
+            break
+    assert _walk_tiles(pyboy, 16, 17, max_steps=150, map_id=_MAP_VIRIDIAN_GYM) == (
+        _MAP_VIRIDIAN_GYM,
+        16,
+        17,
+    )
+    _cross_map_edge(pyboy, "down")
+    assert extract_game_state(pyboy).map_id == _MAP_VIRIDIAN_CITY
+    _bump_into_viridian_gym_door(pyboy)
+    state = extract_game_state(pyboy)
+    assert (state.map_id, state.player_x, state.player_y) == (
+        _MAP_VIRIDIAN_GYM,
+        16,
+        17,
+    )
+    # Both halves of the room's state came back with the map: its own wild rate
+    # and the party the overpowered write replaced.
+    _disable_wild_encounters(pyboy)
+    _give_overpowered_party(pyboy)
+
+
+def test_walking_to_viridian_gym_giovanni_reaches_a_rom_verified_tile(
+    pyboy_outdoors,
+):
+    """#114's root cause, and #100's boot verification for `earth_badge`:
+    Viridian Gym's VIRIDIANGYM_GIOVANNI object (`milestone_targets.py`), map
+    45 tile (2, 1).
+
+    #113's static parse put the city's warp record for the Gym at `(32, 7)`,
+    and #114's report doubted it. The coordinate is right, and so is the
+    assumption behind it - ordinary walking does reach that door. Standing on
+    `(32, 8)` due south of it, pressing "up" lands the player on map 45 at
+    `(16, 17)`, which is `travel_graph`'s own landing tile for the hop down to
+    the tile. What blocks the door is the story, and
+    `pret/pokered`'s `scripts/ViridianCity.asm` spells out the check:
+
+        ViridianCityCheckGymOpenScript:
+                CheckEvent EVENT_VIRIDIAN_GYM_OPEN
+                ret nz
+                ld a, [wObtainedBadges]
+                cp ~(1 << BIT_EARTHBADGE)
+                jr nz, .gym_closed
+                SetEvent EVENT_VIRIDIAN_GYM_OPEN
+                ret
+        .gym_closed
+                ld a, [wYCoord]
+                cp 8
+                ret nz
+                ld a, [wXCoord]
+                cp 32
+                ret nz
+                ld a, TEXT_VIRIDIANCITY_GYM_LOCKED
+                ldh [hTextID], a
+                call DisplayTextID
+                ...
+                call ViridianCityMovePlayerDownScript
+
+    Those are the city and the tile this test stands on - `[wYCoord] == 8`,
+    `[wXCoord] == 32` - and the screenshot of a run with nothing set is the
+    script's own words, "The GYM's doors are locked...", with the Gambler at
+    `(30, 8)` nearby supplying "This #MON GYM is always closed." Measured:
+    eight bumps with nothing set, eight lock dialogs, no warp; the same bump
+    after `_GYM_OPENING_BADGES` goes straight through. `EVENT_VIRIDIAN_GYM_OPEN`
+    is the other release the script allows, and setting the flag alone works
+    too - the badge write is the one used here because it's the condition the
+    game itself has to reach to open the Gym at all, and it's state
+    `_set_badges` already knows how to write.
+
+    The second gate is one screen south of the door and is the reason two
+    exhaustive live BFS passes reported the door itself as unreachable. It is
+    the same shape, one map-tile earlier in the route, and again the ROM
+    supplies it verbatim - `scripts/ViridianCity.asm`, immediately after the
+    block above, run every frame by `ViridianCityDefaultScript`:
+
+        ViridianCityCheckGotPokedexScript:
+                CheckEvent EVENT_GOT_POKEDEX
+                ret nz
+                ld a, [wYCoord]
+                cp 9
+                ret nz
+                ld a, [wXCoord]
+                cp 19
+                ret nz
+                ld a, TEXT_VIRIDIANCITY_OLD_MAN_SLEEPY
+                ldh [hTextID], a
+                call DisplayTextID
+                xor a
+                ldh [hJoyHeld], a
+                call ViridianCityMovePlayerDownScript
+
+    The sleeping Old Man is therefore not only a sprite standing in the way:
+    without `EVENT_GOT_POKEDEX`, standing on `(19, 9)` at all - the one tile the
+    route to the Gym crosses - answers with "You can't go through here! This is
+    private property!" and a shove back down the tile the player was standing
+    on, and the script latches `SCRIPT_VIRIDIANCITY_PLAYER_MOVING_DOWN` to do
+    it. This is the same release `_load_pewter_gym_interior_fixture` already
+    writes for its own reason on the far side of town, and `_walk_tiles` reaches
+    `(32, 8)` with it set.
+
+    Which is also the correction this file owed #114's report. The door tile and
+    the tiles south of it are reachable by ordinary walking, and the note that
+    they were not read a correct BFS result backwards: `game_area_collision()`
+    does not see sprites (#113 wrote that up for Route 3's trainers), so a
+    walker that trusts it plans straight through a standing NPC, presses into
+    him, never moves, and marks everything behind him unreachable. Measured
+    against `tileset_collision`'s own decode with the town's object records
+    added to the solid set: the shortest route from Route 1's north edge to
+    `(32, 8)` is 57 steps; blocking any *one* of the town's nine object tiles
+    leaves it at the same 57, so the Gambler at `(30, 8)` is not the single
+    chokepoint that note made him out to be; and blocking `(19, 8)` - the tile
+    north of the Old Man's - is the one that costs anything, pushing the plan to
+    81 steps round the west side of town. The walk below takes the 57.
+
+    Inside, the room has two mechanics of its own, both recorded where they are
+    handled: `_SPINNER_TILE_IDS` keeps the route off `GymSpinnerArrows`, and the
+    object records put sight-triggered Gym trainers at `(10, 1)` and `(10, 7)`,
+    the two ends of the one-tile-wide corridor that - with the `(7, 2)`/`(7, 3)`
+    notch it feeds - is the only way into Giovanni's pocket, so every route the
+    tile decode finds to him runs up it. Their answer to a walk that does not
+    beat them is to stand on the tile being pressed into and talk, which is what
+    `_press_and_settle`'s `fought` flag is for; and beating them is only half of
+    it, because Gen 1 leaves the sprite standing where the fight ended until the
+    next `LoadObjectEvents`. `_leave_and_reenter_viridian_gym` is the walk's
+    way of asking for that reload - out of the Gym's door and back in - and the
+    second attempt at `(2, 2)` is what it is for.
+    """
+    _bypass_oaks_route_1_interception(pyboy_outdoors)
+    _disable_wild_encounters(pyboy_outdoors)
+    _give_overpowered_party(pyboy_outdoors)
+    _set_badges(pyboy_outdoors, _GYM_OPENING_BADGES)
+    _set_event_flag(pyboy_outdoors, _EVENT_GOT_POKEDEX)
+
+    _walk_toward(pyboy_outdoors, 10, 1)
+    _cross_map_edge(pyboy_outdoors, "up")
+    assert extract_game_state(pyboy_outdoors).map_id == _MAP_ROUTE_1
+
+    _walk_toward(pyboy_outdoors, 12, 0)
+    _cross_map_edge(pyboy_outdoors, "up")
+    assert extract_game_state(pyboy_outdoors).map_id == _MAP_VIRIDIAN_CITY
+
+    assert _walk_tiles(
+        pyboy_outdoors, 32, 8, max_steps=200, map_id=_MAP_VIRIDIAN_CITY
+    ) == (_MAP_VIRIDIAN_CITY, 32, 8)
+    _bump_into_viridian_gym_door(pyboy_outdoors)
+    state = extract_game_state(pyboy_outdoors)
+    assert state.map_id == _MAP_VIRIDIAN_GYM
+    # `travel_graph`'s own landing tile for the hop, arrived at through the
+    # door rather than written there.
+    assert (state.player_x, state.player_y) == (16, 17)
+
+    _advance_past_any_encounter(pyboy_outdoors)
+    if _walk_tiles(pyboy_outdoors, 2, 2, max_steps=200, map_id=_MAP_VIRIDIAN_GYM) != (
+        _MAP_VIRIDIAN_GYM,
+        2,
+        2,
+    ):
+        # The walk beat the Hiker at the head of the corridor and then found his
+        # sprite still on the tile it needed: measured at (10, 4), with the tile
+        # north of it refused for the rest of the visit. He only leaves with the
+        # next load of the map.
+        _leave_and_reenter_viridian_gym(pyboy_outdoors)
+
+    assert _walk_tiles(
+        pyboy_outdoors, 2, 2, max_steps=220, map_id=_MAP_VIRIDIAN_GYM
+    ) == (_MAP_VIRIDIAN_GYM, 2, 2)
+    _advance_past_any_encounter(pyboy_outdoors)
+    # The last step of that walk comes in along row 2, so the player is standing
+    # on `(2, 2)` facing *west* - into an empty tile, where "a" answers nothing
+    # at all. A Gen 1 step that collides still turns the player, so one press
+    # into Giovanni's own tile is what faces him; the tile is his and the walk
+    # cannot take it, which is the point of the press.
+    execute_button(pyboy_outdoors, "up")
+    pyboy_outdoors.tick(20, True)
+
+    row_before = _dialog_row_tiles(pyboy_outdoors)
+    pyboy_outdoors.button("a", 2)
+    dialog_visible = False
+    for _ in range(10):
+        pyboy_outdoors.tick(30, True)
+        # `_dialog_text_visible` is not usable as the check on this map - it is
+        # 18 tiles tall, exactly the window's height, so its own docstring's
+        # caveat ("text *could* be showing") is permanently true here - and
+        # neither is a bare `_in_battle`, which is only Giovanni's *second*
+        # answer. So: the tile this file trusts, a text row that moved because
+        # of the press, plus one of the two things the milestone is expected to
+        # do.
+        state = extract_game_state(pyboy_outdoors)
+        if (state.dialog_open or _in_battle(pyboy_outdoors)) and _dialog_row_tiles(
+            pyboy_outdoors
+        ) != row_before:
+            dialog_visible = True
+            break
+    assert dialog_visible
+
+
+def test_milestone_travel_graph_hops_viridian_city_into_viridian_gym():
+    """#114's other half: `build_hops` needed one map in `MILESTONE_MAP_IDS`,
+    not a new edge type. Viridian City's own warp record for the Gym is real
+    ROM data, so once map 45 is in scope at all the hop falls out of the
+    parser - and it comes out with the door tile on the city side and the
+    landing tile the walk above actually arrives on, on the gym side.
+    """
+    hop = next_hop(_travel_graph(), _MAP_VIRIDIAN_CITY, _MAP_VIRIDIAN_GYM)
+    assert hop is not None
+    assert (hop.from_x, hop.from_y) == (32, 7)
+    assert (hop.to_x, hop.to_y) == (16, 17)
+
+
 # #100: per-milestone boot verification, batch 2 (parent #96, sibling of
 # #99's batch 1 above). `_walk_to_milestone_target` (unlike #99's
 # `_walk_toward`) lets the target sit on a different map than wherever the
@@ -1394,27 +2210,22 @@ def test_route3_to_route4_fixture_lands_on_a_rom_verified_tile(pyboy_outdoors):
 # every map on the route is in `travel_graph.MILESTONE_MAP_IDS` (extended
 # per milestone below).
 #
-# earth_badge (Viridian Gym, map 45) is NOT covered below despite being a
-# direct warp off Viridian City (already in scope alongside Pallet Town/
-# Route 1) - confirmed via an exhaustive real-emulator BFS (save-state-
-# forked, every reachable tile from the Route 1 entrance explored, 530
-# distinct tiles, queue emptied naturally rather than hitting a depth cap)
-# that the gym's own door tile, and the two tiles south of it, are
-# genuinely unreachable by ordinary walking from Viridian City's only
-# in-scope entrance - with or without the other 7 badges set. This isn't
-# the known "door tiles misread as collision-blocked" limitation
-# `_nudge_across_hop` already works around (that's a local, few-tile
-# nudge; this is a real, town-wide unreachable region) - it needs either a
-# corrected ROM-parsed door coordinate or real visual investigation to
-# find the actual approach, neither of which this pass had budget for.
+# earth_badge is covered above, by `test_walking_to_viridian_gym_giovanni_
+# reaches_a_rom_verified_tile` - see that test's own docstring for the two
+# things that were actually in the way there, and for why the "unreachable
+# door" note this block used to carry was wrong.
 #
 # cascade_badge/got_ss_ticket/thunder_badge/rainbow_badge (#99's original
 # remaining 4, all reachable only via Route 3 -> Route 4 -> Cerulean City
-# per `travel_graph.py`'s own scope) are also NOT covered below, for the
-# same class of reason as earth_badge above - see
-# `_load_pewter_to_route3_fixture`'s own docstring (#113) for the second,
-# separate blocker its own investigation found past Pewter City's escort:
-# a real, exhaustively-confirmed dead end partway across Route 3 itself.
+# per `travel_graph.py`'s own scope) are NOT covered yet. Their blocker is
+# the same second obstacle layer one screen further on: Route 4's own
+# decoded walkability is right and useless on its own, because a wall at
+# x=20-23 splits the map into the pocket Route 3's south connection lands in
+# and the eastern side that owns the Cerulean connection, and the only thing
+# joining them is Route 4's pair of warps into Mt Moon - a three-floor
+# dungeon. `travel_graph.py`'s own "A known false edge" section documents
+# what that does to a route this module returns; the crossing itself is
+# scripted work rather than graph routing.
 
 
 def _milestone(target_x: int | None = None, target_y: int | None = None) -> Milestone:
