@@ -70,18 +70,41 @@ it resolves happens to be banked).
 A map's own block grid (`rom_maps.RomMap.blocks`) is already in the same
 "2x2 tiles per block" frame `rom_maps.py`'s docstring documents - one
 block per `(y // 2, x // 2)` - each block's 16 raw tile IDs covering a
-2x2 arrangement of those same world tiles (4x4 raw tiles). `pret/pokered`'s
-own collision check (`home/overworld.asm`'s `CheckTilePassable` ->
-`engine/overworld/player_state.asm`'s `GetTileAndCoordsInFrontOfPlayer`,
-which reads the *background tilemap* via `lda_coord`, not this module's
-static block decode) always samples exactly 2 raw-tile-map units from the
-player's own screen anchor per world-tile step in the direction faced -
-i.e. the *far* raw tile of whichever 2x2 raw-tile quadrant a world tile's
-`(x % 2, y % 2)` picks out within its block, not the near one. Confirmed
-directly, not just derived: `tests/test_tileset_collision.py` diffs this
-module's decode against PyBoy's own live `game_area_collision()` (a
-different, dynamic code path entirely) over real fixture positions with
-zero mismatches.
+2x2 arrangement of those same world tiles (4x4 raw tiles). Each world tile
+is therefore itself a 2x2 group of raw tiles, and `pret/pokered`'s own
+collision check (`home/overworld.asm`'s `CheckTilePassable`) tests exactly
+one of those four: the ID it tests comes from
+`engine/overworld/player_state.asm`'s `_GetTileAndCoordsInFrontOfPlayer`,
+which reads `lda_coord 8, 11` / `8, 7` / `6, 9` / `10, 9` for
+down/up/left/right, and `macros/coords.asm`'s `coord` macro expands
+`lda_coord x, y` to `(y) * SCREEN_WIDTH + (x) + wTileMap` - so every
+direction samples the *same* sub-tile of the destination cell, two 8x8
+units per world-tile step, and which sub-tile that constant `(8, 9)` offset
+picks is fixed, not a free parameter.
+
+Which one it picks is settled by measurement rather than by reading alone.
+Booting a real map and scanning WRAM locates `wTileMap` itself at `$C3A0` -
+its 360 bytes are byte-identical to vBGMap0's visible 20x18 - and fitting
+the world grid against that buffer puts the player's own 16x16 cell at
+tilemap columns 8-9 x rows 8-9 (0 mismatches over all 81 visible cells on
+Mt Moon B2F, 45 on 1F). `hlcoord 8, 9` is thus the cell's *left* column and
+*bottom* row, so this module samples `(sub_row 1, sub_col 0)` of the
+quadrant a world tile occupies inside its block.
+
+The choice of sub-tile is not a detail. Mt Moon's stair block is
+`{(0, 0): 10, (0, 1): 11, (1, 0): 26, (1, 1): 27}` and `CAVERN`'s passable
+list contains exactly one of those four (`26`) - and the game does walk onto
+Mt Moon 1F's `(17, 11)` stair and warp from it, so the tile it tests has to
+be `(1, 0)`. Sampling `(1, 1)` reads `27` there and reports every stair in
+the dungeon as a wall; the same wrong corner reads raw `22` (impassable)
+where `(1, 0)` reads `21` (passable) at `(3, 5)` on Mt Moon B2F - the single
+tile joining the `(5, 7)` stair's pocket to the open floor north of it -
+which reported the whole northwest wing, and with it the only way out of the
+dungeon towards Route 4, as sealed. PyBoy's live `game_area_collision()`
+cannot arbitrate between the corners: it too reports one fixed sub-tile per
+cell (which is how `tests/test_tileset_collision.py` reads it, at even
+indices), and on the blocks where the two readings disagree both left-column
+tiles are `21`, so its answer tracks this one rather than the old one.
 
 ## What this doesn't model
 
@@ -116,6 +139,10 @@ _ROM_BANK_SIZE = 0x4000
 _BANKED_CPU_BASE = 0x4000
 _BLOCK_TILE_COUNT = 16  # 4x4 raw tiles per block
 _BLOCK_WIDTH = 4
+# `lda_coord 8, 9` inside a world tile's own 2x2 raw group: column 8 is the
+# group's left column, row 9 its bottom row (see the module docstring).
+_SAMPLE_ROW_IN_CELL = 1
+_SAMPLE_COL_IN_CELL = 0
 _COLLISION_LIST_TERMINATOR = 0xFF
 
 
@@ -175,10 +202,11 @@ def _raw_tile_id(
 ) -> int:
     """The specific raw tile `pret/pokered`'s own collision check samples
     for world-tile quadrant `(x % 2, y % 2)` - see the module docstring's
-    "World tile -> raw tile" section."""
+    "World tile -> raw tile" section for why that is the quadrant's bottom-left
+    tile and not one of the other three."""
     block_offset = block_file_offset + block_id * _BLOCK_TILE_COUNT
-    raw_row = (y % 2) * 2 + 1
-    raw_col = (x % 2) * 2 + 1
+    raw_row = (y % 2) * 2 + _SAMPLE_ROW_IN_CELL
+    raw_col = (x % 2) * 2 + _SAMPLE_COL_IN_CELL
     return rom[block_offset + raw_row * _BLOCK_WIDTH + raw_col]
 
 
