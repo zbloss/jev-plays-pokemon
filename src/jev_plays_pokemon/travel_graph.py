@@ -59,12 +59,40 @@ Route 25 -> Bill's House (`got_ss_ticket`), and Cerulean -> Route 5 ->
 Saffron City -> Route 6 -> Vermilion City/Gym (`thunder_badge`) and
 Saffron -> Route 7 -> Celadon City/Gym (`rainbow_badge`) - all real,
 walkable land routes (no Surf/water crossing), confirmed against this
-repo's own ROM data. Milestones outside this set (e.g. `soul_badge`)
+repo's own ROM data. (#114) adds Viridian Gym itself (`earth_badge`) - a
+single warp hop off Viridian City, already in scope alongside it, which
+was all that was missing for `build_hops` to produce that edge at all.
+Milestones outside this set (e.g. `soul_badge`)
 aren't yet reachable in the graph; `next_hop`/`find_route` signal that as
 `None`, per ADR-0002's statelessness (#102 treats a `None` route as a
 graceful no-op, matching today's same-map-only behavior), rather than
 raising - a gap here is expected,
 incremental-build territory, not a bug.
+
+## A known false edge: Route 4 is two maps wearing one name
+
+Every hop here is derived from warp/connection *records*, which say where
+a map edge or door lands - not whether its two endpoints are reachable
+from each other on foot. Route 4 is the case where that distinction
+bites: `tileset_collision.py` decodes its whole 90x18 tile grid and
+route `x=20`-`23` is an unbroken wall from `y=0` to `y=17`, splitting the
+map into a west pocket (`x=4`-`19`, where Route 3's south connection
+lands) and an east side (`x=24`+, holding the `(89, 8)` Cerulean City
+connection). Confirmed live, not just decoded: PyBoy's own
+`game_area_collision()` agrees tile-for-tile, and the on-screen A* walks
+the pocket to exactly its east edge and stops.
+
+So the graph's `Route 3 -> Route 4 -> Cerulean City` route is only
+half-true - it names real hops that no ordinary walk can join end to end.
+Route 4's two warps into Mt Moon (`(18, 5)` on the pocket side, `(24, 5)`
+on the east side) are the actual connector, and Mt Moon is a three-floor
+dungeon whose floors the last-mile A* can plan inside but not
+cross-solve, so crossing it is a scripted concern, not graph routing.
+Fixing the graph to say so is a separate decision from this ticket's
+scope (see the fixture docs in `tests/test_navigation.py` for the walked
+route); what matters here is that a route this module returns is a
+sequence of real hops, not a promise that each hop's landing tile is
+walkable from wherever the previous hop left the player.
 
 ## Search
 
@@ -340,6 +368,7 @@ _MAP_ROUTE_24 = 35
 _MAP_ROUTE_25 = 36
 _MAP_OAKS_LAB = 40
 _MAP_VIRIDIAN_MART = 42
+_MAP_VIRIDIAN_GYM = 45
 _MAP_PEWTER_GYM = 54
 _MAP_CERULEAN_GYM = 65
 _MAP_BILLS_HOUSE = 88
@@ -366,6 +395,7 @@ MILESTONE_MAP_IDS: frozenset[int] = frozenset(
         _MAP_ROUTE_25,
         _MAP_OAKS_LAB,
         _MAP_VIRIDIAN_MART,
+        _MAP_VIRIDIAN_GYM,
         _MAP_PEWTER_GYM,
         _MAP_CERULEAN_GYM,
         _MAP_BILLS_HOUSE,
