@@ -85,15 +85,22 @@ zero mismatches.
 
 ## What this doesn't model
 
-Two Gen 1 movement mechanics sit outside plain per-tile passability and
+Three Gen 1 movement mechanics sit outside plain per-tile passability and
 aren't modeled here: ledges (a handful of raw tile IDs, listed in
 `pret/pokered`'s `data/tilesets/ledge_tiles.asm`, that read as impassable
 under an ordinary check but are a one-directional hop from a specific
-standing tile) and tile-pair collisions (`pair_collision_tile_ids.asm`,
-a same-tileset blocked-pair list for elevation changes - empty for
-`OVERWORLD`/tileset 0, the only tileset this ticket's own Route 3 problem
-needed). A route this module finds is real ordinary walking; a route it
-doesn't find might still exist via a ledge jump this module can't see.
+standing tile); tile-pair collisions (`pair_collision_tile_ids.asm`, a
+same-tileset blocked-pair list for elevation changes - `CAVERN` and `FOREST`
+entries and no `OVERWORLD` one, which is the only tileset this ticket's own
+Route 3 problem needed); and gym spinners, whose tile IDs
+`data/tilesets/spinner_tiles.asm` lists as ordinary tile IDs that appear in
+their own tileset's passable list like any floor tile, and which
+`engine/overworld/spinners.asm` then uses to throw the player across the room.
+The first and third are both "this module says walkable, and the game does
+something other than walk" cases, which is why `raw_tile_id` is public: a
+caller planning around them needs the ID, not just the yes/no. A route this
+module finds is real ordinary walking; a route it doesn't find might still
+exist via a ledge jump this module can't see.
 """
 
 from __future__ import annotations
@@ -175,12 +182,17 @@ def _raw_tile_id(
     return rom[block_offset + raw_row * _BLOCK_WIDTH + raw_col]
 
 
-def is_walkable(
+def raw_tile_id(
     rom: bytes, rmap: RomMap, headers: tuple[TilesetHeader, ...], x: int, y: int
-) -> bool | None:
-    """Whether world tile `(x, y)` on `rmap` is ordinary-walkable (see the
-    module docstring's "What this doesn't model" section for what "ordinary"
-    excludes) - `None` if `(x, y)` isn't on the map at all."""
+) -> int | None:
+    """The raw tile ID behind world tile `(x, y)` - the same one `is_walkable`
+    looks up in the tileset's passable list, exposed because passability is not
+    the only thing a tile's ID decides. A gym's spinner tiles are the case in
+    point: `pret/pokered`'s `data/tilesets/spinner_tiles.asm` lists them as
+    ordinary tile IDs, they appear in their tileset's passable list like any
+    floor tile, and `engine/overworld/spinners.asm` then throws the player
+    across the room from them - so a caller planning a route needs the ID, not
+    just the yes/no. `None` if `(x, y)` isn't on the map at all."""
     width_tiles = rmap.width_blocks * 2
     height_tiles = rmap.height_blocks * 2
     if not (0 <= x < width_tiles and 0 <= y < height_tiles):
@@ -188,5 +200,16 @@ def is_walkable(
     block_col, block_row = x // 2, y // 2
     block_id = rmap.blocks[block_row * rmap.width_blocks + block_col]
     header = headers[rmap.tileset_id]
-    tile = _raw_tile_id(rom, header.block_file_offset, block_id, x, y)
-    return tile in header.passable_tile_ids
+    return _raw_tile_id(rom, header.block_file_offset, block_id, x, y)
+
+
+def is_walkable(
+    rom: bytes, rmap: RomMap, headers: tuple[TilesetHeader, ...], x: int, y: int
+) -> bool | None:
+    """Whether world tile `(x, y)` on `rmap` is ordinary-walkable (see the
+    module docstring's "What this doesn't model" section for what "ordinary"
+    excludes) - `None` if `(x, y)` isn't on the map at all."""
+    tile = raw_tile_id(rom, rmap, headers, x, y)
+    if tile is None:
+        return None
+    return tile in headers[rmap.tileset_id].passable_tile_ids
