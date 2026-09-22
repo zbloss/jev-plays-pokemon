@@ -662,6 +662,17 @@ def _advance_past_any_encounter(pyboy: PyBoy) -> None:
     text was visibly on screen) - and since arrow presses don't dismiss a
     Gen 1 dialog box, only A/B do, every direction then reads as
     "blocked" with no way to tell that from a genuine dead end.
+
+    Stops the instant both checks read clear and presses nothing after
+    that (#113). The original version mashed "a" 20 times unconditionally
+    once anything was detected, breaking early only when `_in_battle` went
+    true - which is wrong for the short, single-page "I already beat you,
+    here's my canned line" dialog a *revisited* stationary trainer shows,
+    because there is no battle to break into: presses 7-20 landed after
+    the dialog had already closed, each one re-opening it by re-talking to
+    the NPC standing right there. Verified directly against Route 3's
+    trainers that way - the flag genuinely said "beaten", the dialog
+    genuinely did clear, and the loop was the whole problem.
     """
     if not (_dialog_text_visible(pyboy) or _in_battle(pyboy)):
         return
@@ -670,6 +681,20 @@ def _advance_past_any_encounter(pyboy: PyBoy) -> None:
             break
         execute_button(pyboy, "a")
         pyboy.tick(20, True)
+        if not (_dialog_text_visible(pyboy) or _in_battle(pyboy)):
+            # #113: stop here. Pressing "a" any further re-talks to the
+            # stationary NPC this player is left standing adjacent to and
+            # facing, re-opening the very dialog just closed - which from
+            # outside looks like an unresolvable stuck loop. A trainer's
+            # "already beaten" canned line takes exactly this branch (no
+            # battle to break into), so the old unconditional mash kept
+            # pressing 14+ more times after the dialog was already gone.
+            # Settled and re-checked once, because a battle's own start-up
+            # shows a clear frame between its last dialog page and
+            # `wIsInBattle` going nonzero.
+            pyboy.tick(30, True)
+            if not (_dialog_text_visible(pyboy) or _in_battle(pyboy)):
+                return
     _resolve_any_battle(pyboy)
     pyboy.tick(60, True)  # let the fade back to the overworld finish
     # before any caller reads game_area_collision() again - confirmed
@@ -1143,7 +1168,7 @@ def _load_pewter_to_route3_fixture(pyboy: PyBoy) -> None:
     the same reasoning `_load_pewter_gym_interior_fixture`'s own docstring
     gives for why a captured state beats a fixed button tuple here.
 
-    ## What's past this fixture: a second, separate blocker
+    ## What's past this fixture: a "second blocker" that wasn't
 
     Reaching any of `cascade_badge`/`got_ss_ticket`/`thunder_badge`/
     `rainbow_badge` (all reachable, per `travel_graph.py`'s own scope,
@@ -1152,18 +1177,23 @@ def _load_pewter_to_route3_fixture(pyboy: PyBoy) -> None:
     `(59, 0)`, `travel_graph.py`'s own computed hop). The same exhaustive
     BFS approach, extended east from this fixture's own landing tile (and
     resolving every sight-triggered trainer it met along the way with
-    `_give_overpowered_party`), found a real, bounded, dead-end region -
-    every tile reachable by ordinary walking caps out at world x=22 (out
-    of Route 3's full 70-tile width) across the whole y=4-13 band tried,
-    confirmed against a published Route 3 map (serebii.net's own
-    `kanto-rb` map image) showing a solid boulder-cluster obstacle
-    starting around world x=23 with no gap found in that band. This is a
-    second, separate blocker from the escort above - past it, not
-    something #113's own EVENT_BEAT_BROCK fix touches - and unlike the
-    escort, finding the real gap needs either a corrected understanding of
-    that boulder formation's true shape or a from-scratch static
-    ROM/tileset collision decode, neither of which this pass had budget
-    for (see #113's follow-up).
+    `_give_overpowered_party`), found what looked like a real, bounded,
+    dead-end region - every tile reachable by ordinary walking caps out at
+    world x=22 (out of Route 3's full 70-tile width) across the whole
+    y=4-13 band tried, confirmed against a published Route 3 map
+    (serebii.net's own `kanto-rb` map image) showing a solid boulder-cluster
+    obstacle starting around world x=23 with no gap found in that band.
+
+    **That conclusion was wrong, and is recorded here only as the cautionary
+    note it is.** `tileset_collision.py`'s static whole-map decode found a
+    real ordinary-walkable path to `(59, 0)`, and it was walked for real to
+    capture `_load_route3_to_route4_fixture`'s own state. What the BFS
+    actually hit was Route 3's `y=7` wall: the gap it never found is a
+    *single tile*, and the route to it goes north and back down rather than
+    east along the band it searched. Its own "needs a from-scratch static
+    ROM/tileset collision decode" guess about what a future pass would need
+    was the correct next step - see that fixture's docstring for the real
+    shape and why a 9x10-window, no-memory on-screen search can't find it.
     """
     with _PEWTER_TO_ROUTE3_STATE_PATH.open("rb") as f:
         pyboy.load_state(f)
@@ -1185,6 +1215,106 @@ def test_pewter_to_route3_fixture_lands_on_a_rom_verified_tile(pyboy_outdoors):
     state = extract_game_state(pyboy_outdoors)
     assert state.map_id == _MAP_ROUTE_3
     assert (state.player_x, state.player_y) == (0, 8)
+    assert not state.dialog_open
+    assert not state.battle.in_battle
+
+
+_ROUTE3_TO_ROUTE4_STATE_PATH = (
+    Path(__file__).resolve().parent / "fixtures" / "route3_to_route4.state"
+)
+_MAP_ROUTE_4 = 15
+
+
+def _load_route3_to_route4_fixture(pyboy: PyBoy) -> None:
+    """#113's remaining criterion: loads a captured save state that has
+    walked the width of Route 3 and crossed its north connection to Route 4,
+    landing at Route 4's own tile `(9, 17)` - again `travel_graph.py`'s own
+    computed hop (`Hop(from_map=Route3, from_x=59, from_y=0, to_map=Route4,
+    to_x=9, to_y=17)`), not a hand-typed guess - with
+    `_give_overpowered_party`'s party in place and wild encounters disabled
+    (reapplied below, per `_disable_wild_encounters`'s own note that every
+    map transition reloads the real rate).
+
+    ## PR #115's Route 3 dead end was not real
+
+    `_load_pewter_to_route3_fixture`'s own docstring records a second
+    blocker: an exhaustive live BFS from this fixture's own starting tile
+    that found every tile reachable by ordinary walking capping out at
+    world x=22, read as a boulder cluster with no gap. `tileset_collision.py`
+    (#113's follow-up) decodes the same question statically, from the ROM's
+    own block/collision tables over the whole map at once, and finds a real
+    ordinary-walkable path from `(0, 8)` all the way to the crossing tile -
+    no ledge involved (`tileset_collision.py`'s "What this doesn't model"
+    section explains why that direction of error is impossible: a ledge only
+    ever makes a tile read *more* blocked, never less, so a tile this module
+    calls walkable can't secretly be one).
+
+    Reading the decoded map explains how a live search misses it. Route 3's
+    `y=7` is a near-solid boulder wall whose only five openings are
+    *single tiles* - `x=11, 27, 37, 49, 59` - and the whole lower band
+    (`y=8`-`13`) is cut off from the upper band horizontally at `x=38`-`43`
+    on every single row. So going east along the ground from the landing
+    tile really is impossible past about x=37, exactly as the old BFS
+    reported, and Route 4's connection row (`y=0`) is only walkable at
+    `x=57`-`63`. The way through is vertical, not lateral: up through the
+    `x=37` gap, east along the `y=4`/`y=5` band (which does span `x=34`-`49`
+    where the ground band doesn't), back *down* through the `x=49` gap, east
+    along `y=10`/`y=11`, then up the `x=59` column through the last gap. The
+    published walkthrough PR #115 cross-checked was right that the real
+    route "goes north" and wrong that it needs ledges.
+
+    ## The 8 stationary trainers are a second, separate obstacle layer
+
+    `rom_maps.parse_map(rom, 14).objects` lists 8 records with `.trainer`
+    set, at `(10, 6) (14, 4) (16, 9) (19, 5) (23, 4) (22, 9) (24, 6)
+    (33, 10)`. A trainer's own sprite tile is invisible to background-tile
+    collision - `tileset_collision.py` decodes the map's *terrain*, so it
+    still calls those tiles walkable - so each one had to be added to the
+    pathfinder's blocked set by hand. Their sight lines are deliberately
+    *not* avoided: walking into one is an ordinary, winnable battle (5 of
+    the 8 triggered on this route and were fought for real with
+    `_give_overpowered_party`/`_resolve_any_battle`), it just can't be the
+    tile the path steps onto.
+
+    ## Why a captured state again
+
+    Same reasoning as the two fixtures this one builds on: threading a
+    sequence of single-tile gaps across four screens, with an on-screen A*
+    that sees a 9x10 window and keeps no memory of where it has been, and
+    cannot see any of the 8 trainer tiles above, is exactly the case
+    `_walk_toward` is unreliable for (see
+    `_load_pewter_gym_interior_fixture`'s docstring for the same conclusion
+    on Pewter's streets). Captured by following a distance field computed
+    from the static decode - 92 `execute_button` steps from `(0, 8)` to
+    `(59, 0)`, re-deriving the next step from the player's *actual* live
+    position each time so a battle's displacement can't desync the route -
+    then one more "up" to trip the connection. Regenerate the same way, over
+    this file, if the ROM or PyBoy's save-state format ever changes.
+
+    One shared helper *was* fixed rather than worked around:
+    `_advance_past_any_encounter`'s unconditional 20-press mash re-opened
+    the dialog it had just closed by re-talking to the stationary trainer
+    standing right there, which looks identical from outside to an
+    unresolvable stuck loop. See its own docstring.
+    """
+    with _ROUTE3_TO_ROUTE4_STATE_PATH.open("rb") as f:
+        pyboy.load_state(f)
+    pyboy.tick(1, False)
+    _disable_wild_encounters(pyboy)
+
+
+def test_route3_to_route4_fixture_lands_on_a_rom_verified_tile(pyboy_outdoors):
+    """#113's acceptance criterion: the fixture crosses Route 3's own north
+    connection and lands on Route 4 at `(9, 17)` -
+    `travel_graph.py`'s own computed hop tile for that crossing - with no
+    dialog or battle left open, so #99's four remaining milestone tests can
+    be built on top of it.
+    """
+    _load_route3_to_route4_fixture(pyboy_outdoors)
+
+    state = extract_game_state(pyboy_outdoors)
+    assert state.map_id == _MAP_ROUTE_4
+    assert (state.player_x, state.player_y) == (9, 17)
     assert not state.dialog_open
     assert not state.battle.in_battle
 
