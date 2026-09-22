@@ -1389,12 +1389,13 @@ def _walk_tiles(
 
     When the plan runs out entirely the walker presses toward the goal anyway
     rather than giving up. That is deliberate and it is the only way through the
-    one thing no static decode can express: Gen 1 ledges, which let the player
-    step off and not back on. `tileset_collision.py`'s own "What this doesn't
-    model" section says it does not model them, and Mt Moon B2F's `(5, 7)` stair
-    sits in a chamber with no opening in the decoded terrain at all - it is
-    reached by stepping down into it, so a walker that only ever presses where the
-    decode says `walkable` can never arrive.
+    two things the static picture cannot express at all: Gen 1 ledges, which let
+    the player step off and not back on (`tileset_collision.py`'s own "What this
+    doesn't model" section says it does not model them), and object sprites that
+    this very walk has already removed - Mt Moon B2F's `(5, 7)` stair is reached
+    only through the tile a fossil sits on, and `_map_obstacles` reads object
+    records out of the ROM, so it keeps calling a sprite that is already in the
+    player's bag a wall.
     """
     strikes: dict[tuple[int, int], int] = {}
     expires: dict[tuple[int, int], int] = {}
