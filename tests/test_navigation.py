@@ -566,6 +566,15 @@ def _set_badges(pyboy: PyBoy, badges: tuple[str, ...]) -> None:
     pyboy.memory[_BADGES_ADDRESS] = mask
 
 
+# `MON_EXP` for `_give_overpowered_party` (offset 14 in the 44-byte party
+# struct, per game_state.py's own party_struct comments): 1,059,860 is
+# `pret/pokered`'s Medium-Slow growth curve (`data/growth_rates.asm`,
+# `growth_rate 6, 5, -15, 100, 140` = (6/5)n^3 - 15n^2 + 100n - 140) at
+# n=100. See `_give_overpowered_party`'s docstring for why a level-
+# *consistent* total is required and a maxed one actively breaks fights.
+_EXP_LEVEL_100 = 1_059_860
+
+
 def _give_overpowered_party(pyboy: PyBoy) -> None:
     """Writes one absurdly-strong party Pokemon directly into WRAM.
 
@@ -582,13 +591,28 @@ def _give_overpowered_party(pyboy: PyBoy) -> None:
     tried and once produced a real, reproducible battle-engine freeze
     (a "but it failed!" exchange that never advanced across hundreds of
     presses), so this deliberately stays well clear of extreme values.
-    EXP is maxed so any EXP gained from winning doesn't get used to
-    recompute real (tiny) stats from the species' own growth curve -
-    confirmed to happen otherwise: a single win silently dropped this
-    from level 100 back to level ~2, stats and all, regardless of what
-    MON_EXP was set to going in. `_resolve_any_battle` re-applies this
-    after every battle for the same reason - the recalculation happens
-    the instant EXP is gained, not something set once up front survives.
+
+    `_EXP_LEVEL_100` instead of a maxed `$FFFFFF`, and for a sharper reason
+    than "don't let EXP creep up": Gen 1 recomputes a Pokemon's level from
+    its *total* EXP the first time any is gained, and its level-from-EXP
+    lookup only covers the 100 table entries - an EXP total past level
+    100's threshold makes that recomputation land on a nonsense low level.
+    Measured against Pewter Gym's own trainer: with `$FFFFFF` the party
+    mon read L100 999/999 going in, became a real level-6 28/28 spread
+    mid-fight the instant it scored its first KO, lost, and blacked the
+    player out to Pallet Town (map 0, tile (5, 6)) - which from the outside
+    just looked like `_advance_past_any_encounter` failing to walk the
+    gym. With a level-consistent total the same fight ends in one turn and
+    the player never leaves the map. 1,059,860 is `pret/pokered`'s
+    Medium-Slow curve (`data/growth_rates.asm`: (6/5)n^3 - 15n^2 + 100n -
+    140) at n=100; it is at or above level 100's requirement for every one
+    of the six Gen 1 growth curves except Slow, where it still lands at
+    ~97, so it stays correct whatever species this is pointed at.
+
+    `_resolve_any_battle` re-applies this after every battle for the same
+    reason - the recalculation happens the instant EXP is gained, and with
+    a consistent total it now recomputes to the same strong level instead
+    of a broken one.
     """
     pyboy.memory[_PARTY_COUNT_ADDRESS] = 1
     pyboy.memory[_PARTY_SPECIES_LIST_ADDRESS] = 1  # RHYDON's internal index
@@ -601,7 +625,7 @@ def _give_overpowered_party(pyboy: PyBoy) -> None:
     mon[1:3] = stat  # current HP
     mon[4] = 0  # status: healthy
     mon[8] = 33  # move 1: TACKLE (real, damaging, nonzero)
-    mon[14:17] = (0xFFFFFF).to_bytes(3, "big")  # EXP: maxed
+    mon[14:17] = _EXP_LEVEL_100.to_bytes(3, "big")  # EXP: see above
     mon[29] = 35  # move 1 PP
     mon[33] = 100  # level
     mon[34:36] = stat  # max HP
@@ -643,6 +667,13 @@ def _resolve_any_battle(pyboy: PyBoy, max_presses: int = 2000) -> None:
     raise AssertionError(f"battle did not resolve within {max_presses} presses")
 
 
+# How many 30-frame windows `_advance_past_any_encounter` waits (without
+# pressing anything) after a dialog closes before it believes nothing is
+# coming. 8 = 240 frames, several times the ~30-frame gap measured between
+# Pewter Gym's trainer closing its greeting and `wIsInBattle` going nonzero.
+_POST_DIALOG_SETTLE_CHECKS = 8
+
+
 def _advance_past_any_encounter(pyboy: PyBoy) -> None:
     """Viridian Forest's Bug Catchers (and Pewter Gym's own trainer) are
     sight-triggered: walking into view opens a "Hey, wait up!"-style
@@ -673,6 +704,17 @@ def _advance_past_any_encounter(pyboy: PyBoy) -> None:
     the NPC standing right there. Verified directly against Route 3's
     trainers that way - the flag genuinely said "beaten", the dialog
     genuinely did clear, and the loop was the whole problem.
+
+    "Both checks read clear" is not the same moment as "nothing is coming",
+    though, and the first cut of that fix got this wrong: a sight-triggered
+    trainer's greeting closes on its last press and only *then* starts its
+    battle, so for about a screen-fade's worth of frames both checks
+    genuinely read false with a fight on its way in. Returning there handed
+    the battle to the caller still opening, which is what
+    `test_walking_to_pewter_gym_brock_reaches_a_rom_verified_tile` was then
+    failing on. The settle loop below waits that window out - pressing
+    nothing, since pressing is exactly what #113 had to stop - and only
+    returns once a battle has had every chance to show up.
     """
     if not (_dialog_text_visible(pyboy) or _in_battle(pyboy)):
         return
@@ -689,11 +731,16 @@ def _advance_past_any_encounter(pyboy: PyBoy) -> None:
             # "already beaten" canned line takes exactly this branch (no
             # battle to break into), so the old unconditional mash kept
             # pressing 14+ more times after the dialog was already gone.
-            # Settled and re-checked once, because a battle's own start-up
-            # shows a clear frame between its last dialog page and
-            # `wIsInBattle` going nonzero.
-            pyboy.tick(30, True)
-            if not (_dialog_text_visible(pyboy) or _in_battle(pyboy)):
+            for _ in range(_POST_DIALOG_SETTLE_CHECKS):
+                # Waiting is safe where pressing isn't. Confirmed against
+                # Pewter Gym's own trainer: the greeting closes on press 12
+                # and `wIsInBattle` goes nonzero 30 frames later, so this is
+                # the window its fight opens in - and the reason a single
+                # 30-frame re-check was not enough to be sure.
+                pyboy.tick(30, True)
+                if _dialog_text_visible(pyboy) or _in_battle(pyboy):
+                    break
+            else:
                 return
     _resolve_any_battle(pyboy)
     pyboy.tick(60, True)  # let the fade back to the overworld finish
@@ -987,6 +1034,26 @@ _PEWTER_GYM_INTERIOR_STATE_PATH = (
 )
 
 
+def _apply_fixture_prerequisites(pyboy: PyBoy) -> None:
+    """Re-applies on load the two pieces of prerequisite state every captured
+    fixture relies on, rather than trusting what its bytes happen to carry.
+
+    A `.state` file is a point-in-time snapshot of the *capture session's*
+    helpers, so anything those helpers write is frozen at whatever they
+    believed then: `_disable_wild_encounters` has to be reapplied after every
+    map transition anyway (see its own docstring), and `_give_overpowered_party`
+    is rewritten here so that fixing that helper also fixes fixtures captured
+    before the fix. `pewter_gym_interior.state` in particular was captured
+    when it wrote a maxed `$FFFFFF` EXP total - which, per
+    `_give_overpowered_party`'s own docstring, doesn't just fail to help, it
+    actively breaks the first fight afterwards - and re-capturing three
+    hand-verified fixtures to pick up a WRAM tweak is not worth it when the
+    load path can normalize it in one line.
+    """
+    _disable_wild_encounters(pyboy)
+    _give_overpowered_party(pyboy)
+
+
 def _load_pewter_gym_interior_fixture(pyboy: PyBoy) -> None:
     """Loads a captured save state already past Route 2's boulder maze,
     Viridian Forest, Pewter City's own street layout, and Pewter Gym's own
@@ -1044,7 +1111,7 @@ def _load_pewter_gym_interior_fixture(pyboy: PyBoy) -> None:
     with _PEWTER_GYM_INTERIOR_STATE_PATH.open("rb") as f:
         pyboy.load_state(f)
     pyboy.tick(1, False)
-    _disable_wild_encounters(pyboy)
+    _apply_fixture_prerequisites(pyboy)
 
 
 def test_walking_to_pewter_gym_brock_reaches_a_rom_verified_tile(pyboy_outdoors):
@@ -1198,7 +1265,7 @@ def _load_pewter_to_route3_fixture(pyboy: PyBoy) -> None:
     with _PEWTER_TO_ROUTE3_STATE_PATH.open("rb") as f:
         pyboy.load_state(f)
     pyboy.tick(1, False)
-    _disable_wild_encounters(pyboy)
+    _apply_fixture_prerequisites(pyboy)
 
 
 def test_pewter_to_route3_fixture_lands_on_a_rom_verified_tile(pyboy_outdoors):
@@ -1300,7 +1367,7 @@ def _load_route3_to_route4_fixture(pyboy: PyBoy) -> None:
     with _ROUTE3_TO_ROUTE4_STATE_PATH.open("rb") as f:
         pyboy.load_state(f)
     pyboy.tick(1, False)
-    _disable_wild_encounters(pyboy)
+    _apply_fixture_prerequisites(pyboy)
 
 
 def test_route3_to_route4_fixture_lands_on_a_rom_verified_tile(pyboy_outdoors):
