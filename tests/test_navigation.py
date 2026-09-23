@@ -582,12 +582,84 @@ def _set_badges(pyboy: PyBoy, badges: tuple[str, ...]) -> None:
 
 
 # `MON_EXP` for `_give_overpowered_party` (offset 14 in the 44-byte party
-# struct, per game_state.py's own party_struct comments): 1,059,860 is
-# `pret/pokered`'s Medium-Slow growth curve (`data/growth_rates.asm`,
-# `growth_rate 6, 5, -15, 100, 140` = (6/5)n^3 - 15n^2 + 100n - 140) at
-# n=100. See `_give_overpowered_party`'s docstring for why a level-
-# *consistent* total is required and a maxed one actively breaks fights.
-_EXP_LEVEL_100 = 1_059_860
+# struct, per game_state.py's own party_struct comments): 1,250,000 is what
+# the growth curve of the species it writes requires for level 100.
+# `pret/pokered`'s `data/pokemon/base_stats/rhydon.asm` gives RHYDON
+# `db GROWTH_SLOW`, and `data/growth_rates.asm`'s `growth_rate 5, 4, 0, 0, 0`
+# makes that curve `[1]/[2]*n^3` = `(5/4)n^3`, which is 1,250,000 at n=100.
+# It has to be the species' own curve and it has to be level 100's exact
+# requirement - see `_give_overpowered_party`'s docstring for both failures.
+_EXP_LEVEL_100 = 1_250_000
+
+
+# `pret/pokered`'s `data/growth_rates.asm`, hand-transcribed at the same pinned
+# commit `docs/research/gen1-map-coordinate-sources.md` cites: each row is
+# `[1]/[2]*n^3 + [3]*n^2 + [4]*n - [5]` (the `growth_rate` macro's own comment)
+# in `GROWTH_*` order. The test that reads these back out of the ROM checks the
+# transcription, so the arithmetic below is the ROM's and not a restatement of
+# this file's own opinion.
+_GROWTH_RATE_ROWS: tuple[tuple[int, int, int, int, int], ...] = (
+    (1, 1, 0, 0, 0),  # GROWTH_MEDIUM_FAST
+    (3, 4, 10, 0, 30),  # GROWTH_SLIGHTLY_FAST
+    (3, 4, 20, 0, 70),  # GROWTH_SLIGHTLY_SLOW
+    (6, 5, -15, 100, 140),  # GROWTH_MEDIUM_SLOW
+    (4, 5, 0, 0, 0),  # GROWTH_FAST
+    (5, 4, 0, 0, 0),  # GROWTH_SLOW
+)
+
+# `constants/pokemon_data_constants.asm`'s `BASE_GROWTH_RATE`: dex number (0),
+# the five stats (1-5), two types (6-7), catch rate (8), base EXP (9), picture
+# size (10), front (11-12) and back (13-14) pictures, four moves (15-18), and
+# the growth-rate index at 19.
+_BASE_GROWTH_RATE_OFFSET = 19
+
+# The base-data block of the species `_give_overpowered_party` writes - RHYDON,
+# internal index 1, national dex 112, 105/130/120/40/45, GROUND(4)/ROCK(5),
+# catch rate 60, base EXP 204. Anchored on those ten bytes because together
+# they name both the species and where its block starts.
+_RHYDON_BASE_DATA_PREFIX = bytes([112, 105, 130, 120, 40, 45, 4, 5, 60, 204])
+
+
+def _exp_for_level(row: tuple[int, int, int, int, int], level: int) -> int:
+    """`CalcExperience` (`pret/pokered`'s `engine/pokemon/experience.asm`). The
+    cubic term goes through the ROM's Multiply/Divide pair, so it lands on an
+    integer floor exactly the way `//` does here."""
+    num, den, quad, lin, sub = row
+    return num * level**3 // den + quad * level**2 + lin * level - sub
+
+
+def _level_from_exp(row: tuple[int, int, int, int, int], exp: int) -> int:
+    """`CalcLevelFromExperience`, same file: start at level 1 and step up while
+    the next level's requirement is still paid for. There is no table here and
+    no cap, which is why an EXP total *above* level 100's requirement is not
+    "level 100 with room to spare" - see `_give_overpowered_party`."""
+    level = 1
+    while _exp_for_level(row, level + 1) <= exp:
+        level += 1
+    return level
+
+
+def _packed_growth_rate_table() -> bytes:
+    """`_GROWTH_RATE_ROWS` as the ROM stores them: `dn`-packed numerator and
+    denominator nibbles, then `[3]` (signed magnitude), `[4]` and `[5]`."""
+    packed = bytearray()
+    for num, den, quad, lin, sub in _GROWTH_RATE_ROWS:
+        packed.append((num << 4) | den)
+        packed.append(-quad | 0x80 if quad < 0 else quad)
+        packed.append(lin)
+        packed.append(sub)
+    return bytes(packed)
+
+
+def _only_offset_of(rom: bytes, needle: bytes) -> int:
+    """The one place `needle` occurs in `rom`, failing loudly if that is wrong."""
+    offsets = []
+    at = rom.find(needle)
+    while at >= 0:
+        offsets.append(at)
+        at = rom.find(needle, at + 1)
+    assert len(offsets) == 1, f"expected one hit for {needle.hex()!r}, got {offsets}"
+    return offsets[0]
 
 
 def _give_overpowered_party(pyboy: PyBoy) -> None:
@@ -609,25 +681,35 @@ def _give_overpowered_party(pyboy: PyBoy) -> None:
 
     `_EXP_LEVEL_100` instead of a maxed `$FFFFFF`, and for a sharper reason
     than "don't let EXP creep up": Gen 1 recomputes a Pokemon's level from
-    its *total* EXP the first time any is gained, and its level-from-EXP
-    lookup only covers the 100 table entries - an EXP total past level
-    100's threshold makes that recomputation land on a nonsense low level.
-    Measured against Pewter Gym's own trainer: with `$FFFFFF` the party
-    mon read L100 999/999 going in, became a real level-6 28/28 spread
-    mid-fight the instant it scored its first KO, lost, and blacked the
-    player out to Pallet Town (map 0, tile (5, 6)) - which from the outside
-    just looked like `_advance_past_any_encounter` failing to walk the
-    gym. With a level-consistent total the same fight ends in one turn and
-    the player never leaves the map. 1,059,860 is `pret/pokered`'s
-    Medium-Slow curve (`data/growth_rates.asm`: (6/5)n^3 - 15n^2 + 100n -
-    140) at n=100; it is at or above level 100's requirement for every one
-    of the six Gen 1 growth curves except Slow, where it still lands at
-    ~97, so it stays correct whatever species this is pointed at.
+    its *total* EXP the first time any is gained, and `CalcLevelFromExperience`
+    (`pret/pokered`'s `engine/pokemon/experience.asm`) has no table and no cap
+    to fall back on - it starts at level 1 and `inc d`s upward, comparing each
+    level's `CalcExperience` requirement against the total, so the answer is
+    simply the highest level the total pays for. Measured against Pewter Gym's
+    own trainer: with `$FFFFFF` the party mon read L100 999/999 going in, became
+    a real level-6 28/28 spread mid-fight the instant it scored its first KO,
+    lost, and blacked the player out to Pallet Town (map 0, tile (5, 6)) - which
+    from the outside just looked like `_advance_past_any_encounter` failing to
+    walk the gym.
+
+    So the total has to be the *written species' own* curve's requirement for
+    level 100, which an earlier cut of this got wrong by pinning Medium-Slow's
+    1,059,860 while writing RHYDON. RHYDON's curve is GROWTH_SLOW, `(5/4)n^3`,
+    so 1,059,860 buys it only level 94 - (5/4)*94^3 = 1,038,230 fits while
+    (5/4)*95^3 = 1,071,719 does not - and a level that *changes* makes the ROM
+    recompute the whole spread from the species' base stats, throwing away the
+    999s this writes. Measured on Mt Moon B2F: walking up from `(11, 20)` into
+    the Rocket at `(11, 16)`'s sight line took the mon from L100 999/999 to
+    exactly L94 302 HP the first time EXP was scored, and that fight then ran
+    374 presses and lost, ending at map 0 tile `(5, 6)` the same way - which
+    from the outside looked like the walk wandering off its own map. With this
+    total the same walk's fights ended at L100 with every 999 intact and it
+    reached `(12, 7)`.
 
     `_resolve_any_battle` re-applies this after every battle for the same
-    reason - the recalculation happens the instant EXP is gained, and with
-    a consistent total it now recomputes to the same strong level instead
-    of a broken one.
+    reason - the recalculation happens the instant EXP is gained, and with a
+    total that is exactly this species' level-100 requirement it recomputes to
+    the level already written, so no stat recalculation is triggered at all.
     """
     pyboy.memory[_PARTY_COUNT_ADDRESS] = 1
     pyboy.memory[_PARTY_SPECIES_LIST_ADDRESS] = 1  # RHYDON's internal index
@@ -2385,3 +2467,51 @@ def test_read_menu_cursor_reads_the_live_wcurrentmenuitem_byte(pyboy_in_bedroom)
     pyboy_in_bedroom.memory[0xCC26] = 2
 
     assert read_menu_cursor(pyboy_in_bedroom) == 2
+
+
+def test_the_growth_rate_table_in_the_rom_matches_pret_pokered_row_for_row():
+    """The six curves, found by the byte string this file's transcription packs
+    to. A row out by one nibble, or the table in the wrong place, and the
+    needle stops being unique or stops appearing at all - which is the same
+    anchor discipline `test_tile_pair_collisions_match_pret_pokered_row_for_row`
+    applies to the pair-collision tables."""
+    rom, _, _, _ = _rom_parse()
+    offset = _only_offset_of(rom, _packed_growth_rate_table())
+    assert rom[offset : offset + 24] == _packed_growth_rate_table()
+    # The ROM reads this table by index, so the order is part of the data.
+    assert _exp_for_level(_GROWTH_RATE_ROWS[0], 100) == 1_000_000  # MEDIUM_FAST
+    assert _exp_for_level(_GROWTH_RATE_ROWS[3], 100) == 1_059_860  # MEDIUM_SLOW
+    assert _exp_for_level(_GROWTH_RATE_ROWS[5], 100) == 1_250_000  # SLOW
+
+
+def test_the_partys_exp_total_is_the_written_species_own_level_100():
+    """The invariant `_give_overpowered_party` depends on, taken from the ROM.
+
+    Gen 1 recomputes a Pokemon's level from its total EXP the first time a
+    fight awards any, and `_level_from_exp` is that routine: the highest level
+    the total pays for. So the EXP this writes has to be the level-100
+    requirement of the growth rate *the written species' own base-data block
+    names* - which the ROM says is index 5, `GROWTH_SLOW`.
+
+    The assertion at the bottom pins the failure that made this necessary. The
+    total used to be Medium-Slow's level-100 value, 1,059,860, which under
+    RHYDON's own curve is not level 100 at all: it is level 94, and a level
+    that changes makes the ROM rederive the whole spread from base stats, so
+    the 999s this writes are gone by the second turn. That is what the Mt Moon
+    B2F walk measured (`L100 999/999 -> L94 302 HP`, then a lost fight and the
+    player on map 0 tile `(5, 6)`), and it looked nothing like an EXP bug from
+    the outside.
+    """
+    rom, _, _, _ = _rom_parse()
+    rhydon = _only_offset_of(rom, _RHYDON_BASE_DATA_PREFIX)
+    curve = _GROWTH_RATE_ROWS[rom[rhydon + _BASE_GROWTH_RATE_OFFSET]]
+
+    assert _exp_for_level(curve, 100) == _EXP_LEVEL_100
+    assert _level_from_exp(curve, _EXP_LEVEL_100) == 100
+    # And one fight's EXP must not be able to move the level, because
+    # `_resolve_any_battle` only re-applies the party once the fight is over.
+    # 37,876 EXP separates this total from level 101's requirement.
+    assert _exp_for_level(curve, 101) - _EXP_LEVEL_100 == 37_876
+    assert _level_from_exp(curve, _EXP_LEVEL_100 + 30_000) == 100
+
+    assert _level_from_exp(curve, 1_059_860) == 94
