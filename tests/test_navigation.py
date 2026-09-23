@@ -1945,6 +1945,236 @@ def test_walking_to_cerulean_gym_misty_reaches_a_rom_verified_tile(pyboy_outdoor
     assert dialog_opened
 
 
+_MAP_BILLS_HOUSE = 88  # `constants/map_constants.asm`'s BILLS_HOUSE
+# `pret/pokered`'s `constants/event_constants.asm` ordinals for the Bill quest,
+# derived the same way `milestones.py` derives its own - by replaying that file's
+# `const`/`const_skip`/`const_next` macros rather than counting bits by hand - and
+# `EVENT_GOT_SS_TICKET` is the third of them, which is the number `milestones.py`
+# already carries as `_EVENT_GOT_SS_TICKET`.
+_EVENT_USED_CELL_SEPARATOR_ON_BILL = 1371
+_EVENT_MET_BILL_2 = 1373
+_EVENT_GOT_SS_TICKET = 1372
+
+_BILLS_HOUSE_INTERIOR_STATE_PATH = (
+    Path(__file__).resolve().parent / "fixtures" / "bills_house_interior.state"
+)
+
+
+def _event_flag_is_set(pyboy: PyBoy, flag: int) -> bool:
+    """Reads one `wEventFlags` bit by its `event_constants.asm` ordinal, which is
+    `_set_event_flag`'s own inverse - same `offset * 8 + bit` numbering
+    `game_state.py`'s `_read_event_flags` and `milestones.py` use, so a flag this
+    returns True for is a flag `track_milestones` will see.
+    """
+    byte, bit = divmod(flag, 8)
+    return bool((pyboy.memory[_EVENT_FLAGS_START_ADDRESS + byte] >> bit) & 1)
+
+
+def _wait_for_event_flag(pyboy: PyBoy, flag: int, max_presses: int = 80) -> None:
+    """Presses "a" - the only button that advances a Gen 1 text box - until the ROM
+    has set `flag` itself, and fails with the flag's name if it never does.
+
+    The Bills House scene is scripted rather than instant: `BillsHouse_Script`'s
+    pointer table runs one script per frame and each hand-off
+    (`POKEMON_WALK_TO_MACHINE` -> `POKEMON_ENTERS_MACHINE` -> `BILL_EXITS_MACHINE`
+    -> `CLEANUP`) waits on the previous one's own condition, so the flags below are
+    the only honest progress signal. Pressing is also what the ROM needs from the
+    player during it - the scene's text pages need dismissing - so this polls the
+    flag *before* pressing and stops on the frame it appears. Stopping matters: see
+    `_run_bills_house_cell_separator` for what mashing past it costs.
+    """
+    for _ in range(max_presses):
+        if _event_flag_is_set(pyboy, flag):
+            return
+        execute_button(pyboy, "a")
+        pyboy.tick(30, True)
+    raise AssertionError(f"event flag {flag} was never set by the ROM")
+
+
+def _advance_bills_house_dialog(pyboy: PyBoy, max_presses: int = 30) -> None:
+    """Dismisses the pages of a Bills House dialog with "a", stopping on the first
+    press the text row does not answer.
+
+    That close signal is #113's, for the reason `_advance_past_any_encounter`
+    records: `GameState.dialog_open` misses short single-page lines entirely and
+    `_dialog_text_visible` is only trustworthy on a map as short as this one (Bill's
+    House is 8 tiles tall), so on a longer map the same check would mash twenty
+    presses into a closed box - and Bills House has two stationary NPCs, so a press
+    after the box closes re-opens it by re-talking to whoever stands there.
+    """
+    for _ in range(max_presses):
+        row = _dialog_row_tiles(pyboy)
+        pyboy.button("a", 2)
+        pyboy.tick(20, True)
+        if not _in_battle(pyboy) and _dialog_row_tiles(pyboy) == row:
+            return
+
+
+def _run_bills_house_cell_separator(pyboy: PyBoy) -> None:
+    """Plays, from real button presses, the two story beats Bill's House gates the
+    S.S. Ticket behind, and leaves the player standing at the machine.
+
+    `data/maps/objects/BillsHouse.asm` gives Bill two object records on this map, and
+    the ticket one is unreachable until the quest has run: the `(4, 4)` record's
+    `TEXT_BILLSHOUSE_BILL_SS_TICKET` belongs to the sprite `scripts/BillsHouse.asm`
+    only shows with `predef ShowObject` on `TOGGLE_BILL_1`, inside
+    `BillsHouseBillExitsMachineScript`, which itself waits on
+    `EVENT_USED_CELL_SEPARATOR_ON_BILL`. So:
+
+    1. The `(6, 5)` `SPRITE_MONSTER` record, faced from `(5, 5)`: that is
+       `BillsHouseBillPokemonText`, which prints "I'm not a Pokemon!", asks a Yes/No,
+       and sets `SCRIPT_BILLSHOUSE_POKEMON_WALK_TO_MACHINE` on either answer - the
+       `.answered_no` branch prints its own line and then falls into `.use_machine`.
+       No cursor work is needed, because `YesNoChoice`'s default answer also leads
+       there.
+    2. The machine, which is not an object record at all but a hidden BG event:
+       `data/events/hidden_events.asm`'s `hidden_event 1, 4, BillsHousePC,
+       SPRITE_FACING_UP`, and `engine/overworld/hidden_events.asm` matches it through
+       `CheckIfCoordsInFrontOfPlayerMatch`, so the event tile has to be *in front of*
+       the player and `engine/hidden_events/bills_house_pc.asm` opens with
+       `cp SPRITE_FACING_UP / ret nz`. The macro emits its coordinates y-then-x, so
+       `hidden_event 1, 4` is x=1, y=4 - fired from `(1, 5)` facing up, which is what
+       this walks to. That is what sets `EVENT_USED_CELL_SEPARATOR_ON_BILL`.
+
+    Then the ROM's own scripts run: the monster walks into the machine,
+    `BillsHouseBillExitsMachineScript` sets `PAD_CTRL_PAD` in `wJoyIgnore`, moves Bill
+    out with `SetSpritePosition1` and `MoveSprite`, and `BillsHouseCleanupScript`
+    clears `wJoyIgnore` and sets `EVENT_MET_BILL_2` once
+    `BIT_SCRIPTED_NPC_MOVEMENT` is clear. Between the second flag and the third the
+    player takes no directions at all, and that is the reason this waits on flags
+    rather than frames: an earlier probe gave up twelve presses in and read the whole
+    window as a frozen emulator.
+
+    It also stops pressing the moment `EVENT_MET_BILL_2` appears, and that is not
+    cosmetic. The cleanup leaves the player exactly where they stood, facing the
+    machine, so every further "a" is another `BillsHousePC` hidden-event call: one
+    run that mashed forty such presses still had the ticket, but its next walk moved
+    the player nowhere for four seconds, with a text box on the screen eating every
+    step.
+    """
+    assert _walk_tiles(pyboy, 5, 5, max_steps=80, map_id=_MAP_BILLS_HOUSE) == (
+        _MAP_BILLS_HOUSE,
+        5,
+        5,
+    )
+    execute_button(pyboy, "right")
+    pyboy.tick(30, True)
+    pyboy.button("a", 2)
+    _advance_bills_house_dialog(pyboy)
+
+    assert _walk_tiles(pyboy, 1, 5, max_steps=80, map_id=_MAP_BILLS_HOUSE) == (
+        _MAP_BILLS_HOUSE,
+        1,
+        5,
+    )
+    execute_button(pyboy, "up")
+    pyboy.tick(30, True)
+    pyboy.button("a", 2)
+    _wait_for_event_flag(pyboy, _EVENT_USED_CELL_SEPARATOR_ON_BILL)
+    _wait_for_event_flag(pyboy, _EVENT_MET_BILL_2)
+    pyboy.tick(60, True)
+
+
+def _load_bills_house_interior_fixture(pyboy: PyBoy) -> None:
+    """Loads a captured save state standing just inside Bill's House - map 88, tile
+    (2, 7), the tile its own door warp hands over - with
+    `_apply_fixture_prerequisites`'s two writes re-applied on load.
+
+    The way here was walked rather than teleported: Cerulean City `(0, 18)` (Route 4's
+    east-edge landing, and the same tile `_load_cerulean_gym_interior_fixture`'s chain
+    ends on) -> `(20, 6)` -> `(20, 0)` -> Route 24 `(10, 35)` -> `(19, 8)` -> Route 25
+    `(0, 8)` -> `(45, 3)`'s door -> `(2, 7)`. `(20, 6)` is a story gate rather than
+    terrain - the rival stands on it and its map script releases him only once
+    `EVENT_BEAT_CERULEAN_RIVAL` is set, so that flag is set directly, which is what
+    #99 says to do with prerequisite story state.
+
+    A fixture rather than a live crossing, for the reason the two Gym fixtures give in
+    their own docstrings and with the same caveat: those walks' fight lengths vary run
+    to run, and this chain is five maps and eleven measured fights long - the run that
+    captured it logged fights of 506 and 866 presses apiece along Route 24 and Route
+    25 (`_resolve_any_battle`'s own docstring records the measurements). Everything
+    before `(2, 7)` is scenery for what this test verifies.
+
+    Unlike the other fixture loaders this one settles 120 frames before reading
+    anything, because the state was captured *through* a warp and #90's gotcha about
+    position reads taken straight after a warp is exactly what that means here:
+    sampled too early this state reads `(88, 45, 3)` - Route 25's own door tile, still
+    - and only becomes `(88, 2, 7)` between about 90 and 120 frames later.
+    """
+    with _BILLS_HOUSE_INTERIOR_STATE_PATH.open("rb") as f:
+        pyboy.load_state(f)
+    pyboy.tick(120, False)
+    _apply_fixture_prerequisites(pyboy)
+
+
+def test_walking_to_bills_house_bill_reaches_a_rom_verified_tile(pyboy_outdoors):
+    """#99's boot verification for the `got_ss_ticket` milestone: Bill's House's own
+    S.S.-ticket object record (`milestone_targets.py`'s selection for it), map 88 tile
+    (4, 4).
+
+    Like every Gym milestone in this batch, the parsed target is the NPC's own tile,
+    and the assertion below re-derives that from `_map_obstacles` rather than taking
+    this docstring's word for it. Bill's House adds a wrinkle none of them had, and it
+    is worth recording because it says where the repo's "objects are the second
+    obstacle layer" model is wrong: *before* the cell-separation scene, `(4, 4)` can
+    actually be stood on. The sprite that would occupy it is hidden by a
+    `TOGGLE_BILL_1` flag, and `constants/toggle_constants.asm` +
+    `engine/overworld/toggleable_objects.asm` keep those in `wToggleableObjectFlags` -
+    a different array from `wEventFlags`, which is why no amount of
+    `_set_event_flag` reaches it and why the parse cannot see it either. So the tile is
+    only solid in the one state where the milestone is reachable, which is the state
+    `_run_bills_house_cell_separator` puts the game into.
+
+    Talking to him then is `BillsHouseBillSSTicketText`, and unlike the Gym milestones
+    this one does not stop at a pre-battle page: it prints the thank-you, calls
+    `GiveItem` for `S_S_TICKET`, and sets `EVENT_GOT_SS_TICKET` - the exact flag
+    `milestones.py`'s `_MilestoneCheck` for `got_ss_ticket` reads. So this test checks
+    #99's own criterion (a `dialog_open` that goes True from a press aimed at the
+    milestone's parsed tile) *and* the milestone completing, with the flag read back
+    through `_event_flag_is_set`, `_set_event_flag`'s own inverse.
+
+    The tile that faces `(4, 4)` is `(3, 4)`, approached from the door side of the
+    room; the other three neighbours were each measured refusing a walk to the tile
+    itself (`(4, 3)` and `(5, 4)` come back at `(3, 4)`, `(4, 5)` never gets there
+    either), so this aims at `(3, 4)` and faces right, the same substitution the
+    merged `boulder_badge` and `cascade_badge` tests make.
+    """
+    _load_bills_house_interior_fixture(pyboy_outdoors)
+    assert extract_game_state(pyboy_outdoors).map_id == _MAP_BILLS_HOUSE
+    assert not _event_flag_is_set(pyboy_outdoors, _EVENT_GOT_SS_TICKET)
+
+    solid, _warps = _map_obstacles(_MAP_BILLS_HOUSE)
+    assert (4, 4) in solid  # the parsed target is Bill's own object record
+    assert (3, 4) not in solid
+
+    _run_bills_house_cell_separator(pyboy_outdoors)
+
+    assert _walk_tiles(
+        pyboy_outdoors, 3, 4, max_steps=150, map_id=_MAP_BILLS_HOUSE
+    ) == (
+        _MAP_BILLS_HOUSE,
+        3,
+        4,
+    )
+    execute_button(pyboy_outdoors, "right")
+    pyboy_outdoors.tick(30, True)
+    pyboy_outdoors.button("a", 2)
+    dialog_opened = False
+    for _ in range(12):
+        pyboy_outdoors.tick(30, True)
+        if extract_game_state(pyboy_outdoors).dialog_open:
+            dialog_opened = True
+            break
+    assert dialog_opened
+
+    for _ in range(40):
+        if _event_flag_is_set(pyboy_outdoors, _EVENT_GOT_SS_TICKET):
+            break
+        pyboy_outdoors.tick(25, True)
+        pyboy_outdoors.button("a", 2)
+    assert _event_flag_is_set(pyboy_outdoors, _EVENT_GOT_SS_TICKET)
+
+
 _PEWTER_TO_ROUTE3_STATE_PATH = (
     Path(__file__).resolve().parent / "fixtures" / "pewter_to_route3.state"
 )
