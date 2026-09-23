@@ -6,7 +6,9 @@ from pyboy import PyBoy
 
 from jev_plays_pokemon import rom_maps
 from jev_plays_pokemon.tileset_collision import (
+    crosses_blocked_pair,
     is_walkable,
+    parse_tile_pair_collisions,
     parse_tileset_headers,
     raw_tile_id,
 )
@@ -90,6 +92,11 @@ def rom() -> bytes:
 @pytest.fixture(scope="module")
 def headers(rom: bytes):
     return parse_tileset_headers(rom)
+
+
+@pytest.fixture(scope="module")
+def pairs(rom: bytes):
+    return parse_tile_pair_collisions(rom)
 
 
 def test_overworld_header_matches_directly_verified_rom_offsets(headers):
@@ -196,6 +203,41 @@ _CAVERN_COLL_TILE_IDS = frozenset(
 )
 
 
+def _legally_reachable(
+    rom: bytes,
+    rmap,
+    headers,
+    pair_collisions: frozenset[tuple[int, int, int]],
+    start: tuple[int, int],
+    opened: frozenset[tuple[int, int]] = frozenset(),
+) -> frozenset[tuple[int, int]]:
+    """Every tile ordinary walking reaches from `start`, honouring *both* of
+    `pret/pokered`'s `home/overworld.asm` step checks plus the map's object
+    records. `opened` names objects the walk is allowed to treat as already
+    picked up, which is how a fossil becomes a doorway."""
+    width, height = rmap.width_blocks * 2, rmap.height_blocks * 2
+    walls = {(o.x, o.y) for o in rmap.objects} - opened
+    seen = {start}
+    queue = deque([start])
+    while queue:
+        x, y = queue.popleft()
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            neighbor = (x + dx, y + dy)
+            if not (0 <= neighbor[0] < width and 0 <= neighbor[1] < height):
+                continue
+            if neighbor in seen or neighbor in walls:
+                continue
+            if is_walkable(rom, rmap, headers, *neighbor) is not True:
+                continue
+            if crosses_blocked_pair(
+                rom, rmap, headers, pair_collisions, (x, y), neighbor
+            ):
+                continue
+            seen.add(neighbor)
+            queue.append(neighbor)
+    return frozenset(seen)
+
+
 def _raw_tile_quadrant(rom: bytes, rmap, headers, x: int, y: int) -> dict:
     """The 2x2 raw tile IDs world tile `(x, y)` occupies inside its 4x4 block,
     keyed by `(sub_row, sub_col)` - read straight off the block-set bytes
@@ -249,37 +291,261 @@ def test_mt_moon_stairs_are_walkable_under_the_bottom_left_sample(rom, headers):
         assert discriminating > 0
 
 
-def test_mt_moon_b2f_stair_reachable_from_the_b1f_landing_by_ordinary_walking(
-    rom, headers
+def test_mt_moon_b2f_route_to_the_route4_stair_needs_a_fossil_and_the_other_stair(
+    rom, headers, pairs
 ):
-    """#99/#100's route out of Mt Moon, in static form.
+    """#99/#100's route out of Mt Moon, in static form - and the measurement
+    that overturned this file's earlier version of the same claim.
 
-    `(25, 9)` is where Mt Moon B1F's `(17, 11)` stair lands the player, and
-    `(5, 7)` is the stair that lands in B1F's Route 4 chamber - the only way to
-    Route 4's east side, and so the only land route to Cerulean City and
-    everything beyond it. This was unreachable in the decode until the sample
-    moved to `(1, 0)`: `(3, 5)`, the one tile joining the `(5, 7)` stair's
-    pocket to the open floor north of it, has quadrant
-    `{(0, 0): 21, (0, 1): 22, (1, 0): 21, (1, 1): 22}`, and raw `22` is not in
-    `CAVERN`'s passable list while `21` is - so the old reading walled the
-    pocket, and B1F's Route 4 chamber with it, on all four sides.
+    `(5, 7)` is the stair that lands in B1F's Route 4 chamber, the only way to
+    Route 4's east side and so the only land route to Cerulean City and
+    everything beyond it. This file used to assert it was reachable from
+    `(25, 9)` on `is_walkable` alone. That is wrong, and Mt Moon is exactly
+    where `crosses_blocked_pair` earns its place: the flood from `(25, 9)`
+    covers 483 tiles without the pair rule and **67** with it, because
+    `(25, 9)`'s landing band is `$20` and every corridor leaving it is `$05` -
+    a `CAVERN $20 <-> $05` crossing the ROM refuses in both directions. That
+    landing is a sealed pocket, and its only warp is the stair it came in by.
+
+    The floor's real trunk road starts at `(21, 17)` (B1F's `(21, 17)` stair,
+    384 tiles with the pair rule) and runs to the two fossil pedestals at
+    `(12, 6)`/`(13, 6)`, which `rom_maps` reports as sprite 62 objects sitting
+    on walkable floor. Taking either fossil is what opens the dungeon: with one
+    gone the component grows to 448 tiles and includes `(5, 7)`. So Mt Moon's
+    exit is not merely a walking problem - the ROM's own collision data makes
+    the fossil pickup a prerequisite for leaving, which is why the walk that
+    stalls here has nothing to do with how it plans.
     """
     rmap = rom_maps.parse_map(rom, _MAP_MT_MOON_B2F)
-    start = (25, 9)
     target = (5, 7)
-    assert is_walkable(rom, rmap, headers, *start) is True
+    assert is_walkable(rom, rmap, headers, *target) is True
     assert is_walkable(rom, rmap, headers, 3, 5) is True
 
+    sealed_pocket = _legally_reachable(rom, rmap, headers, pairs, (25, 9))
+    assert target not in sealed_pocket
+    assert len(sealed_pocket) == 67
+
+    without_fossil = _legally_reachable(rom, rmap, headers, pairs, (21, 17))
+    assert target not in without_fossil
+    assert len(without_fossil) == 384
+
+    with_fossil = _legally_reachable(
+        rom, rmap, headers, pairs, (21, 17), opened=frozenset({(12, 6)})
+    )
+    assert target in with_fossil
+    assert len(with_fossil) == 448
+
+
+def _legally_reachable(
+    rom: bytes,
+    rmap,
+    headers,
+    pair_collisions: frozenset[tuple[int, int, int]],
+    start: tuple[int, int],
+    opened: frozenset[tuple[int, int]] = frozenset(),
+) -> frozenset[tuple[int, int]]:
+    """Every tile ordinary walking reaches from `start`, honouring *both* of
+    `pret/pokered`'s `home/overworld.asm` step checks plus the map's object
+    records. `opened` names objects the walk is allowed to treat as already
+    picked up, which is how a fossil becomes a doorway."""
+    width, height = rmap.width_blocks * 2, rmap.height_blocks * 2
+    walls = {(o.x, o.y) for o in rmap.objects} - opened
     seen = {start}
     queue = deque([start])
     while queue:
         x, y = queue.popleft()
         for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
             neighbor = (x + dx, y + dy)
-            if neighbor in seen:
+            if not (0 <= neighbor[0] < width and 0 <= neighbor[1] < height):
                 continue
-            if is_walkable(rom, rmap, headers, *neighbor):
-                seen.add(neighbor)
-                queue.append(neighbor)
+            if neighbor in seen or neighbor in walls:
+                continue
+            if is_walkable(rom, rmap, headers, *neighbor) is not True:
+                continue
+            if crosses_blocked_pair(
+                rom, rmap, headers, pair_collisions, (x, y), neighbor
+            ):
+                continue
+            seen.add(neighbor)
+            queue.append(neighbor)
+    return frozenset(seen)
 
-    assert target in seen
+
+# `pret/pokered`'s `data/tilesets/pair_collision_tile_ids.asm`, hand-transcribed
+# from that file at the same pinned commit `docs/research/gen1-map-coordinate-
+# sources.md` uses. Independent of this module's anchor, so the equality below
+# checks both where the parse started and what it stopped at.
+_TILE_PAIR_COLLISION_ROWS = frozenset(
+    {
+        # TilePairCollisionsLand
+        (_TILESET_CAVERN, 0x20, 0x05),
+        (_TILESET_CAVERN, 0x41, 0x05),
+        (_TILESET_FOREST, 0x30, 0x2E),
+        (_TILESET_CAVERN, 0x2A, 0x05),
+        (_TILESET_CAVERN, 0x05, 0x21),
+        (_TILESET_FOREST, 0x52, 0x2E),
+        (_TILESET_FOREST, 0x55, 0x2E),
+        (_TILESET_FOREST, 0x56, 0x2E),
+        (_TILESET_FOREST, 0x20, 0x2E),
+        (_TILESET_FOREST, 0x5E, 0x2E),
+        (_TILESET_FOREST, 0x5F, 0x2E),
+        # TilePairCollisionsWater
+        (_TILESET_FOREST, 0x14, 0x2E),
+        (_TILESET_FOREST, 0x48, 0x2E),
+        (_TILESET_CAVERN, 0x14, 0x05),
+    }
+)
+
+
+def test_tile_pair_collisions_match_pret_pokered_row_for_row(pairs):
+    """All fourteen rows of both tables, from an offset the module found by
+    anchoring six bytes - and the terminator positions are what separate the
+    second table's three rows from whatever the ROM keeps after it, so a
+    mis-read here shows up as a row that isn't in pokered or a row missing."""
+    assert pairs == _TILE_PAIR_COLLISION_ROWS
+
+
+def test_tile_pair_collisions_only_name_the_two_tilesets_that_need_them(pairs):
+    """`FOREST` and `CAVERN` only. The nine `FOREST` rows all pair against
+    `$2E` and the five `CAVERN` rows all pair against `$05`, which is why
+    neither rule can wall off a map that never uses those floor IDs."""
+    assert {row[0] for row in pairs} == {_TILESET_FOREST, _TILESET_CAVERN}
+    for tileset_id, partner in ((_TILESET_FOREST, 0x2E), (_TILESET_CAVERN, 0x05)):
+        rows = {row for row in pairs if row[0] == tileset_id}
+        assert rows
+        assert all(partner in (row[1], row[2]) for row in rows), rows
+
+
+def test_the_pair_rule_is_what_seals_mt_moon_b2fs_landing_pocket(rom, headers, pairs):
+    """A regression for the rule itself, at the tile that made it visible.
+
+    `(24, 12)` is ordinary walkable - raw `$05`, squarely in `CAVERN`'s
+    passable list - and it sits on a corridor the passable list calls open the
+    whole width of the floor. `(24, 11)`, the tile directly above it, is raw
+    `$20`. `is_walkable` calls both walkable and so plans the step; the ROM
+    refuses it, and every one of the refusals this repo's walker recorded in
+    this dungeon is a crossing of exactly that kind.
+    """
+    rmap = rom_maps.parse_map(rom, _MAP_MT_MOON_B2F)
+    assert is_walkable(rom, rmap, headers, 24, 12) is True
+    assert is_walkable(rom, rmap, headers, 24, 11) is True
+    assert raw_tile_id(rom, rmap, headers, 24, 12) == 0x05
+    assert raw_tile_id(rom, rmap, headers, 24, 11) == 0x20
+    assert crosses_blocked_pair(rom, rmap, headers, pairs, (24, 11), (24, 12))
+    assert crosses_blocked_pair(rom, rmap, headers, pairs, (24, 12), (24, 11))
+
+    pocket = _legally_reachable(rom, rmap, headers, pairs, (25, 9))
+    assert (24, 12) not in pocket
+    assert all(
+        not crosses_blocked_pair(
+            rom, rmap, headers, pairs, here, (here[0] + dx, here[1] + dy)
+        )
+        for here in pocket
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))
+        if (here[0] + dx, here[1] + dy) in pocket
+    )
+
+
+_MAP_ROUTE_4 = 15
+
+
+def _warp_landing(rmap, warp):
+    """The tile a warp record actually lands the player on, read out of the
+    destination map's own warp list (`rom_maps.MapWarp.dest_warp` is a 0-based
+    index into it, and `dest_map=None` is `LAST_MAP` - which inside Mt Moon is
+    the last *outside* map, so Route 4, per `pret/pokered`'s `WarpFound2` only
+    writing `wLastMap` when leaving an outside map)."""
+    return rmap.warps[warp.dest_warp]
+
+
+def test_the_route_from_route4s_route3_landing_to_ceruleans_gate_is_one_walkable_chain(
+    rom, headers, pairs
+):
+    """The whole claim #99's remaining four milestones rest on, link by link.
+
+    Route 3's north connection puts the player on Route 4 at `(9, 17)` (the
+    committed `route3_to_route4.state` fixture's landing tile), and Route 4's
+    decoded walkability is "right and useless on its own": the wall at x=20-23
+    splits the map, and `travel_graph.py`'s own docstring calls the only
+    connector a scripted concern rather than a routing one. This walks that
+    connector statically, and asserts each hop's landing tile *from the warp
+    records* rather than from the coordinates the last attempt assumed - which
+    is where the earlier version of this chain was wrong.
+
+    Every link is on the ROM's own bytes, because a link that fails statically
+    fails on live hardware too; each one that passes is a leg the walker can be
+    pointed at, and the two that need something beyond walking - the fossil,
+    and Route 4's one-way ledge drop into Cerulean's side of the map - are
+    named as such instead of planned through.
+
+    Worth recording next to the ledge: `travel_graph.connection_hop` picks
+    Route 4's crossing tile for its `east -> Cerulean City` connection as
+    `(89, 8)` - the midpoint of the two maps' overlapping rows - and `$14`
+    there is not in `OVERWORLD`'s passable list. The crossing is real (rows 10
+    and 11 of column 89 are walkable and land in Cerulean), but the graph's
+    chosen representative tile is one the player cannot stand on, so a walk
+    driven by that hop stalls one tile short of a map edge that is otherwise
+    open.
+    """
+    route4 = rom_maps.parse_map(rom, _MAP_ROUTE_4)
+    moon_1f = rom_maps.parse_map(rom, _MAP_MT_MOON_1F)
+    b1f = rom_maps.parse_map(rom, _MAP_MT_MOON_B1F)
+    b2f = rom_maps.parse_map(rom, _MAP_MT_MOON_B2F)
+
+    # Route 4's west half reaches the Mt Moon door, and the door's record
+    # really is Mt Moon 1F's.
+    landing = _legally_reachable(rom, route4, headers, pairs, (9, 17))
+    door = next(w for w in route4.warps if (w.x, w.y) == (18, 5))
+    assert (door.x, door.y) in landing
+    assert door.dest_map == _MAP_MT_MOON_1F
+    inside = _warp_landing(moon_1f, door)
+    assert (inside.x, inside.y) in _legally_reachable(
+        rom, moon_1f, headers, pairs, (inside.x, inside.y)
+    )
+
+    # 1F's whole floor is one component, and it holds the stair down.
+    from_door = _legally_reachable(rom, moon_1f, headers, pairs, (inside.x, inside.y))
+    assert (5, 5) in from_door
+    stair = next(w for w in moon_1f.warps if (w.x, w.y) == (5, 5))
+    assert stair.dest_map == _MAP_MT_MOON_B1F
+    assert (b1f.warps[stair.dest_warp].x, b1f.warps[stair.dest_warp].y) == (5, 5)
+
+    # B1F's landing chamber holds the stair that leads to B2F's *trunk road* -
+    # and not the one to the `(25, 9)` pocket, which is a dead end.
+    down_stairs = _legally_reachable(rom, b1f, headers, pairs, (5, 5))
+    assert (21, 17) in down_stairs
+    to_b2f = next(w for w in b1f.warps if (w.x, w.y) == (21, 17))
+    assert to_b2f.dest_map == _MAP_MT_MOON_B2F
+    assert (b2f.warps[to_b2f.dest_warp].x, b2f.warps[to_b2f.dest_warp].y) == (21, 17)
+
+    # B2F: the fossil is the door, and `(5, 7)` lands in B1F's Route 4 chamber.
+    past_fossil = _legally_reachable(
+        rom, b2f, headers, pairs, (21, 17), opened=frozenset({(12, 6)})
+    )
+    assert (5, 7) in past_fossil
+    up = next(w for w in b2f.warps if (w.x, w.y) == (5, 7))
+    assert up.dest_map == _MAP_MT_MOON_B1F
+    assert (b1f.warps[up.dest_warp].x, b1f.warps[up.dest_warp].y) == (23, 3)
+
+    # B1F's Route 4 chamber is entered only by that stair, and holds the door.
+    to_route4 = _legally_reachable(rom, b1f, headers, pairs, (23, 3))
+    assert (27, 3) in to_route4
+    out = next(w for w in b1f.warps if (w.x, w.y) == (27, 3))
+    assert out.dest_map is None, "Mt Moon's Route 4 exit is a LAST_MAP warp"
+    back = route4.warps[out.dest_warp]
+    assert (back.x, back.y) == (24, 5)
+
+    # Route 4's east half opens from that landing as far as ordinary walking
+    # goes: to column 79, on rows 6 and 8. What joins that frontier to the
+    # map's east edge is Route 4's one-way ledge drop (down from row 8 onto row
+    # 10, over a row of `$37`/`$36` drop tiles), which is the second of the two
+    # mechanics `tileset_collision.py`'s docstring names as deliberately
+    # unmodeled - so this test stops here rather than planning through it, and
+    # the ledge is what the live walk has to actually press.
+    east_of_moon = _legally_reachable(rom, route4, headers, pairs, (24, 5))
+    width_tiles = route4.width_blocks * 2
+    assert max(x for x, _ in east_of_moon) == 79
+    assert {(79, 6), (79, 8)} <= east_of_moon
+    for row in (10, 11):
+        assert is_walkable(rom, route4, headers, width_tiles - 1, row) is True
+        assert (width_tiles - 1, row) not in east_of_moon

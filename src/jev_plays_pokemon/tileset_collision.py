@@ -100,30 +100,88 @@ the dungeon as a wall; the same wrong corner reads raw `22` (impassable)
 where `(1, 0)` reads `21` (passable) at `(3, 5)` on Mt Moon B2F - the single
 tile joining the `(5, 7)` stair's pocket to the open floor north of it -
 which reported the whole northwest wing, and with it the only way out of the
-dungeon towards Route 4, as sealed. PyBoy's live `game_area_collision()`
-cannot arbitrate between the corners: it too reports one fixed sub-tile per
-cell (which is how `tests/test_tileset_collision.py` reads it, at even
-indices), and on the blocks where the two readings disagree both left-column
-tiles are `21`, so its answer tracks this one rather than the old one.
+dungeon towards Route 4, as sealed.
+
+The two readings are arbitrated by the buffer the ROM itself reads. Both of its
+collision checks go through the `coord` macro, so the bytes in play are
+`wTileMap`'s; PyBoy's `game_area_collision()` is *not* that buffer (it reports
+one graphics-level walkability flag per cell, `$00`/`$01` only, and agrees with
+neither reading on Mt Moon's blocks), but WRAM at `$C3A0` is: read there at a
+real booted position on Mt Moon B2F, `raw_tile_id` reproduces the buffer
+exactly - 86 tiles, 0 mismatches, at stride 20 with the world tile at
+`(8 + 2 * dx, 9 + 2 * dy)`, which is `lda_coord 8, 9`'s own frame. The player's
+standing cell there reads `$0a/$0b/$1a/$1b` across its four 8x8 tiles, exactly
+the up-stairs block quadrant above, and the sampled one is `$1a` = raw 26.
+
+## Tile-pair collisions
+
+`is_walkable` answers `CheckTilePassable`'s question - "is the raw tile in front in this
+tileset's passable list?" - and that is only the *second* of the two checks
+`pret/pokered`'s `home/overworld.asm` runs before it lets an ordinary step happen:
+
+```text
+; if no sprite collision
+        ld hl, TilePairCollisionsLand
+        call CheckForJumpingAndTilePairCollisions
+        jr c, .collision
+        call CheckTilePassable
+        jr nc, .noCollision
+```
+
+The first one is `data/tilesets/pair_collision_tile_ids.asm`, whose own header comment
+says what it is for - "these entries indicate that the player may not cross between tile 1
+and tile 2; it's mainly used to simulate differences in elevation" - and whose eleven land
+rows (four `CAVERN`, seven `FOREST`) and three water rows each end in a `$FF`: `CAVERN`
+being Mt Moon's tileset, and four of its land rows pairing `CAVERN $05` - the plain floor
+most of the dungeon is made of - with a different floor ID:
+
+```text
+TilePairCollisionsLand::
+        db CAVERN, $20, $05
+        db CAVERN, $41, $05
+        ...
+        db CAVERN, $05, $21
+```
+
+Four of those rows pair `CAVERN $05` - the plain floor most of Mt Moon is made of - with a
+different floor ID, and `CheckForTilePairCollisions` compares the *standing* tile against
+both halves of a pair, so the blocked crossing is two-way. This matters more than it
+looks: measured on Mt Moon B2F, `is_walkable` alone calls 483 of the tiles around the
+stair landing at `(25, 9)` walkable, while applying the pair rule leaves 67 legally
+reachable, because the tileset's corridors are `$05` and the landing's own band is `$20`.
+Every refusal `test_navigation`'s walker has recorded in that dungeon - `down (24, 11) ->
+(24, 12)`, `(25, 11) -> (25, 12)` … `(35, 11) -> (35, 12)`, the whole width of a corridor
+the passable list calls open - is one of those `$20 -> $05` crossings. A planner that
+cannot see the rule routes straight through it, the walk presses into it press after
+press, and the tiles it blacklists on the way are tiles the map was never going to allow.
+
+Both tables are compiled back-to-back in bank 0 (where a CPU address *is* a file
+offset), each `$FF`-terminated, three bytes per row. `_TILE_PAIR_COLLISIONS_FILE_OFFSET`
+is anchored the same way the tileset header table above is: the 6-byte run
+`11 20 05 11 41 05` - `CAVERN $20 $05` then `CAVERN $41 $05`, the table's first two rows -
+appears exactly once in `pokemon_red.gb`, at file offset 3198. Two things keep the anchor
+from being self-confirming: `FOREST`/`CAVERN`'s tileset IDs (`3`/`17`) come from the
+tileset header table decoded above and not from this table, and `parse_tile_pair_
+collisions` refuses to return unless the bytes it walked are structurally the two tables
+pokered compiles - two `$FF` terminators, every row's tileset ID a real one. So the shape
+is checked against the format and the contents are checked against
+`data/tilesets/pair_collision_tile_ids.asm` row for row by `tests/test_tileset_
+collision.py`, rather than assumed.
 
 ## What this doesn't model
 
-Three Gen 1 movement mechanics sit outside plain per-tile passability and
-aren't modeled here: ledges (a handful of raw tile IDs, listed in
-`pret/pokered`'s `data/tilesets/ledge_tiles.asm`, that read as impassable
-under an ordinary check but are a one-directional hop from a specific
-standing tile); tile-pair collisions (`pair_collision_tile_ids.asm`, a
-same-tileset blocked-pair list for elevation changes - `CAVERN` and `FOREST`
-entries and no `OVERWORLD` one, which is the only tileset this ticket's own
-Route 3 problem needed); and gym spinners, whose tile IDs
-`data/tilesets/spinner_tiles.asm` lists as ordinary tile IDs that appear in
-their own tileset's passable list like any floor tile, and which
-`engine/overworld/spinners.asm` then uses to throw the player across the room.
-The first and third are both "this module says walkable, and the game does
-something other than walk" cases, which is why `raw_tile_id` is public: a
-caller planning around them needs the ID, not just the yes/no. A route this
-module finds is real ordinary walking; a route it doesn't find might still
-exist via a ledge jump this module can't see.
+Two Gen 1 movement mechanics sit outside plain per-tile passability and aren't modeled
+here: ledges (a handful of raw tile IDs, listed in `pret/pokered`'s
+`data/tilesets/ledge_tiles.asm`, that read as impassable under an ordinary check but are a
+one-directional hop from a specific standing tile - `engine/overworld/ledges.asm` gates
+them on `wCurMapTileset == OVERWORLD`, so they are a route-between-maps mechanic and
+never a dungeon one); and gym spinners, whose tile IDs `data/tilesets/spinner_tiles.asm`
+lists as ordinary tile IDs that appear in their own tileset's passable list like any floor
+tile, and which `engine/overworld/spinners.asm` then uses to throw the player across the
+room. Both are "this module says walkable, and the game does something other than walk"
+cases, which is why `raw_tile_id` is public: a caller planning around them needs the ID,
+not just the yes/no. A route this module finds is real ordinary walking; a route it
+doesn't find might still exist via a ledge jump this module can't see.
 """
 
 from __future__ import annotations
@@ -144,6 +202,11 @@ _BLOCK_WIDTH = 4
 _SAMPLE_ROW_IN_CELL = 1
 _SAMPLE_COL_IN_CELL = 0
 _COLLISION_LIST_TERMINATOR = 0xFF
+# `TilePairCollisionsLand`, with `TilePairCollisionsWater` compiled immediately after it
+# (see the module docstring's "Tile-pair collisions" section for the anchor).
+_TILE_PAIR_COLLISIONS_FILE_OFFSET = 3198
+_TILE_PAIR_COLLISION_TABLES = 2
+_PAIR_COLLISION_ENTRY_SIZE = 3
 
 
 @dataclass(frozen=True)
@@ -241,3 +304,69 @@ def is_walkable(
     if tile is None:
         return None
     return tile in headers[rmap.tileset_id].passable_tile_ids
+
+
+def parse_tile_pair_collisions(rom: bytes) -> frozenset[tuple[int, int, int]]:
+    """`(tileset_id, first_tile, second_tile)` for every row of `pret/pokered`'s
+    `data/tilesets/pair_collision_tile_ids.asm` - the crossings
+    `CheckForTilePairCollisions` refuses before `CheckTilePassable` ever runs
+    (see the module docstring's "Tile-pair collisions" section).
+
+    The two tables are walked as the assembler lays them down: three bytes per
+    row, a `$FF` terminator per table, `TilePairCollisionsWater` immediately
+    after `TilePairCollisionsLand`'s terminator. Both are validated rather than
+    trusted - every row's tileset ID has to be one of the tileset header table's
+    own IDs and the terminators have to be where the format says they are -
+    because a walk off the end of the first table would otherwise return the
+    *next* table's bytes as blocked pairs and silently wall off a tileset.
+    """
+    rows: list[tuple[int, int, int]] = []
+    offset = _TILE_PAIR_COLLISIONS_FILE_OFFSET
+    for table in range(_TILE_PAIR_COLLISION_TABLES):
+        while rom[offset] != _COLLISION_LIST_TERMINATOR:
+            tileset_id = rom[offset]
+            if tileset_id >= _TILESET_COUNT:
+                raise ValueError(
+                    f"tile-pair collision table at offset {offset} names tileset"
+                    f" {tileset_id}, which is not one of the {_TILESET_COUNT}"
+                    " decoded from the tileset header table"
+                )
+            rows.append((tileset_id, rom[offset + 1], rom[offset + 2]))
+            offset += _PAIR_COLLISION_ENTRY_SIZE
+        if table + 1 < _TILE_PAIR_COLLISION_TABLES:
+            offset += 1
+    return frozenset(rows)
+
+
+def crosses_blocked_pair(
+    rom: bytes,
+    rmap: RomMap,
+    headers: tuple[TilesetHeader, ...],
+    pair_collisions: frozenset[tuple[int, int, int]],
+    here: tuple[int, int],
+    there: tuple[int, int],
+) -> bool:
+    """Whether the ROM refuses the step from world tile `here` to world tile
+    `there` because their raw tile IDs are one of `pret/pokered`'s blocked
+    elevation pairs, even though each is individually walkable.
+
+    Two things about it are easy to get wrong and both are in the ROM's own code.
+    The rule is an *edge* property, not a tile property - `is_walkable` cannot
+    express it, which is why this is a separate call and why `Mt Moon B2F`'s
+    `(24, 12)` reads as walkable and still refuses every step into it. And it is
+    two-way: `CheckForTilePairCollisions` matches the standing tile against
+    either half of a pair and then tests the tile in front against the other, so
+    `pair` order in `pair_collision_tile_ids.asm` carries no direction - which is
+    what separates it from a ledge, the other mechanic that makes a tile behave
+    differently in each direction.
+    """
+    tileset_id = rmap.tileset_id
+    here_tile = raw_tile_id(rom, rmap, headers, *here)
+    there_tile = raw_tile_id(rom, rmap, headers, *there)
+    if here_tile is None or there_tile is None:
+        return False
+    return (tileset_id, here_tile, there_tile) in pair_collisions or (
+        tileset_id,
+        there_tile,
+        here_tile,
+    ) in pair_collisions

@@ -22,7 +22,9 @@ from jev_plays_pokemon.navigation import (
 )
 from jev_plays_pokemon.rom_maps import load_rom, parse_all_maps
 from jev_plays_pokemon.tileset_collision import (
+    crosses_blocked_pair,
     is_walkable,
+    parse_tile_pair_collisions,
     parse_tileset_headers,
     raw_tile_id,
 )
@@ -1070,13 +1072,21 @@ _MAP_GEOMETRY: dict[
 _ROM_CACHE: list = []
 
 
-def _rom_parse() -> tuple[bytes, dict, tuple]:
-    """The ROM bytes, its parsed maps, and its parsed tileset headers - parsed
-    once per module, since every one of these walks asks for the same three."""
+def _rom_parse() -> tuple[bytes, dict, tuple, frozenset[tuple[int, int, int]]]:
+    """The ROM bytes, its parsed maps, its parsed tileset headers, and its
+    blocked tile-pair crossings - parsed once per module, since every one of
+    these walks asks for the same four."""
     if not _ROM_CACHE:
         rom = load_rom(ROM_PATH)
-        _ROM_CACHE.extend((rom, parse_all_maps(rom), parse_tileset_headers(rom)))
-    return _ROM_CACHE[0], _ROM_CACHE[1], _ROM_CACHE[2]
+        _ROM_CACHE.extend(
+            (
+                rom,
+                parse_all_maps(rom),
+                parse_tileset_headers(rom),
+                parse_tile_pair_collisions(rom),
+            )
+        )
+    return _ROM_CACHE[0], _ROM_CACHE[1], _ROM_CACHE[2], _ROM_CACHE[3]
 
 
 # Maps whose tiles throw the player, by the raw tile IDs that do it.
@@ -1115,7 +1125,7 @@ def _map_obstacles(
     plan the walk can follow.
     """
     if map_id not in _MAP_GEOMETRY:
-        rom, maps, headers = _rom_parse()
+        rom, maps, headers, _pairs = _rom_parse()
         rmap = maps[map_id]
         width = rmap.width_blocks * 2
         height = rmap.height_blocks * 2
@@ -1151,10 +1161,23 @@ def _route_across_map(
     """Shortest walkable tile sequence from `start` to `goal` on one map, or
     `None` if there is none. Breadth-first over the four plain directions - the
     same shape as `travel_graph.find_route`, one tile at a time instead of one
-    map at a time."""
+    map at a time.
+
+    A step is refused if either tile is one the tileset's collision lists call
+    impassable *or* the two tiles are one of the ROM's blocked elevation pairs -
+    the first of the two checks `pret/pokered`'s `home/overworld.asm`'s
+    `CollisionCheckOnLand` runs before it lets an ordinary step happen. The
+    second half is an edge test rather than a tile test, so it cannot live in
+    `_map_obstacles`' solid set and is checked per step here. Mt Moon B2F is
+    what forced it: `(24, 12)` is walkable, and every one of the twelve steps
+    its corridor would take from the `(25, 9)` landing is a `CAVERN $20 -> $05`
+    crossing the ROM refuses - so a plan that could not see the rule sent the
+    walk pressing into a wall the map was never going to open, press after
+    press, and blacklisted tiles that were never the problem.
+    """
     solid, warps = _map_obstacles(map_id)
     blocked = (solid | learned | warps) - {start, goal}
-    _rom, maps, _headers = _rom_parse()
+    rom, maps, headers, pairs = _rom_parse()
     rmap = maps[map_id]
     width, height = rmap.width_blocks * 2, rmap.height_blocks * 2
     seen = {start}
@@ -1168,6 +1191,8 @@ def _route_across_map(
                 if not (0 <= step[0] < width and 0 <= step[1] < height):
                     continue
                 if step in seen or step in blocked:
+                    continue
+                if crosses_blocked_pair(rom, rmap, headers, pairs, (x, y), step):
                     continue
                 seen.add(step)
                 came_from[step] = (x, y)
@@ -1913,6 +1938,28 @@ def test_route3_to_route4_fixture_lands_on_a_rom_verified_tile(pyboy_outdoors):
     assert (state.player_x, state.player_y) == (9, 17)
     assert not state.dialog_open
     assert not state.battle.in_battle
+
+
+_MAP_MT_MOON_B2F = 61
+
+
+def test_the_walk_planner_never_plans_a_step_the_roms_pair_rule_refuses():
+    """A planner-level regression for `crosses_blocked_pair`.
+
+    Mt Moon B2F's `(5, 7)` stair is the only way out of the dungeon towards
+    Route 4, and until the pair rule reached `_route_across_map` the planner
+    happily routed a walk from the `(25, 9)` stair landing to it - a route
+    straight through twelve `CAVERN $20 -> $05` crossings, which is where every
+    one of this repo's recorded `down (n, 11) -> (n, 12)` refusals came from.
+    The plan was not merely hard to walk; the ROM refuses each of those steps,
+    so no amount of pressing walks it. With the rule in place the same query
+    answers `None`, and the floor's real trunk road - from `(21, 17)`, to the
+    mouth of the fossil corridor at `(12, 7)` - still plans.
+    """
+    assert _route_across_map(_MAP_MT_MOON_B2F, (25, 9), (5, 7), frozenset()) is None
+    assert (
+        _route_across_map(_MAP_MT_MOON_B2F, (21, 17), (12, 7), frozenset()) is not None
+    )
 
 
 _MAP_VIRIDIAN_CITY = 1
