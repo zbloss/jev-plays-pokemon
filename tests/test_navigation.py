@@ -553,6 +553,11 @@ _PARTY_COUNT_ADDRESS = 0xD163
 _PARTY_SPECIES_LIST_ADDRESS = 0xD164
 _PARTY_MON_1_ADDRESS = 0xD16B  # matches game_state.py's own
 # _PARTY_MON_BASE_ADDRESS
+_PARTY_MON_HP_OFFSET = 1  # `MON_HP`, the `mon[1:3]` that
+# `_give_overpowered_party` writes and `_resolve_any_battle` tops up mid-fight.
+_OVERPOWERED_HP = 999  # the value `_give_overpowered_party` writes twice (current
+# and max HP) for the reason its own docstring gives: 999 survived every fight
+# encountered while building this, 65000 once froze the battle engine.
 
 _BADGES_ADDRESS = 0xD356  # matches game_state.py's own _BADGES_ADDRESS
 # Bit position per badge, matching game_state.py's own _BADGE_ITEM_IDS order
@@ -715,11 +720,11 @@ def _give_overpowered_party(pyboy: PyBoy) -> None:
     pyboy.memory[_PARTY_SPECIES_LIST_ADDRESS] = 1  # RHYDON's internal index
     pyboy.memory[_PARTY_SPECIES_LIST_ADDRESS + 1] = 0xFF  # list terminator
 
-    stat = (999).to_bytes(2, "big")
+    stat = _OVERPOWERED_HP.to_bytes(2, "big")
     mon = bytearray(44)  # PARTYMON_STRUCT_LENGTH, per game_state.py's own
     # party_struct offset comments
     mon[0] = 1  # species
-    mon[1:3] = stat  # current HP
+    mon[_PARTY_MON_HP_OFFSET : _PARTY_MON_HP_OFFSET + 2] = stat  # current HP
     mon[4] = 0  # status: healthy
     mon[8] = 33  # move 1: TACKLE (real, damaging, nonzero)
     mon[14:17] = _EXP_LEVEL_100.to_bytes(3, "big")  # EXP: see above
@@ -739,10 +744,43 @@ def _in_battle(pyboy: PyBoy) -> bool:
     return bool(battle and battle.in_battle)
 
 
-def _resolve_any_battle(pyboy: PyBoy, max_presses: int = 2000) -> None:
+def _top_up_party_hp(pyboy: PyBoy) -> None:
+    """Rewrites the one thing a fight can take away that decides whether the
+    fight can be lost: the written mon's current HP, and nothing else.
+
+    `_give_overpowered_party`'s 999 is a starting balance, not a floor. Measured
+    walking Cerulean City toward Route 24's edge, the fight the map script forces
+    at `(20, 6)` runs about 1750 presses and the party struct's HP walks 999, 997,
+    995, ... 283, 248, 213, 143, 73, 38, 3, after which `wIsInBattle` clears with
+    the player at map 0 tile `(5, 6)` - the blackout landing
+    `_give_overpowered_party` already records. Its Attack/Defense bytes are
+    decoration, because `pret/pokered` recomputes a battle stat with
+    `CalcSingleStat` from base stats, DVs, stat EXP and level; HP is the one
+    written stat a fight really spends, and a trainer with a status move turns
+    every third or fourth of our presses into one of its own turns plus its own
+    per-turn chip. That is the whole difference between the fights this file used
+    to walk through - a one-or-two-mon Rocket, won inside 454 presses - and the
+    ones past Pewter City: enough mons and enough status to outlast the HP.
+
+    Only HP, and deliberately: re-running `_give_overpowered_party` itself once a
+    press pins HP/PP/status at 999/35/0 and the battle then never advances a
+    single turn - measured over 2000 presses, the same class of engine freeze its
+    own docstring records for the `$FFFFFF` EXP write. Rewriting species, party
+    count, EXP and level under a fight that is mid-turn is too much; the two HP
+    bytes are the minimum that makes the fight a race that cannot be lost.
+    """
+    address = _PARTY_MON_1_ADDRESS + _PARTY_MON_HP_OFFSET
+    hp = _OVERPOWERED_HP.to_bytes(2, "big")
+    pyboy.memory[address] = hp[0]
+    pyboy.memory[address + 1] = hp[1]
+
+
+def _resolve_any_battle(pyboy: PyBoy, max_presses: int = 8000) -> None:
     """Mashes A through a wild or trainer battle already in progress,
-    relying on `_give_overpowered_party`'s stats for a guaranteed win, and
-    re-applies that party afterward (see its own docstring for why).
+    relying on `_give_overpowered_party`'s stats for a guaranteed win, topping up
+    its HP as it goes (see `_top_up_party_hp` for why the fight needs that and why
+    nothing else can be rewritten mid-fight), and re-applying that whole party
+    afterward (see its own docstring for why).
 
     Settles 30 extra frames after every press - confirmed necessary by a
     direct A/B test: without it, a fight where our own Pokemon gets put
@@ -754,11 +792,20 @@ def _resolve_any_battle(pyboy: PyBoy, max_presses: int = 2000) -> None:
     "normal" trainer fight can still take several hundred presses (real
     turns, not a stall) if our own Pokemon keeps getting put back to
     sleep, hence the generous default budget.
+
+    8000 rather than 2000 because the fights past Pewter City need more than
+    that and are not stalled: measured crossing Route 24 and Route 25, eleven
+    separate fights ran 506, 866 and similar presses apiece, and a multi-mon
+    trainer with a status move was still taking turns at press 1975 with the
+    party's PP down from 35 to 23 - sixteen KOs in, i.e. winning on a budget it
+    had already outlived. The old cap surfaced as the AssertionError this
+    function raises, which reads like a stalled fight and is not one.
     """
     for _ in range(max_presses):
         if not _in_battle(pyboy):
             _give_overpowered_party(pyboy)
             return
+        _top_up_party_hp(pyboy)
         execute_button(pyboy, "a")
         pyboy.tick(30, True)
     raise AssertionError(f"battle did not resolve within {max_presses} presses")
