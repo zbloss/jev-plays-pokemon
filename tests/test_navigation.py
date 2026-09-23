@@ -1945,6 +1945,106 @@ def test_walking_to_cerulean_gym_misty_reaches_a_rom_verified_tile(pyboy_outdoor
     assert dialog_opened
 
 
+_MAP_FUCHSIA_GYM = 157  # `constants/map_constants.asm`'s FUCHSIA_GYM ($9D)
+# `constants/event_constants.asm`'s `EVENT_BEAT_KOGA` and the Gym's own six
+# trainers (`EVENT_BEAT_FUCHSIA_GYM_TRAINER_0`..`_5`), derived by replaying that
+# file's `const` chain in `.qwen/tmp/wram.py` rather than counting bits by hand.
+# Koga's own flag is what makes his `.beforeBeat` branch print instead of
+# fighting, and the trainers' are set only to keep their sight lines out of the
+# way of the walk this test makes; neither is what the milestone verifies.
+_EVENT_BEAT_KOGA = 601
+_EVENT_BEAT_FUCHSIA_GYM_TRAINER_0 = 602
+
+_FUCHSIA_GYM_INTERIOR_STATE_PATH = (
+    Path(__file__).resolve().parent / "fixtures" / "fuchsia_gym_interior.state"
+)
+
+
+def _load_fuchsia_gym_interior_fixture(pyboy: PyBoy) -> None:
+    """Loads a captured save state inside Fuchsia Gym - map 157, tile (4, 11), the
+    tile directly below Koga's own record - with `_apply_fixture_prerequisites`'s
+    two writes re-applied on load.
+
+    The door here is the cheapest of the batch, and unlike Vermilion's and
+    Celadon's it is a door the ROM will actually walk the player into:
+    `data/maps/objects/FuchsiaCity.asm`'s `warp_event 5, 27, FUCHSIA_GYM, 1` sits
+    on a tile the town's own walkable list reaches, so `Fly` landing the player at
+    `(19, 28)` - `data/maps/special_warps.asm`'s `fly_warp FUCHSIA_CITY, 19, 28` -
+    and handing `(5, 27)` to `_walk_tiles` is enough; the walk never comes back
+    with `(7, 5, 27)` because the ROM warps the player the frame they step onto
+    it, and the state this file holds is the `(4, 17)` landing that warp hands
+    over, walked up to `(4, 11)` for real. What the fixture spares is the
+    re-run-per-test cost of crossing a town, not the walk through the Gym.
+
+    Two of the writes the loader makes are this Gym's story state rather than
+    terrain, which is what #99 means by setting up story state directly:
+    `EVENT_BEAT_KOGA` would be the badge itself, so the test sets
+    `EVENT_BEAT_KOGA` only in the sense that its absence is what makes pressing
+    "a" produce a dialog instead of a fight - see the test below, which leaves
+    that flag clear on purpose.
+    """
+    with _FUCHSIA_GYM_INTERIOR_STATE_PATH.open("rb") as f:
+        pyboy.load_state(f)
+    pyboy.tick(1, False)
+    _apply_fixture_prerequisites(pyboy)
+    for ordinal in range(
+        _EVENT_BEAT_FUCHSIA_GYM_TRAINER_0, _EVENT_BEAT_FUCHSIA_GYM_TRAINER_0 + 6
+    ):
+        _set_event_flag(pyboy, ordinal)
+
+
+def test_walking_to_fuchsia_gym_koga_reaches_a_rom_verified_tile(pyboy_outdoors):
+    """#100's boot verification for the `soul_badge` milestone: Fuchsia Gym's
+    FUCHSIAGYM_KOGA object (`milestone_targets.py`'s object_index 0), map 157 tile
+    (4, 10).
+
+    `(4, 10)` is Koga's own tile and so, for the reason
+    `test_walking_to_cerulean_gym_misty_reaches_a_rom_verified_tile` gives, a tile
+    no walk can end on - `_map_obstacles` marks every object record solid. The
+    tile this test stands on is `(4, 11)`, one below it, which is where Koga's
+    `STAY, DOWN` in `data/maps/objects/FuchsiaGym.asm` puts his front: facing up
+    from there is facing him. That it is the milestone's own interactive tile and
+    not a neighbour is the thing being checked, and the decode agrees it is the
+    only way to reach it - `_map_obstacles` says `(4, 10)` is solid, `(4, 11)` is
+    not, and both of Fuchsia Gym's door warps are on row 17, eleven tiles below.
+
+    `scripts/FuchsiaGym.asm`'s Koga text is a trainer `.beforeBeat` branch, the
+    same shape as Brock's and Misty's: with `EVENT_BEAT_KOGA` clear it prints
+    first and only then calls `EngageMapTrainer`, so `dialog_open` is what a boot
+    can observe here, and this test never completes the fight. The six Gym
+    trainers' own flags are set by the loader so their sight lines do not turn the
+    walk to `(4, 11)` into a detour; Koga's is left clear because that is the
+    whole test.
+    """
+    _load_fuchsia_gym_interior_fixture(pyboy_outdoors)
+    assert extract_game_state(pyboy_outdoors).map_id == _MAP_FUCHSIA_GYM
+
+    solid, _warps = _map_obstacles(_MAP_FUCHSIA_GYM)
+    assert (4, 10) in solid, "Koga's tile should be solid to a walk"
+    assert (4, 11) not in solid, "the tile in front of Koga should be walkable"
+    assert not _event_flag_is_set(pyboy_outdoors, _EVENT_BEAT_KOGA), (
+        "beating Koga first would replace his dialog with nothing"
+    )
+
+    assert _walk_tiles(
+        pyboy_outdoors, 4, 11, max_steps=120, map_id=_MAP_FUCHSIA_GYM
+    ) == (
+        _MAP_FUCHSIA_GYM,
+        4,
+        11,
+    )
+    execute_button(pyboy_outdoors, "up")
+    pyboy_outdoors.tick(30, True)
+    pyboy_outdoors.button("a", 2)
+    dialog_opened = False
+    for _ in range(12):
+        pyboy_outdoors.tick(30, True)
+        if extract_game_state(pyboy_outdoors).dialog_open:
+            dialog_opened = True
+            break
+    assert dialog_opened
+
+
 _MAP_BILLS_HOUSE = 88  # `constants/map_constants.asm`'s BILLS_HOUSE
 # `pret/pokered`'s `constants/event_constants.asm` ordinals for the Bill quest,
 # derived the same way `milestones.py` derives its own - by replaying that file's
