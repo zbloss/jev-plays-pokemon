@@ -1797,6 +1797,107 @@ def test_walking_to_pewter_gym_brock_reaches_a_rom_verified_tile(pyboy_outdoors)
     assert dialog_opened
 
 
+_CERULEAN_GYM_INTERIOR_STATE_PATH = (
+    Path(__file__).resolve().parent / "fixtures" / "cerulean_gym_interior.state"
+)
+
+
+def _load_cerulean_gym_interior_fixture(pyboy: PyBoy) -> None:
+    """Loads a captured save state inside Cerulean Gym - map 65, tile (4, 13),
+    the first walkable tile inside the Gym's own door - with
+    `_apply_fixture_prerequisites`'s two writes re-applied on load.
+
+    The way here is this batch's longest chain, and every link of it was
+    pressed rather than teleported: Route 4 `(9, 17)` -> Mt Moon 1F -> B1F ->
+    B2F's trunk road -> the fossil corridor -> B2F `(5, 7)`'s stair -> B1F
+    `(5, 7)` -> B1F `(27, 3)`'s stair -> Route 4 `(27, 3)` -> `(79, 8)` -> the
+    one-way ledge down to `(79, 10)` -> `(89, 10)` -> Route 4's east edge ->
+    Cerulean City `(0, 18)` -> `(30, 20)` -> the Gym's door at `(30, 19)`,
+    which is what puts the player at the tile this state starts on. Each leg
+    was driven as its own map - the walker is given `map_id` and stops the
+    moment the ROM moves the player anywhere else - and each leg's landing
+    tile was read back out of WRAM before the next leg was started, which is
+    the ordering #90's gotcha about position reads taken straight after a warp
+    calls for.
+
+    It is a fixture rather than a live crossing for the same reason
+    `_load_pewter_gym_interior_fixture` is one, and the reason is cost rather
+    than possibility: the chain above is a few hundred tile presses across five
+    maps with sight-triggered Mt Moon rockets, a one-way ledge and two
+    sight-triggered Gym trainers in it, and that other docstring already
+    records what re-running it per test costs - a fight's frame length varies
+    run to run, which changes how much of the map the walk gets through before
+    the step budget is gone, and one measured run took over 3x as long and
+    covered a fraction of the distance. Everything up to the Gym door is
+    scenery for the milestone under test; the two Gym trainers standing between
+    this tile and Misty are still fought for real inside the test.
+    """
+    with _CERULEAN_GYM_INTERIOR_STATE_PATH.open("rb") as f:
+        pyboy.load_state(f)
+    pyboy.tick(1, False)
+    _apply_fixture_prerequisites(pyboy)
+
+
+def test_walking_to_cerulean_gym_misty_reaches_a_rom_verified_tile(pyboy_outdoors):
+    """#99's boot verification for the `cascade_badge` milestone: Cerulean
+    Gym's CERULEANGYM_MISTY object (`milestone_targets.py`'s object_index 0),
+    map 65 tile (4, 2).
+
+    `(4, 2)` is not a tile any walk can end on, and that is a property of every
+    Gym milestone in this batch rather than a problem with this one:
+    `resolve_target_coordinates` reads its `(x, y)` straight off the selected
+    *object record*, while `_map_obstacles` marks every object record's tile
+    solid - objects are the second obstacle layer, the one no terrain decode
+    can see (its own docstring says so). Checked against the ROM's own decode,
+    all five Gym targets in this batch come back `solid=True
+    object-tile=True`, Pewter Gym's `(4, 1)` included. So #99's criterion -
+    "`dialog_open` goes `True` when standing on the milestone's parsed target
+    tile and pressing 'a'" - is only satisfiable the way the already-merged
+    `boulder_badge` test satisfies it: walk up to the NPC, come to rest on the
+    tile the ROM does allow, face them, press "a".
+
+    Aiming at the NPC's own tile is not sufficient here, and that was measured
+    with both walkers this file has. The merged test's `_walk_toward` (the
+    navigation macro's on-screen A*) gives up two rooms short and comes to rest
+    at `(5, 7)`; this file's own `_walk_tiles` gets to `(5, 3)`, diagonal to
+    Misty, where "a" addresses the floor instead of her. So the walk is aimed
+    at the tile that is both landable and facing her, which the decode picks
+    out uniquely: of `(4, 2)`'s four neighbours, `(3, 2)` and `(4, 1)` are wall,
+    `(4, 3)` reads walkable and was still reached by none of three separate
+    attempts (every one came back `(5, 3)`), and `(5, 2)` - due east of her,
+    approached up the east side of the room's upper corridor - is the tile
+    `_walk_tiles` lands on exactly, needing one "left" press to face her. The
+    assertion below re-derives that split from the ROM instead of taking this
+    paragraph's word for it.
+
+    Talking to Misty before beating her is `CeruleanGymMistyText`'s
+    `.beforeBeat` branch: it prints `.PreBattleText`, sets
+    `BIT_TALKED_TO_TRAINER` and only then starts the fight, so `dialog_open` is
+    the first thing the ROM puts on the screen. That is the same shape as the
+    Brock test above, which likewise stops at the pre-battle text instead of
+    finishing the fight.
+    """
+    _load_cerulean_gym_interior_fixture(pyboy_outdoors)
+    assert extract_game_state(pyboy_outdoors).map_id == 65  # Cerulean Gym
+
+    solid, _warps = _map_obstacles(65)
+    assert (4, 2) in solid  # the parsed target is Misty's own tile
+    assert (5, 2) not in solid
+
+    assert _walk_tiles(pyboy_outdoors, 5, 2, max_steps=200, map_id=65) == (65, 5, 2)
+
+    execute_button(pyboy_outdoors, "left")
+    pyboy_outdoors.tick(30, True)
+    pyboy_outdoors.button("a", 2)
+    dialog_opened = False
+    for _ in range(12):
+        pyboy_outdoors.tick(30, True)
+        if extract_game_state(pyboy_outdoors).dialog_open:
+            dialog_opened = True
+            break
+    assert dialog_opened
+
+
 _PEWTER_TO_ROUTE3_STATE_PATH = (
     Path(__file__).resolve().parent / "fixtures" / "pewter_to_route3.state"
 )
