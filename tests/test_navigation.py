@@ -2153,6 +2153,183 @@ def test_walking_to_cinnabar_gym_blaine_reaches_a_rom_verified_tile(pyboy_outdoo
     assert dialog_opened
 
 
+_MAP_SAFFRON_GYM = 178  # `constants/map_constants.asm`'s SAFFRON_GYM ($B2)
+# `constants/event_constants.asm`'s `EVENT_BEAT_SABRINA` ($361) and the seven trainers this
+# Gym declares (`EVENT_BEAT_SAFFRON_GYM_TRAINER_0`..`_6`, $362..$368), both read off
+# `.qwen/tmp/wram.py`'s replay of that file's `const` chain rather than counted by hand.
+# Sabrina's own flag is the badge, so it is the one flag this test leaves clear.
+_EVENT_BEAT_SABRINA = 865
+_EVENT_BEAT_SAFFRON_GYM_TRAINER_0 = 866
+
+_SAFFRON_GYM_INTERIOR_STATE_PATH = (
+    Path(__file__).resolve().parent / "fixtures" / "saffron_gym_interior.state"
+)
+
+# Saffron Gym's own door landing, the tile `data/maps/objects/SaffronGym.asm`'s
+# `warp_event 8, 17, LAST_MAP, 3` hands over, and Sabrina's front tile - she is
+# `object_event 9, 8, SPRITE_SABRINA, STAY, DOWN`, so facing up from (9, 9) is facing her.
+_SAFFRON_GYM_LANDING = (8, 17)
+_SAFFRON_GYM_STAND = (9, 9)
+
+# The pad chain out of the entrance room, measured press by press twice over
+# (`.qwen/tmp/ss100b_chain1.txt`, `ss100b_chain2.txt`, which agree tile for tile). Saffron
+# Gym is nine sealed rooms - rows y=0, y=6 and y=12 are solid end to end and columns x=6
+# and x=13 are solid top to bottom - and the only joins are its thirty same-map warp
+# records, which `data/tilesets/warp_pad_hole_tile_ids.asm`'s `db FACILITY, $20` makes
+# teleports rather than footsteps. `_map_obstacles` files those records under `warps` and
+# `_route_across_map` refuses to plan *through* a warp tile, so no planned walk can cross a
+# pad: this is the route the planner cannot see, and each hop below is checked against the
+# partner tile the ROM's own warp table names rather than against a number typed in here.
+_SAFFRON_GYM_PAD_ROUTE = (
+    ("up", "right", "right", "right", "up"),  # (8,17) -> pad (11,15) -> (19,17)
+    ("up", "up"),  # pad (19,15) -> (19, 9)
+    ("down", "down"),  # pad (19,11) -> ( 1, 9)
+    ("down", "down"),  # pad ( 1,11) -> ( 5, 5)
+    ("left", "left", "left", "left"),  # pad ( 1, 5) -> (11,11)
+    ("up", "up", "left", "left"),  # (11,11) -> (9,9), no pad
+)
+
+
+def _saffron_gym_pads() -> dict[tuple[int, int], tuple[int, int]]:
+    """`{pad_tile: landing_tile}` for Saffron Gym's teleport pads, read from the map's
+    own warp records instead of typed out: a record whose destination map is the Gym
+    itself hands over the tile its `dest_warp` indexes in the same table.
+    """
+    _rom, maps, _headers, _pairs = _rom_parse()
+    rmap = maps[_MAP_SAFFRON_GYM]
+    return {
+        (warp.x, warp.y): (rmap.warps[warp.dest_warp].x, rmap.warps[warp.dest_warp].y)
+        for warp in rmap.warps
+        if warp.dest_map == _MAP_SAFFRON_GYM
+    }
+
+
+def _load_saffron_gym_interior_fixture(pyboy: PyBoy) -> None:
+    """Loads a captured save state on Saffron Gym's own landing tile - map 178, tile
+    (8, 17) - with `_apply_fixture_prerequisites`'s writes and this Gym's seven trainer
+    flags re-applied on load.
+
+    The way here was walked rather than teleported, and it needed one piece of story
+    state no earlier milestone in this batch needed. Saffron City's Gym door at
+    `data/maps/objects/SaffronCity.asm`'s `warp_event 34, 3, SAFFRON_GYM, 1` is blocked by
+    `object_event 34, 4, SPRITE_ROCKET, STAY, NONE` - a `STAY`/`NONE` record, so the sprite
+    never walks off the tile and waiting is not an option, and the six-byte `object_event`
+    macro carries no state byte at all, so the record itself cannot hide him. What hides
+    him is `wToggleableObjectFlags`, the array `engine/overworld/toggleable_objects.asm`
+    consults every frame through `CheckSpriteAvailability`'s `IsObjectHidden`, at WRAM
+    $D5A6; `constants/toggle_constants.asm`'s `TOGGLE_SAFFRON_CITY_3 ; 0C` is byte 1
+    ($D5A7) mask $10, and `scripts/SilphCo11F.asm`'s `SilphCo11FTeamRocketLeavesScript` is
+    who sets it legitimately - it is the story bit that empties Saffron's streets after
+    Giovanni. Setting it directly is exactly what #99 means by setting prerequisite story
+    state rather than replaying the game, and it is the game's own switch rather than a
+    position poke: with it clear the step onto (34, 4) is refused and with it set the same
+    press goes in, which `.qwen/tmp/ss100b_r2_D.txt` pins by blanking the sprite's picture
+    id instead and watching the step stay refused.
+
+    So the capture is one continuous cold-boot run: the three Fly writes asking the ROM for
+    its own warp to Saffron City - `data/maps/special_warps.asm`'s
+    `fly_warp SAFFRON_CITY, 9, 30`, which is where the ROM really lands the player, at
+    (10, 9, 30) in four separate boots - then that toggle write, then
+    `_walk_tiles(map 10, 34, 4)` to the door lip, then one "up" press, which steps onto the
+    door and warps. No `wX`, no `wY`, no `wCurMap`. The file holds the (178, 8, 17) landing
+    and nothing more: the maze is walked by the test.
+    """
+    with _SAFFRON_GYM_INTERIOR_STATE_PATH.open("rb") as f:
+        pyboy.load_state(f)
+    pyboy.tick(1, False)
+    _apply_fixture_prerequisites(pyboy)
+    for ordinal in range(
+        _EVENT_BEAT_SAFFRON_GYM_TRAINER_0,
+        _EVENT_BEAT_SAFFRON_GYM_TRAINER_0 + 7,
+    ):
+        _set_event_flag(pyboy, ordinal)
+
+
+def test_walking_to_saffron_gym_sabrina_reaches_a_rom_verified_tile(pyboy_outdoors):
+    """#100's boot verification for the `marsh_badge` milestone: Saffron Gym's
+    SAFFRONGYM_SABRINA object (`milestone_targets.py`'s object_index 0), map 178 tile
+    (9, 8).
+
+    (9, 8) is Sabrina's own tile and so, for the reason
+    `test_walking_to_cerulean_gym_misty_reaches_a_rom_verified_tile` gives, a tile no walk
+    can end on - `_map_obstacles` marks every object record solid. The tile this test
+    stands on is (9, 9), directly below her, from which facing up is facing her; the
+    assertion below re-derives both from `_map_obstacles` rather than taking this
+    docstring's word for it.
+
+    What makes this Gym different from the other four in the batch is that arriving on its
+    landing tile is not most of the journey, it is none of it. Rows y=0, y=6 and y=12 are
+    solid across the whole width and columns x=6 and x=13 are solid top to bottom, so the
+    entrance room shares no walkable edge with Sabrina's room: pad-free reach from (8, 17)
+    is 25 tiles, none of them in x 7..12, y 7..11, and
+    `_route_across_map(178, (8, 17), (9, 9))` comes back with no route at all. The thirty
+    same-map warp records are the only joins, and because `_map_obstacles` files warp tiles
+    under `warps` and `_route_across_map` will not plan through one, `_walk_tiles` inside
+    this Gym walks (8,17) to (8,14) and then presses "up" into the solid row y=12 forever.
+    So the walk to the milestone's tile is performed here with the presses the maze
+    actually needs, and it is checked press by press: a step lands on the tile ahead, a
+    pad hop lands on the tile the ROM's own warp table names as that pad's partner, and
+    nothing about the route is taken on trust from a save state.
+
+    `scripts/SaffronGym.asm`'s Sabrina text is the same trainer `.beforeBeat` shape as
+    Brock's, Misty's, Koga's and Blaine's: with `EVENT_BEAT_SABRINA` clear it prints -
+    `_SaffronGymSabrinaText`, "I had a vision of your arrival!" - and only then calls
+    `EngageMapTrainer`, so `dialog_open` is what a boot can observe and this test never
+    completes the fight. The seven trainers' flags are set by the loader to keep their
+    sight lines out of the maze walk's way; Sabrina's is left clear because that absence
+    is the whole test.
+    """
+    _load_saffron_gym_interior_fixture(pyboy_outdoors)
+    state = extract_game_state(pyboy_outdoors)
+    assert (state.map_id, state.player_x, state.player_y) == (
+        _MAP_SAFFRON_GYM,
+        *_SAFFRON_GYM_LANDING,
+    )
+
+    solid, _warps = _map_obstacles(_MAP_SAFFRON_GYM)
+    assert (9, 8) in solid, "Sabrina's tile should be solid to a walk"
+    assert (9, 9) not in solid, "the tile in front of Sabrina should be walkable"
+    assert not _event_flag_is_set(pyboy_outdoors, _EVENT_BEAT_SABRINA), (
+        "beating Sabrina first would replace her dialog with nothing"
+    )
+
+    pads = _saffron_gym_pads()
+    steps = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0)}
+    here = _SAFFRON_GYM_LANDING
+    for buttons in _SAFFRON_GYM_PAD_ROUTE:
+        for button in buttons:
+            ahead = (here[0] + steps[button][0], here[1] + steps[button][1])
+            # A pad is stepped *onto* first, so the tile the press has to end on is the
+            # pad's partner, not the pad; `execute_button` returns once the player has
+            # moved, which for a pad is the pad tile, and the warp lands ~60 frames later.
+            expected = pads.get(ahead, ahead)
+            execute_button(pyboy_outdoors, button)
+            for _ in range(24):
+                now = extract_game_state(pyboy_outdoors)
+                landed = (now.map_id, now.player_x, now.player_y)
+                if landed[0] != _MAP_SAFFRON_GYM or landed[1:] == expected:
+                    break
+                pyboy_outdoors.tick(10, True)
+            assert landed[0] == _MAP_SAFFRON_GYM, f"{button} left the Gym: {landed}"
+            assert landed[1:] == expected, (
+                f"from {here} pressing {button} aimed at {ahead}"
+                f"{' (a pad)' if ahead in pads else ''} ended at {landed[1:]}"
+            )
+            here = landed[1:]
+
+    assert here == _SAFFRON_GYM_STAND
+    execute_button(pyboy_outdoors, "up")
+    pyboy_outdoors.tick(30, True)
+    pyboy_outdoors.button("a", 2)
+    dialog_opened = False
+    for _ in range(12):
+        pyboy_outdoors.tick(30, True)
+        if extract_game_state(pyboy_outdoors).dialog_open:
+            dialog_opened = True
+            break
+    assert dialog_opened
+
+
 _MAP_BILLS_HOUSE = 88  # `constants/map_constants.asm`'s BILLS_HOUSE
 # `pret/pokered`'s `constants/event_constants.asm` ordinals for the Bill quest,
 # derived the same way `milestones.py` derives its own - by replaying that file's
