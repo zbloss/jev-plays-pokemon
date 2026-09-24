@@ -2045,6 +2045,114 @@ def test_walking_to_fuchsia_gym_koga_reaches_a_rom_verified_tile(pyboy_outdoors)
     assert dialog_opened
 
 
+_MAP_CINNABAR_GYM = 166  # `constants/map_constants.asm`'s CINNABAR_GYM ($A6)
+# `constants/event_constants.asm`'s `EVENT_BEAT_BLAINE` ($299), the seven trainers this
+# Gym declares (`EVENT_BEAT_CINNABAR_GYM_TRAINER_0`..`_6`, $29a..$2a0 - there is no `_7`)
+# and its seven `EVENT_CINNABAR_GYM_GATE*_UNLOCKED` ($2a8..$2ae), all three ranges read
+# off `.qwen/tmp/wram.py`'s replay of that file's `const` chain rather than counted by
+# hand. The gates are terrain rather than story: `scripts/CinnabarGym.asm`'s gate tiles
+# throw the player back unless their flag is already set, and this Gym's maze is walked
+# through six of them. Blaine's own flag is the badge, so it stays clear.
+_EVENT_BEAT_BLAINE = 665
+_EVENT_BEAT_CINNABAR_GYM_TRAINER_0 = 666
+_EVENT_CINNABAR_GYM_GATE0_UNLOCKED = 680
+
+_CINNABAR_GYM_INTERIOR_STATE_PATH = (
+    Path(__file__).resolve().parent / "fixtures" / "cinnabar_gym_interior.state"
+)
+
+
+def _load_cinnabar_gym_interior_fixture(pyboy: PyBoy) -> None:
+    """Loads a captured save state on Cinnabar Gym's own landing tile - map 166, tile
+    (16, 17) - with `_apply_fixture_prerequisites`'s writes and this Gym's flags
+    re-applied on load.
+
+    The capture is one continuous cold-boot run: `boot_past_intro`, then the bag write the
+    island's door actually checks (`scripts/CinnabarIsland.asm`'s locked-door branch tests
+    the bag for `SECRET_KEY`, not an event flag, so there is no flag to set for it), then
+    the three Fly writes asking the ROM for its own warp to Cinnabar Island - no `wX`, no
+    `wY`, no `wCurMap` - then `_walk_tiles` across the island to (18, 4), the tile below
+    `data/maps/objects/CinnabarIsland.asm`'s `warp_event 18, 3, CINNABAR_GYM, 1`, and one
+    "up" press, which steps onto the door and warps. The ROM arrives at (166, 16, 17)
+    because that is `data/maps/objects/CinnabarGym.asm`'s own `warp_event 16, 17, LAST_MAP,
+    2` - the first of its two records, which is the warp the island's `1` names - and the
+    file holds exactly that landing and nothing more: the maze is walked by the test.
+
+    The two flag ranges are written here *and* already present in the file, and that
+    duplication is the point. `cg_land.py`'s first capture was made pristine - loaded on
+    the landing with every Cinnabar flag clear, flags written afterwards - and the walk to
+    Blaine then stopped at (166, 17, 7), stranded partway across the maze by a gate that
+    had decided its behaviour when the map loaded. The same writes made before the door was
+    crossed reach (166, 3, 4) exactly, twice over. So the fixture has to carry the gates,
+    and the loader re-asserts them so that a re-capture which forgets them fails here
+    rather than in the middle of the walk.
+    """
+    with _CINNABAR_GYM_INTERIOR_STATE_PATH.open("rb") as f:
+        pyboy.load_state(f)
+    pyboy.tick(1, False)
+    _apply_fixture_prerequisites(pyboy)
+    for ordinal in range(
+        _EVENT_BEAT_CINNABAR_GYM_TRAINER_0,
+        _EVENT_BEAT_CINNABAR_GYM_TRAINER_0 + 7,
+    ):
+        _set_event_flag(pyboy, ordinal)
+    for ordinal in range(
+        _EVENT_CINNABAR_GYM_GATE0_UNLOCKED,
+        _EVENT_CINNABAR_GYM_GATE0_UNLOCKED + 7,
+    ):
+        _set_event_flag(pyboy, ordinal)
+
+
+def test_walking_to_cinnabar_gym_blaine_reaches_a_rom_verified_tile(pyboy_outdoors):
+    """#100's boot verification for the `volcano_badge` milestone: Cinnabar Gym's
+    CINNABARGYM_BLAINE object (`milestone_targets.py`'s object_index 0), map 166 tile
+    (3, 3).
+
+    Blaine is `object_event 3, 3, SPRITE_MIDDLE_AGED_MAN, STAY, DOWN` in
+    `data/maps/objects/CinnabarGym.asm`, so his own tile is `(3, 3)` and his front tile is
+    `(3, 4)` directly below it - the tile this test stands on, from which facing up is
+    facing him. `(3, 3)` is in every walk's way for the reason
+    `test_walking_to_cerulean_gym_misty_reaches_a_rom_verified_tile` gives: `_map_obstacles`
+    marks an object record's tile solid. The walk this test performs is the Gym's own maze,
+    which `_route_across_map` plans at sixty steps across the six unlocked gates from the
+    (16, 17) landing, so the milestone's tile is reached by walking and not by a write.
+
+    `scripts/CinnabarGym.asm`'s Blaine text is the same trainer `.beforeBeat` shape as
+    Brock's, Misty's and Koga's: with `EVENT_BEAT_BLAINE` clear it prints before it calls
+    `EngageMapTrainer`, so `dialog_open` is what a boot can observe and this test never
+    completes the fight. The seven trainers' flags are set by the loader purely to keep
+    their sight lines out of the maze walk's way; Blaine's is left clear because that
+    absence is the whole test.
+    """
+    _load_cinnabar_gym_interior_fixture(pyboy_outdoors)
+    assert extract_game_state(pyboy_outdoors).map_id == _MAP_CINNABAR_GYM
+
+    solid, _warps = _map_obstacles(_MAP_CINNABAR_GYM)
+    assert (3, 3) in solid, "Blaine's tile should be solid to a walk"
+    assert (3, 4) not in solid, "the tile in front of Blaine should be walkable"
+    assert not _event_flag_is_set(pyboy_outdoors, _EVENT_BEAT_BLAINE), (
+        "beating Blaine first would replace his dialog with nothing"
+    )
+
+    assert _walk_tiles(
+        pyboy_outdoors, 3, 4, max_steps=250, map_id=_MAP_CINNABAR_GYM
+    ) == (
+        _MAP_CINNABAR_GYM,
+        3,
+        4,
+    )
+    execute_button(pyboy_outdoors, "up")
+    pyboy_outdoors.tick(30, True)
+    pyboy_outdoors.button("a", 2)
+    dialog_opened = False
+    for _ in range(12):
+        pyboy_outdoors.tick(30, True)
+        if extract_game_state(pyboy_outdoors).dialog_open:
+            dialog_opened = True
+            break
+    assert dialog_opened
+
+
 _MAP_BILLS_HOUSE = 88  # `constants/map_constants.asm`'s BILLS_HOUSE
 # `pret/pokered`'s `constants/event_constants.asm` ordinals for the Bill quest,
 # derived the same way `milestones.py` derives its own - by replaying that file's
