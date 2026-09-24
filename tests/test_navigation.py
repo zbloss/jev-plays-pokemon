@@ -1364,6 +1364,38 @@ _SCRIPT_SETTLE_CHECKS = 20
 # twelve, of which the first three move nothing at all.
 _ANSWER_PRESS_LIMIT = 25
 
+# How many 10-frame windows `_wait_for_the_map_to_load` will spend on a warp's
+# arrival. 40 = 400 frames, against a measured worst case of ~140 for a room
+# that walks the player in on arrival - see `_walk_tiles`'s warp hook.
+_WARP_SETTLE_CHECKS = 40
+
+
+def _wait_for_the_map_to_load(pyboy: PyBoy) -> None:
+    """Ticks until a warp's arrival stops moving, or 400 frames pass.
+
+    #90's gotcha in its plainest form: the position read the frame `wCurMap`
+    changes still belongs to the trip, not the arrival. Two things move the
+    player after that frame. A map script can walk them several tiles by
+    itself - three of the Elite Four's rooms do exactly that, and
+    `.qwen/tmp/bc_A.txt` traces the walk tile by tile
+    (`245:4,11 245:4,9 245:4,7 245:4,5`) - and `LoadWildData` writes the new
+    floor's own encounter rate, which is the part that turns a long walk into a
+    lost fight (see the warp hook in `_walk_tiles`).
+    """
+    anchor = extract_game_state(pyboy)
+    anchor = (anchor.map_id, anchor.player_x, anchor.player_y)
+    repeats = 0
+    for _ in range(_WARP_SETTLE_CHECKS):
+        pyboy.tick(10, True)
+        state = extract_game_state(pyboy)
+        now = (state.map_id, state.player_x, state.player_y)
+        if now == anchor:
+            repeats += 1
+            if repeats >= _SETTLED_REPEATS:
+                return
+        else:
+            anchor, repeats = now, 0
+
 
 def _fight_what_is_in_the_way(pyboy: PyBoy) -> bool:
     """Answers whatever a directional press walked into, and fights it. Returns
@@ -1583,6 +1615,24 @@ def _walk_tiles(
         dx, dy = _DIRECTION_OFFSETS[direction]
         aimed = (pos[0] + dx, pos[1] + dy)
         landed_map, landed_x, landed_y, fought = _press_and_settle(pyboy, direction)
+        if landed_map != state.map_id:
+            # A door, a stair or a map-edge connection just moved the player to
+            # another map, and `_press_and_settle` reads the arrival the frame
+            # `wCurMap` changes - which is before the new map has finished
+            # loading. Two consequences, both measured. `LoadWildData` runs
+            # after that read, so `wGrassRate` on Pokemon Tower 7F's stair reads
+            # 0 at the transition and 15 once the load completes
+            # (`.qwen/tmp/rate_ab.py`), and `engine/battle/wild_encounters.asm`
+            # rolls on indoor tiles too - so pressing on with the new floor's
+            # rate armed is what made the first `got_poke_flute` attempt lose
+            # presses to a Ghost the fixture party's single damaging move does
+            # no damage to, and report the milestone blocked. And the stale
+            # arrival tile does not equal the tile this press was aimed at, so
+            # without settling first the press is scored as a refusal and the
+            # walker holds it against a door it just went through.
+            _wait_for_the_map_to_load(pyboy)
+            _disable_wild_encounters(pyboy)
+            continue
         if (landed_map, landed_x, landed_y) == (state.map_id, *aimed):
             continue
         if fought:
@@ -3140,6 +3190,7 @@ def test_milestone_travel_graph_hops_viridian_city_into_viridian_gym():
 
 
 _MAP_POKEMON_TOWER_7F = 148  # `constants/map_constants.asm`'s POKEMON_TOWER_7F ($94)
+_MAP_POKEMON_TOWER_6F = 147  # ditto POKEMON_TOWER_6F ($93), 7F's stair below it
 # Ordinals from replaying `constants/event_constants.asm`'s `const` chain in
 # `.qwen/tmp/wram.py` (`wEventFlags` derived `0xd747`, matching the live ROM).
 # The three Rockets are this floor's only obstacle with a sight line, and
@@ -3254,6 +3305,51 @@ def test_walking_to_pokemon_tower_7f_mr_fuji_reaches_a_rom_verified_tile(
     assert not _event_flag_is_set(pyboy_outdoors, _EVENT_GOT_POKE_FLUTE), (
         "the dialog alone must not have awarded the milestone's own flag"
     )
+
+
+def test_a_walk_disarms_the_wild_data_of_the_map_a_warp_landed_on(pyboy_outdoors):
+    """A walk has to re-zero `wGrassRate`/`wWaterRate` *after* the map a warp
+    landed on has finished loading, because the rate the player arrives with is
+    the new map's own and it is written after the position becomes readable.
+
+    This is the mechanism that produced the original `got_poke_flute` negative,
+    and the numbers are measured rather than reasoned: `.qwen/tmp/rate_ab.py`
+    loads the 7F fixture, steps off the stair, walks back onto it and prints
+    `wGrassRate` at four points - 0 the moment `wCurMap` flips, 15 once the load
+    settles, still 15 two hundred frames later. 15 is Pokemon Tower 6F's own
+    `def_grass_wildmons`, and `engine/battle/wild_encounters.asm` rolls on
+    indoor tiles as much as outdoor ones, so a walk that crosses a stair is
+    pressing on with the new floor armed. `_give_overpowered_party` gives the
+    fixture's mon exactly one move (TACKLE), and
+    `data/types/type_matchups.asm:21` is `db NORMAL, GHOST, NO_EFFECT` - on a
+    Tower floor that is an unwinnable fight, which is the
+    `battle did not resolve within N presses` the earlier attempt reported.
+
+    The assertion is deliberately made after a further settle rather than
+    immediately on arrival: `LoadWildData` is the thing being raced here, so a
+    check taken too early would pass against a rate that is about to be
+    rewritten, and this is the same frame range at which the unfixed walker
+    measured 15.
+    """
+    _load_pokemon_tower_7f_interior_fixture(pyboy_outdoors)
+    assert extract_game_state(pyboy_outdoors).map_id == _MAP_POKEMON_TOWER_7F
+
+    # The fixture stands *on* the stair tile, and a warp only fires on the step
+    # onto it, so step off first and aim the walk back at it.
+    execute_button(pyboy_outdoors, "right")
+    pyboy_outdoors.tick(60, True)
+    assert extract_game_state(pyboy_outdoors).player_x == 10
+
+    assert _walk_tiles(
+        pyboy_outdoors, 9, 16, max_steps=8, map_id=_MAP_POKEMON_TOWER_7F
+    ) == (_MAP_POKEMON_TOWER_6F, 9, 16)
+
+    pyboy_outdoors.tick(140, True)
+    assert pyboy_outdoors.memory[_GRASS_RATE_ADDRESS] == 0, (
+        "the floor a warp lands on reloads its own encounter rate; the walk has "
+        "to zero it after that load, not at the transition"
+    )
+    assert pyboy_outdoors.memory[_WATER_RATE_ADDRESS] == 0
 
 
 _MAP_CHAMPIONS_ROOM = 120  # `constants/map_constants.asm`'s CHAMPIONS_ROOM ($78)
