@@ -3106,19 +3106,267 @@ def test_milestone_travel_graph_hops_viridian_city_into_viridian_gym():
 # earth_badge is covered above, by `test_walking_to_viridian_gym_giovanni_
 # reaches_a_rom_verified_tile` - see that test's own docstring for the two
 # things that were actually in the way there, and for why the "unreachable
-# door" note this block used to carry was wrong.
+# door" note this block used to carry was wrong. got_poke_flute and
+# beat_champion are covered below.
 #
-# cascade_badge/got_ss_ticket/thunder_badge/rainbow_badge (#99's original
-# remaining 4, all reachable only via Route 3 -> Route 4 -> Cerulean City
-# per `travel_graph.py`'s own scope) are NOT covered yet. Their blocker is
-# the same second obstacle layer one screen further on: Route 4's own
-# decoded walkability is right and useless on its own, because a wall at
-# x=20-23 splits the map into the pocket Route 3's south connection lands in
-# and the eastern side that owns the Cerulean connection, and the only thing
-# joining them is Route 4's pair of warps into Mt Moon - a three-floor
-# dungeon. `travel_graph.py`'s own "A known false edge" section documents
-# what that does to a route this module returns; the crossing itself is
-# scripted work rather than graph routing.
+# cascade_badge and got_ss_ticket (#99's list) are covered above as well, which
+# is what the two captured crossing fixtures were for: Route 4's own decoded
+# walkability is right and useless on its own, because a wall at x=20-23 splits
+# the map into the pocket Route 3's south connection lands in and the eastern
+# side that owns the Cerulean connection, and the only thing joining them is
+# Route 4's pair of warps into Mt Moon - a three-floor dungeon.
+# `travel_graph.py`'s own "A known false edge" section documents what that does
+# to a route this module returns; the crossing itself is scripted work rather
+# than graph routing, and `route3_to_route4.state` is that work captured.
+#
+# thunder_badge and rainbow_badge are NOT covered, and are not a scripted-work
+# gap: both targets are inside a Gym whose town-side district is sealed to an
+# ordinary walk. Exhaustive press-searches over each whole town (queues emptied
+# naturally, not budget-capped) reach 352 tiles in Vermilion and 799 in Celadon
+# without either district appearing, and both maps' block arrays are byte-identical
+# to pret/pokered's `VermilionCity.blk` (360/360) and `CeladonCity.blk` (450/450).
+# One impassable tile separates the reachable streets from each district -
+# Vermilion (14, 19), Celadon (21, 31) - and each is impassable across all four of
+# its sub-tiles, so this is not the sampling question `tileset_collision.py`
+# answers. Hand presses with `execute_button` from walked-to, ROM-confirmed
+# standing tiles agree: from Vermilion (14, 18) `down`/`left`/`right` are refused
+# while `up` opens; from Celadon (22, 28)/(22, 29)/(22, 30)/(22, 31) every press
+# along the corridor opens and every press into the district is refused (`$12`,
+# `$17`, `$4b`, `$1a` and `$50` - five distinct impassable ids, not one ambiguous
+# tile). Ledges, map connections, back-door warps, tile-pair collision tables and
+# sprite over-blocking were each ruled out against pokered's own data, and Surf
+# explains neither: Vermilion's district is ringed by `$14` water and reachable
+# only over it, while Celadon's sealed district contains no water at all.
+
+
+_MAP_POKEMON_TOWER_7F = 148  # `constants/map_constants.asm`'s POKEMON_TOWER_7F ($94)
+# Ordinals from replaying `constants/event_constants.asm`'s `const` chain in
+# `.qwen/tmp/wram.py` (`wEventFlags` derived `0xd747`, matching the live ROM).
+# The three Rockets are this floor's only obstacle with a sight line, and
+# `EVENT_GOT_POKE_FLUTE` is the milestone's own reward - the flag whose absence
+# is what makes the press below a first meeting rather than a repeat.
+_EVENT_GOT_POKE_FLUTE = 296
+_EVENT_BEAT_POKEMONTOWER_7_TRAINER_0 = 273
+
+_POKEMON_TOWER_7F_INTERIOR_STATE_PATH = (
+    Path(__file__).resolve().parent / "fixtures" / "pokemon_tower_7f_interior.state"
+)
+
+
+def _load_pokemon_tower_7f_interior_fixture(pyboy: PyBoy) -> None:
+    """Loads a captured save state on Pokemon Tower 7F - map 148, tile (9, 16), the
+    tile 6F's own stair warp hands over - with `_apply_fixture_prerequisites`'s
+    writes re-applied on load and this floor's three Rocket flags set.
+
+    What the fixture spares is the climb, and the climb is the reason a state
+    file is needed here rather than a walk: `_route_across_map` refuses to plan
+    *through* a warp tile, so the six stairs are invisible to the planner and
+    each floor has to be aimed at directly - (14, 5) on Lavender Town (which
+    `data/maps/special_warps.asm` reaches with `fly_warp LAVENDER_TOWN, 3, 6`)
+    then (18, 9)/(3, 9)/(18, 9)/(3, 9)/(18, 9) up 142->143->144->145->146->147
+    then (9, 16) to 7F, every landing tile named by that floor's own warp record.
+    6F adds a second obstacle layer: its RARE CANDY at (6, 8) sits on the only
+    tile joining the stair pocket to the rest of the floor, and the ROM will no
+    more walk the player through a `SPRITE_POKE_BALL` than through a person, so
+    the capture walks *at* the ball (a walk's own goal is exempt), lets the
+    bump's "a" presses pick it up, and steps off south into (6, 9).
+
+    Two things in the loader are load-bearing rather than defensive. The Rocket
+    flags are needed because `data/maps/objects/PokemonTower7F.asm` parks three
+    `SPRITE_ROCKET` records on (9, 11), (12, 9) and (9, 7), all `STAY, RIGHT`
+    with sight range 3, which puts column x=10 - the only column the walk uses -
+    inside two of their rays; `.qwen/tmp/fl7_rockets2.txt` measured the walk
+    without those flags and got three real fights and a variable press count.
+    And `_apply_fixture_prerequisites` has to run after the load because
+    `engine/battle/wild_encounters.asm` rolls on *every* indoor tile, so 7F's own
+    `def_grass_wildmons 15` is live anywhere on this floor.
+    """
+    with _POKEMON_TOWER_7F_INTERIOR_STATE_PATH.open("rb") as f:
+        pyboy.load_state(f)
+    pyboy.tick(1, False)
+    _apply_fixture_prerequisites(pyboy)
+    for ordinal in range(
+        _EVENT_BEAT_POKEMONTOWER_7_TRAINER_0,
+        _EVENT_BEAT_POKEMONTOWER_7_TRAINER_0 + 3,
+    ):
+        _set_event_flag(pyboy, ordinal)
+
+
+def test_walking_to_pokemon_tower_7f_mr_fuji_reaches_a_rom_verified_tile(
+    pyboy_outdoors,
+):
+    """#100's boot verification for the `got_poke_flute` milestone: Pokemon Tower
+    7F's POKEMONTOWER7F_MR_FUJI object (`milestone_targets.py`'s object_index 3),
+    map 148 tile (10, 3).
+
+    `(10, 3)` is Mr. Fuji's own tile, so `_map_obstacles` marks it solid and no
+    walk can end on it - the same reason every sibling test in this file stands
+    on the tile in front instead. His record is
+    `object_event 10, 3, SPRITE_MR_FUJI, STAY, DOWN, TEXT_POKEMONTOWER7F_MR_FUJI`,
+    so the tile his front occupies is `(10, 4)` and facing up from there is
+    facing him.
+
+    This is the one milestone in the batch whose earlier "blocked" verdict was
+    simply wrong, so it is worth naming what was actually wrong with it: the
+    previous attempt never stood on 7F. Its three logs all die below it, on 3F
+    and 5F, each with `battle did not resolve within N presses` - a wild Ghost
+    on a freshly-warped floor whose `wGrassRate` the walker had left armed,
+    against a fixture party whose only move is TACKLE, which
+    `data/types/type_matchups.asm` gives `NO_EFFECT` against GHOST. The Marowak
+    ghost on 6F was never the blocker either; it is gated on one flag,
+    `EVENT_BEAT_GHOST_MAROWAK` (271), and `PokemonTower6FDefaultScript` jumps
+    straight past it when set.
+
+    The dialog this asserts is Mr. Fuji's own and not merely "a text box":
+    `.qwen/tmp/fl7_runA.txt` decodes the window row to
+    `MR.FUJI: Heh? You`, which is line 1 of `_PokemonTower7FMrFujiRescueText` in
+    `text/PokemonTower7F.asm`, and `.qwen/tmp/fl7_dirs.txt` measured the control -
+    same tile, same session, other three directions, `dialog_open` False every
+    time. `EVENT_GOT_POKE_FLUTE` is left clear and asserted clear on both sides
+    of the press, and the test stops at `dialog_open` on purpose: answering the
+    box runs `PokemonTower7FWarpToMrFujiHouseScript`, which ships the player off
+    map 148 entirely.
+    """
+    _load_pokemon_tower_7f_interior_fixture(pyboy_outdoors)
+    assert extract_game_state(pyboy_outdoors).map_id == _MAP_POKEMON_TOWER_7F
+
+    solid, _warps = _map_obstacles(_MAP_POKEMON_TOWER_7F)
+    assert (10, 3) in solid, "Mr. Fuji's tile should be solid to a walk"
+    assert (10, 4) not in solid, "the tile in front of Mr. Fuji should be walkable"
+    assert not _event_flag_is_set(pyboy_outdoors, _EVENT_GOT_POKE_FLUTE), (
+        "already holding the flute would replace his dialog with nothing"
+    )
+
+    assert _walk_tiles(
+        pyboy_outdoors, 10, 4, max_steps=120, map_id=_MAP_POKEMON_TOWER_7F
+    ) == (_MAP_POKEMON_TOWER_7F, 10, 4)
+
+    execute_button(pyboy_outdoors, "up")
+    pyboy_outdoors.tick(30, True)
+    pyboy_outdoors.button("a", 2)
+    dialog_opened = False
+    for _ in range(12):
+        pyboy_outdoors.tick(30, True)
+        if extract_game_state(pyboy_outdoors).dialog_open:
+            dialog_opened = True
+            break
+    assert dialog_opened
+    assert not _event_flag_is_set(pyboy_outdoors, _EVENT_GOT_POKE_FLUTE), (
+        "the dialog alone must not have awarded the milestone's own flag"
+    )
+
+
+_MAP_CHAMPIONS_ROOM = 120  # `constants/map_constants.asm`'s CHAMPIONS_ROOM ($78)
+# `EVENT_BEAT_CHAMPION_RIVAL`, from the same `wram.py` replay. The five flags
+# that buy the approach - `EVENT_BEAT_LORELEIS_ROOM_TRAINER_0` 2273,
+# `EVENT_BEAT_BRUNOS_ROOM_TRAINER_0` 2281, `EVENT_BEAT_AGATHAS_ROOM_TRAINER_0`
+# 2289, `EVENT_BEAT_LANCES_ROOM_TRAINER_0` 2297 and `EVENT_BEAT_LANCE` 2302 -
+# are set by the capture run and travel inside the state file; the loader does
+# not repeat them because none of them is read on map 120 (`.qwen/tmp/
+# bc_fixture.py` reproduced the dialog from the fixture with
+# `_apply_fixture_prerequisites` and nothing else).
+_EVENT_BEAT_CHAMPION_RIVAL = 2305
+
+_CHAMPIONS_ROOM_INTERIOR_STATE_PATH = (
+    Path(__file__).resolve().parent / "fixtures" / "champions_room_interior.state"
+)
+
+
+def _load_champions_room_interior_fixture(pyboy: PyBoy) -> None:
+    """Loads a captured save state inside Champions Room - map 120, tile (3, 7),
+    the tile its own `warp_event 3, 7, LANCES_ROOM, 2` names - with
+    `_apply_fixture_prerequisites`'s writes re-applied on load.
+
+    The route the capture walked is Fly to Indigo Plateau
+    (`fly_warp INDIGO_PLATEAU, 9, 6`) -> the Plateau's (9, 5) lobby warp -> map
+    174 -> (8, 0) -> Lorelei 245 -> 246 -> Bruno -> 247 -> Agatha -> 113 ->
+    Lance's Room's north door at (5, 0) -> 120, and three of those rooms walk
+    the player by themselves on arrival (`LoreleiScriptWalkIntoRoom` and its two
+    siblings), so every landing there is read only after a settle.
+
+    Two facts about the approach are worth recording because they are not
+    guessable from the decode. `EVENT_BEAT_LANCE` (2302) is load-bearing rather
+    than decorative: with it clear, `LancesRoomDefaultScript` tests
+    `LanceTriggerMovementCoords`, whose fifth entry is the landing tile
+    `(24, 16)` itself, and `CheckAndSetEvent EVENT_LANCES_ROOM_LOCK_DOOR` then
+    rewrites the door blocks from `$31/$32` to `$72/$73` - the ROM slams the door
+    shut under the player. `.qwen/tmp/bc_C.txt` ran that counterfactual and the
+    chain died inside Lance's Room with `dialog_open = False`. And the flags have
+    to be written *after* the lobby loads, because
+    `scripts/IndigoPlateauLobby.asm` runs `ResetEventRange` over exactly this flag
+    range on lobby load when `BIT_STARTED_ELITE_4` is set.
+
+    Lance's Room also carries the one step the planner cannot see:
+    `_map_obstacles(113)` reads the *shipped* blocks, which hold the closed-door
+    `$72/$73` at row 6 columns 2 and 3, while
+    `LanceShowOrHideEntranceBlocks` rewrites those same two blocks to `$31/$32`
+    at load. A test that hands `(5, 0)` to `_walk_tiles` on map 113 therefore
+    parks at `(113, 20, 15)`; the capture crosses those fifteen tiles with
+    explicit presses, the way the Saffron Gym test crosses its warp pads.
+    """
+    with _CHAMPIONS_ROOM_INTERIOR_STATE_PATH.open("rb") as f:
+        pyboy.load_state(f)
+    pyboy.tick(1, False)
+    _apply_fixture_prerequisites(pyboy)
+
+
+def test_walking_to_champions_room_rival_reaches_a_rom_verified_tile(pyboy_outdoors):
+    """#100's boot verification for the `beat_champion` milestone: Champions
+    Room's CHAMPIONSROOM_RIVAL object (`milestone_targets.py`'s object_index 0),
+    map 120 tile (4, 2) - Oak, at object_index 1, is deliberately not selected.
+
+    `(4, 2)` is the rival's own tile and solid to a walk for the reason every
+    sibling gives; his record is
+    `object_event 4, 2, SPRITE_BLUE, STAY, DOWN, TEXT_CHAMPIONSROOM_RIVAL`
+    (`data/maps/objects/ChampionsRoom.asm:17`), so the stand tile is `(4, 3)` and
+    facing up from there is facing him.
+
+    Two things a reader might assume about this milestone are false, and both
+    were measured rather than reasoned. `trainer: None` on that record is not a
+    decode gap - the record really carries no `OPP_*` header, and the final
+    battle is started only by `ChampionsRoomRivalReadyToBattleScript`, which
+    needs `SCRIPT_CHAMPIONSROOM_PLAYER_ENTERS` in `wChampionsRoomCurScript`, a
+    value written in exactly one place in the whole ROM
+    (`scripts/AgathasRoom.asm:116`). Arriving by warp leaves the room on its
+    default `ret`, so he is an ordinary NPC and no fight can start; the run
+    reads `in_battle=False` after the dialog. And unlike the gym leaders'
+    `.beforeBeat` branches, `ChampionsRoomRivalText` prints on *both* branches of
+    `CheckEvent EVENT_BEAT_CHAMPION_RIVAL` (`.qwen/tmp/bc_beaten.txt` measured
+    `<RIVAL>: Hey!` with the flag clear and `Why? Why did I lose?` with it set),
+    so the flag is left clear because it is this milestone's own story state, not
+    because a dialog depends on it.
+
+    What does discriminate is direction, and it was measured: on a map this small
+    `dialog_open` is not trivially True - `.qwen/tmp/bc_control_A.txt` pressed
+    "a" from the same stand tile in all four directions and only the press that
+    faces `(4, 2)` opened a box. `_dialog_text_visible` is `True` here before
+    anything is pressed, so this test asserts only `dialog_open`, which is what
+    the criterion asks for.
+    """
+    _load_champions_room_interior_fixture(pyboy_outdoors)
+    assert extract_game_state(pyboy_outdoors).map_id == _MAP_CHAMPIONS_ROOM
+
+    solid, _warps = _map_obstacles(_MAP_CHAMPIONS_ROOM)
+    assert (4, 2) in solid, "the rival's tile should be solid to a walk"
+    assert (4, 3) not in solid, "the tile in front of the rival should be walkable"
+    assert not _event_flag_is_set(pyboy_outdoors, _EVENT_BEAT_CHAMPION_RIVAL), (
+        "the milestone's own flag should still be unearned"
+    )
+
+    assert _walk_tiles(
+        pyboy_outdoors, 4, 3, max_steps=120, map_id=_MAP_CHAMPIONS_ROOM
+    ) == (_MAP_CHAMPIONS_ROOM, 4, 3)
+
+    execute_button(pyboy_outdoors, "up")
+    pyboy_outdoors.tick(30, True)
+    pyboy_outdoors.button("a", 2)
+    dialog_opened = False
+    for _ in range(12):
+        pyboy_outdoors.tick(30, True)
+        if extract_game_state(pyboy_outdoors).dialog_open:
+            dialog_opened = True
+            break
+    assert dialog_opened
 
 
 def _milestone(target_x: int | None = None, target_y: int | None = None) -> Milestone:
