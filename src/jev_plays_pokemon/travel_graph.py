@@ -22,15 +22,19 @@ connections are modeled as, uniformly.
   lookup; `LAST_MAP` warps need an `entered_from` map supplied (see below).
 - **`LAST_MAP` resolution.** A `LAST_MAP` exit door's destination map isn't
   in the warp record - it's `wLastMap`, "whichever map the player warped in
-  from" - but within this incrementally-built, scoped graph, that map is
-  always discoverable: it's whichever *other* in-scope map has a warp
-  targeting the exit door's own map. `_find_entrance_map` does exactly that
-  reverse lookup, so `LAST_MAP` edges resolve to a real, ROM-derived tile
-  (never a hand-typed destination) - verified end to end against this
-  repo's own ROM: Oak's Lab's `LAST_MAP` exit (`dest_warp=2`) resolves to
-  Pallet Town's warp index 2, `(12, 11)` - the exact door the player walked
-  in through, and the same tile `docs/research/gen1-map-coordinate-
-  sources.md` independently verified live from RAM.
+  from" - and within this scoped graph that map is discoverable from the warp
+  records themselves: a `LAST_MAP` door sends the player back out of the door
+  they came in through, so the entrance is the one in-scope map whose own warp
+  *lands on this exact tile*. `_find_entrance_map` does exactly that
+  landing-matched reverse lookup, so `LAST_MAP` edges resolve to a real,
+  ROM-derived tile (never a hand-typed destination) - verified end to end
+  against this repo's own ROM: Oak's Lab's `LAST_MAP` exit (`dest_warp=2`)
+  resolves to Pallet Town's warp index 2, `(12, 11)` - the exact door the player
+  walked in through, and the same tile `docs/research/gen1-map-coordinate-
+  sources.md` independently verified live from RAM. Matching on the landing tile
+  rather than merely on "some map warps into this one" is what lets a map with
+  two entrances (Red's House 1F: Pallet Town's front door and its own upstairs
+  staircase) resolve at all - see `_find_entrance_map`'s own docstring.
 - **Connections.** `pret/pokered`'s `home/overworld.asm`
   (`CheckMapConnections`) computes a crossed map edge's landing tile from
   two signed alignment bytes now decoded onto `rom_maps.MapConnection`
@@ -217,18 +221,36 @@ def resolve_warp_destination(
 
 
 def _find_entrance_map(
-    rom_maps: dict[int, RomMap], map_ids: frozenset[int], target_map: int
+    rom_maps: dict[int, RomMap],
+    map_ids: frozenset[int],
+    target_map: int,
+    target_warp: MapWarp,
 ) -> int | None:
-    """Which map, among `map_ids`, has a warp whose (statically-known)
-    destination is `target_map` - i.e. which map a `LAST_MAP` exit door on
-    `target_map` returns to, discovered from the scoped ROM data itself
-    rather than hand-declared. `None` if no in-scope map's warps target it
-    (the scoped graph doesn't cover this map's entrance yet)."""
+    """Which map the `LAST_MAP` exit door at `target_warp` returns to - what
+    `wLastMap` holds in the ROM when the player steps on it.
+
+    Counting incoming warps ("whichever in-scope map has a warp targeting this
+    map") is ambiguous for any map with more than one entrance: Red's House 1F
+    is entered both from Pallet Town's front door and from its own upstairs
+    floor, so two candidates exist and the front door would be dropped. The
+    runtime answer is symmetry - `LAST_MAP` sends the player back out of the
+    door they came in through - so the right candidate is the map whose own warp
+    *lands on this exact tile*, which `resolve_warp_destination` already knows
+    how to compute. Against this repo's ROM that separates Red's House 1F's two
+    entrances cleanly: Pallet Town's door lands on this map's `(2, 7)` (the
+    `LAST_MAP` warp itself), while 2F's staircase lands on its `(7, 1)` (the
+    stairs warp), so `(2, 7)` resolves to Pallet Town and the stairs do not.
+
+    `None` if no single in-scope map lands exactly here - either because the
+    scoped graph doesn't cover this map's entrance yet, or because more than one
+    candidate does, which is an ambiguity this module refuses to guess at."""
     candidates = {
         map_id
         for map_id in map_ids
         for warp in rom_maps[map_id].warps
         if warp.dest_map == target_map
+        and resolve_warp_destination(rom_maps, warp)
+        == (target_map, target_warp.x, target_warp.y)
     }
     if len(candidates) != 1:
         return None
@@ -304,7 +326,7 @@ def build_hops(rom_maps: dict[int, RomMap], map_ids: frozenset[int]) -> tuple[Ho
                     continue  # destination out of scope - not a needed hop.
                 entered_from = None
             else:
-                entered_from = _find_entrance_map(rom_maps, map_ids, map_id)
+                entered_from = _find_entrance_map(rom_maps, map_ids, map_id, warp)
                 if entered_from is None:
                     continue  # LAST_MAP with no in-scope entrance yet.
             dest_map, dest_x, dest_y = resolve_warp_destination(
@@ -366,6 +388,13 @@ _MAP_ROUTE_6 = 17
 _MAP_ROUTE_7 = 18
 _MAP_ROUTE_24 = 35
 _MAP_ROUTE_25 = 36
+# The player's own house. A fresh boot leaves the player controllable on Reds
+# House 2F (see `emulator.boot_past_intro`), and `resolve_navigation_target`
+# offers the navigation macro only from a map the graph can actually route out
+# of - so without these two, the run's first milestone is unreachable from its
+# first tile and every turn's action space collapses to raw button presses.
+_MAP_REDS_HOUSE_1F = 37
+_MAP_REDS_HOUSE_2F = 38
 _MAP_OAKS_LAB = 40
 _MAP_VIRIDIAN_MART = 42
 _MAP_VIRIDIAN_GYM = 45
@@ -393,6 +422,8 @@ MILESTONE_MAP_IDS: frozenset[int] = frozenset(
         _MAP_ROUTE_7,
         _MAP_ROUTE_24,
         _MAP_ROUTE_25,
+        _MAP_REDS_HOUSE_1F,
+        _MAP_REDS_HOUSE_2F,
         _MAP_OAKS_LAB,
         _MAP_VIRIDIAN_MART,
         _MAP_VIRIDIAN_GYM,

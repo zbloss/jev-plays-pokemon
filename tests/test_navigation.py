@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 from pyboy import PyBoy
 
+from jev_plays_pokemon import navigation as navigation_module
 from jev_plays_pokemon.emulator import boot_past_intro
 from jev_plays_pokemon.game_state import extract_game_state
 from jev_plays_pokemon.milestones import Milestone, MilestoneTarget
@@ -44,6 +45,10 @@ pytestmark = pytest.mark.skipif(
 # real, known hops in the milestone travel graph.
 _MAP_PALLET_TOWN = 0
 _MAP_OAKS_LAB = 40
+# The player's own house, which `travel_graph.MILESTONE_MAP_IDS` carries
+# because a fresh boot leaves the player controllable on its upstairs floor.
+_MAP_REDS_HOUSE_1F = 37
+_MAP_REDS_HOUSE_2F = 38
 # Silph Co 2F: one of the 7 maps #96's own "Out of Scope" section names as
 # never getting a travel-graph route (its parsed ROM records disagreed with
 # upstream pret/pokered during that ticket's research) - a permanently safe
@@ -84,14 +89,14 @@ def _walk_out_of_the_house(pyboy: PyBoy) -> None:
     """From the bedroom (see `_boot_past_intro`), walk downstairs and out of
     the house into Pallet Town.
 
-    This is needed because PyBoy's Gen1 `game_area_collision()` (see
-    `navigation.py`'s docstring) only resolves real walkable/blocked data
-    outdoors - every indoor tileset this ticket checked against the real
-    ROM (Red's House 1F and 2F) reads back as entirely blocked, which is
-    degenerate for the navigation macro's pathfinding tests. `_HOUSE_EXIT_PATH`
-    is a fixed sequence of `execute_button` calls (one real tile - or, on
-    the stairs, one map transition - per call) found by exploring the real
-    ROM from the bedroom out to Pallet Town.
+    `_HOUSE_EXIT_PATH` is a fixed sequence of `execute_button` calls (one real
+    tile - or, on the stairs, one map transition - per call) found by exploring
+    the real ROM from the bedroom out to Pallet Town. It is kept as a fixed
+    sequence, rather than replaced by the navigation macro that can now walk
+    this leg itself (see `test_navigation_macro_walks_the_first_mile_to_oaks_lab`),
+    because `outdoors_state` is a module fixture every outdoor test pays for: a
+    fixed 19 presses costs what it always cost, and it cannot be affected by a
+    change to the planner those tests are meant to be measured against.
     """
     for direction in _HOUSE_EXIT_PATH:
         execute_button(pyboy, direction)
@@ -197,14 +202,199 @@ def test_raw_buttons_cover_the_four_directions_and_the_face_buttons():
     }
 
 
-def test_player_grid_anchor_is_always_the_players_own_walkable_tile(pyboy_outdoors):
-    """Documents/verifies `navigation.py`'s `_PLAYER_GRID_COL`/`_PLAYER_GRID_ROW`
-    constant against the real ROM: whatever tile the player is standing on
-    must itself be walkable, so the collision grid's cell at that fixed
-    anchor should read as walkable at a real, live outdoor position."""
-    collision = pyboy_outdoors.game_area_collision()
+def test_the_players_own_tile_is_walkable_in_the_decoded_map(pyboy_outdoors):
+    """Documents/verifies `navigation.py`'s `_map_walkability` against the real
+    ROM at a live position: the tile the player is actually standing on must be
+    in that map's decoded walkable set, and it must be addressable in world
+    coordinates - the same ones `GameState.player_x`/`player_y` report - with no
+    screen-window conversion anywhere in between. The planner's coordinates and
+    the emulator's position have to be the same coordinate system for a plan to
+    be pressable."""
+    state = extract_game_state(pyboy_outdoors)
+    walk = navigation_module._map_walkability(state.map_id)
 
-    assert collision[8, 8] != 0
+    assert walk is not None
+    assert walk.is_walkable((state.player_x, state.player_y))
+
+
+def test_navigation_macro_walks_the_first_mile_to_oaks_lab(pyboy_in_bedroom):
+    """The first mile of a fresh boot: the run's first milestone (`got_starter`,
+    Oak's Lab) has to be reachable with the navigation macro from the tile the
+    game actually leaves the player controllable on - Reds House 2F, not Pallet
+    Town.
+
+    This is the case every layer above it was built for, and the case that made
+    a real run mash 'a' in the bedroom forever: with the player's own house out
+    of `MILESTONE_MAP_IDS`, `resolve_navigation_target` returned `None` on the
+    first turn, `decision.py`'s offer predicate dropped the navigation macro
+    from the action space, and the raw-button space left nothing to do but
+    re-read the same flavour text. It needs both fixes at once - the two house
+    maps in the graph, and `travel_graph._find_entrance_map`'s landing-matched
+    rule for Red's House 1F's `LAST_MAP` front door (1F has two entrances, the
+    town's front door and its own upstairs staircase, so "which map did I come
+    in from?" is ambiguous until you match on the landing tile).
+
+    The macro is aimed at Oak's Lab's own milestone tile, `(8, 3)`, which is the
+    item ball the ROM refuses to let anyone stand on - so arrival means "next
+    door to it", where pressing 'a' picks up the starter, not a byte-exact
+    landing.
+    """
+    milestone = _milestone(target_x=8, target_y=3)
+    for current_map in (_MAP_REDS_HOUSE_2F, _MAP_REDS_HOUSE_1F, _MAP_PALLET_TOWN):
+        assert resolve_navigation_target(milestone, current_map) is not None, (
+            f"map {current_map} offers no navigation target, so the action "
+            "space for that turn collapses to raw buttons"
+        )
+
+    before = extract_game_state(pyboy_in_bedroom)
+    assert before.map_id == _MAP_REDS_HOUSE_2F
+
+    target = NavigationTarget(map_id=_MAP_OAKS_LAB, x=8, y=3)
+    for _ in range(10):
+        state = extract_game_state(pyboy_in_bedroom)
+        if state.map_id == target.map_id:
+            break
+        assert execute_navigation_macro(pyboy_in_bedroom, target) is True
+
+    after = extract_game_state(pyboy_in_bedroom)
+    assert after.map_id == _MAP_OAKS_LAB
+    assert abs(after.player_x - target.x) + abs(after.player_y - target.y) <= 1
+
+
+def test_navigation_macro_reports_no_move_instead_of_pressing_into_a_refused_tile(
+    pyboy_outdoors,
+):
+    """`moved` means the position changed, and a step the ROM refuses is refused
+    for the rest of the walk.
+
+    Pallet Town `(5, 9)` is the measured case: its raw tile (`$55`) is not in
+    tileset 0's passable list, while PyBoy's on-screen collision grid calls the
+    cell walkable - so a plan built from the screen aims at it, `execute_button`
+    holds 'down' for its whole `_MAX_WALK_FRAMES` cap, and nothing moves. Planned
+    against the ROM the tile is simply not walkable, so the A* never aims at it;
+    planned against the screen and re-planned statelessly, that exact press comes
+    back every one of the `max_steps` iterations and the walk spends its entire
+    budget against one tile while reporting progress. From `(5, 8)` there is no
+    legal step that gets closer to `(5, 9)`, so the honest answer is `False` with
+    the player exactly where they started.
+    """
+    _walk_to_milestone_target(pyboy_outdoors, _MAP_PALLET_TOWN, 5, 8)
+    before = extract_game_state(pyboy_outdoors)
+    assert (before.map_id, before.player_x, before.player_y) == (
+        _MAP_PALLET_TOWN,
+        5,
+        8,
+    )
+    walk = navigation_module._map_walkability(_MAP_PALLET_TOWN)
+    assert walk is not None
+    assert not walk.is_walkable((5, 9)), "(5, 9) was expected to be ROM-impassable"
+
+    moved = execute_navigation_macro(
+        pyboy_outdoors, NavigationTarget(map_id=_MAP_PALLET_TOWN, x=5, y=9)
+    )
+
+    after = extract_game_state(pyboy_outdoors)
+    assert moved is False
+    assert (after.player_x, after.player_y) == (before.player_x, before.player_y)
+
+
+def _synthetic_map(
+    walkable: tuple[tuple[int, int], ...],
+    blocked: tuple[tuple[tuple[int, int], tuple[int, int]], ...] = (),
+) -> navigation_module.MapWalkability:
+    """A `MapWalkability` written out by hand, for the planner's own rules
+    (which edge it refuses, which tiles it treats as obstacles) without paying a
+    ROM boot or depending on a particular map's terrain."""
+    return navigation_module.MapWalkability(
+        map_id=0,
+        width=5,
+        height=5,
+        walkable=frozenset(walkable),
+        blocked_crossings=frozenset(
+            edge for pair in blocked for edge in (pair, (pair[1], pair[0]))
+        ),
+    )
+
+
+_OPEN_5X5 = tuple((x, y) for x in range(5) for y in range(5))
+
+
+def test_next_step_toward_refuses_an_edge_the_rom_already_declined():
+    """A refused `(from, to)` edge is gone from the graph for this walk, so the
+    planner detours instead of naming the same doomed press again."""
+    walk = _synthetic_map(_OPEN_5X5)
+    assert navigation_module._next_step_toward(walk, (0, 0), (2, 0)) == "right"
+
+    step = navigation_module._next_step_toward(
+        walk, (0, 0), (2, 0), refused=frozenset({((0, 0), (1, 0))})
+    )
+
+    assert step == "down"
+
+
+def test_next_step_toward_routes_around_another_hops_warp_tile():
+    """ADR-0002's context-dependent warp treatment: another hop's tile is an
+    obstacle the plan walks around, while the current step's *own* goal tile is
+    never one - otherwise the macro could never aim at a door at all."""
+    walk = _synthetic_map(_OPEN_5X5)
+
+    assert (
+        navigation_module._next_step_toward(
+            walk, (0, 0), (4, 0), avoid=frozenset({(4, 0)})
+        )
+        == "right"
+    )
+
+    here, stepped_on_door = (0, 0), False
+    for _ in range(8):
+        step = navigation_module._next_step_toward(
+            walk, here, (4, 4), avoid=frozenset({(2, 2)})
+        )
+        if step is None:
+            break
+        delta_x, delta_y = navigation_module._DIRECTIONS[step]
+        here = (here[0] + delta_x, here[1] + delta_y)
+        stepped_on_door = stepped_on_door or here == (2, 2)
+
+    assert here == (4, 4)
+    assert not stepped_on_door
+
+
+def test_next_step_toward_walks_toward_the_closest_reachable_tile():
+    """An unreachable goal (an NPC, an item ball, a tile past the map's own
+    edge) still produces real progress rather than `None`: the first step
+    toward whichever reachable tile ends up nearest it."""
+    walk = _synthetic_map(_OPEN_5X5)
+
+    assert navigation_module._next_step_toward(walk, (0, 0), (9, 0)) == "right"
+
+    # A goal with no tile to stand on at all - the whole east column is
+    # missing, so the closest reachable tile is `(3, 0)`, due east. The plan
+    # aims at the wall and gets as close as the map allows rather than
+    # reporting that it can't move, which is what lets a macro aim at an item
+    # ball or an NPC and still arrive next door to it.
+    missing_column = _synthetic_map(tuple(t for t in _OPEN_5X5 if t[0] != 4))
+    assert (
+        navigation_module._next_step_toward(missing_column, (0, 0), (4, 0)) == "right"
+    )
+
+
+def test_next_step_toward_gives_up_when_the_players_own_tile_isnt_walkable():
+    """A player standing on something the ROM doesn't consider walkable (a warp
+    mid-transition, a tile the decode doesn't cover) gets `None` rather than a
+    plan invented from a tile the map doesn't have."""
+    walk = _synthetic_map(((1, 0), (2, 0), (3, 0)))
+
+    assert navigation_module._next_step_toward(walk, (0, 0), (3, 0)) is None
+
+
+def test_next_step_toward_wont_cross_a_blocked_elevation_pair():
+    """Two individually-walkable tiles can still be illegal to walk between -
+    `CheckForTilePairCollisions`' elevation pairs are an edge property, so a
+    per-tile walkable set can't express them and the planner has to be told."""
+    walk = _synthetic_map(_OPEN_5X5, blocked=(((0, 0), (1, 0)),))
+
+    assert navigation_module._next_step_toward(walk, (0, 0), (2, 0)) == "down"
 
 
 def test_navigation_macro_walks_the_player_toward_a_reachable_target(pyboy_outdoors):
@@ -255,11 +445,11 @@ def test_navigation_macro_is_a_noop_when_the_target_map_has_no_known_route(
 # The first 14 presses of `_TO_OAKS_LAB_TABLE_PATH` below (same fixed,
 # ROM-verified sequence, from the same `pyboy_outdoors` spawn) - far enough
 # from the house to clear a real Pallet Town obstacle (a fence/hedge tile
-# pair) this ticket found `game_area_collision()` reports as walkable when
-# the real game engine doesn't allow crossing it, a pre-existing limitation
-# of PyBoy 2.2.0's exposed collision data unrelated to #102's own routing
-# logic - and still short of Oak's Lab's own door, so the macro is the one
-# actually crossing the map boundary below, not this fixed prefix.
+# pair) that the on-screen collision grid reports as walkable when the real
+# game engine doesn't allow crossing it, so this prefix stays a fixed
+# sequence rather than a macro walk - and still short of Oak's Lab's own
+# door, so the macro is the one actually crossing the map boundary below, not
+# this fixed prefix.
 _NEAR_OAKS_LAB_DOOR_PATH: tuple[str, ...] = (
     "down",
     "down",
@@ -293,13 +483,13 @@ def test_navigation_macro_routes_across_maps_via_a_known_hop(pyboy_outdoors):
     whole remaining route, which would leave every call after the first a
     no-op and never actually exercise re-deriving the route across calls.
 
-    "At or closer" rather than "exactly reaches" because Oak's Lab is an
-    indoor map: PyBoy's `game_area_collision()` is only verified accurate
-    outdoors (see `_walk_out_of_the_house`'s docstring above), so last-mile
-    A* may not be able to walk the player any further once inside - this
-    still proves #102's routing itself (leaving Pallet Town via the correct
-    door, landing on the target map) without depending on that separate,
-    pre-existing indoor-collision limitation.
+    "At or closer" rather than "exactly reaches" because Oak's Lab's milestone
+    tile is an object the player interacts with from the tile next to it (see
+    `test_navigation_macro_walks_the_first_mile_to_oaks_lab`), so the last mile
+    ends next door rather than on top of the target - this still proves #102's
+    routing itself (leaving Pallet Town via the correct door, landing on the
+    target map) without depending on where inside the room the walk is allowed
+    to finish.
     """
     for direction in _NEAR_OAKS_LAB_DOOR_PATH:
         execute_button(pyboy_outdoors, direction)
@@ -985,8 +1175,9 @@ def _walk_toward(pyboy: PyBoy, x: int, y: int, max_calls: int = 20) -> None:
     """Drives the navigation macro toward `(x, y)` on the player's current
     map, calling `execute_navigation_macro` repeatedly (it only takes one
     step, or a short run, per call) until it arrives, stops making
-    progress (a real obstacle its on-screen A* can't route around, or a
-    map transition happened mid-step), or `max_calls` is exhausted.
+    progress (an obstacle the ROM's own terrain still can't route around -
+    an NPC record or a wandering sprite is not in any static terrain table,
+    or a map transition happened mid-step), or `max_calls` is exhausted.
     """
     for _ in range(max_calls):
         state = extract_game_state(pyboy)
@@ -1065,15 +1256,16 @@ def _walk_to_milestone_target(
     `_walk_toward`'s, since a milestone's target can sit several maps and
     screens away rather than a single nearby tile.
 
-    A hop's own tile can itself misread as collision-blocked in PyBoy's
-    on-screen `game_area_collision()` - the same pre-existing limitation
-    `_NEAR_OAKS_LAB_DOOR_PATH`'s comment documents for Pallet Town's fence
-    tile (confirmed directly: the on-screen A* walks right up to within a
-    tile or two of a hop tile, then reports no further progress, even
-    though the real game lets the player step onto it) - so when
-    `execute_navigation_macro` stops making progress while still short of
-    `map_id`, this nudges across the map edge (`_nudge_across_hop`) rather
-    than treating "the on-screen A* gave up" as "no route exists."
+    A hop's own tile can still be unreachable for a reason no terrain decode
+    carries - an NPC record standing on the approach, a trainer sprite that
+    wanders into it, a one-way ledge - and the macro declines to press at all
+    while `GameState.dialog_open` reads `True`, so a walk that keeps getting
+    spoken to makes no progress. When `execute_navigation_macro` stops while
+    still short of `map_id`, this nudges across the map edge
+    (`_nudge_across_hop`, which searches a couple of tiles either side, since
+    `connection_hop` names one arbitrary tile in a crossing range that is all
+    equally real) rather than treating "the planner gave up" as "no route
+    exists."
     """
     for _ in range(max_calls):
         state = extract_game_state(pyboy)
@@ -1166,13 +1358,12 @@ def _dialog_row_tiles(pyboy: PyBoy) -> tuple[int, ...]:
 
 # ## Walking a whole map by the ROM's own collision data
 #
-# `execute_navigation_macro` plans with PyBoy's `game_area_collision()` over the
-# on-screen window only, and for the single-screen hops every test above needs,
-# that is enough. It is not enough to cross a town. Two separate failures, both
-# confirmed by reading the tile grid under the player at the tile a walk stopped
-# on:
+# `execute_navigation_macro` now plans on the same per-tile ROM decode the
+# helpers below do (`tileset_collision.py`), so the two agree on terrain. What
+# the helpers still add, and why a milestone walk that has to cross a town is
+# planned here rather than through the macro:
 #
-# * A sprite is solid in-game and invisible to `game_area_collision()`. The
+# * A sprite is solid in-game and invisible to any terrain decode. The
 #   approach to Viridian Gym's door stops dead at `(19, 9)` with nothing on
 #   screen except that the Old Man asleep at `(18, 9)` has started talking - and
 #   `pret/pokered`'s `scripts/ViridianCity.asm` (`ViridianCityOldManSleepyText`)
@@ -1188,12 +1379,12 @@ def _dialog_row_tiles(pyboy: PyBoy) -> tuple[int, ...]:
 #   text box owns the D-pad, and the reason a walk that keeps getting spoken to by
 #   an NPC makes no progress at all.
 #
-# So the helpers below plan on the ROM's own data instead: `tileset_collision`'s
-# per-tile decode for the terrain, every `rom_maps` object record as solid (the
-# second obstacle layer, which no terrain decode can see), and - on top of both -
-# every tile this particular walk has tried to enter and failed to enter, because
-# a sprite that wanders, a one-way ledge, or an Old Man who shoves you south is
-# not in any of the ROM's static tables.
+# So the helpers below plan on the ROM's own data *plus* the layers the macro
+# deliberately leaves to the live loop: every `rom_maps` object record as solid
+# (the second obstacle layer, which no terrain decode can see), and - on top of
+# both - every tile this particular walk has tried to enter and failed to enter,
+# because a sprite that wanders, a one-way ledge, or an Old Man who shoves you
+# south is not in any of the ROM's static tables.
 
 _MAP_GEOMETRY: dict[
     int, tuple[frozenset[tuple[int, int]], frozenset[tuple[int, int]]]
@@ -1955,8 +2146,9 @@ def test_walking_to_cerulean_gym_misty_reaches_a_rom_verified_tile(pyboy_outdoor
 
     Aiming at the NPC's own tile is not sufficient here, and that was measured
     with both walkers this file has. The merged test's `_walk_toward` (the
-    navigation macro's on-screen A*) gives up two rooms short and comes to rest
-    at `(5, 7)`; this file's own `_walk_tiles` gets to `(5, 3)`, diagonal to
+    navigation macro, back when it still planned against PyBoy's on-screen
+    collision grid) gives up two rooms short and comes to rest at `(5, 7)`; this
+    file's own `_walk_tiles` gets to `(5, 3)`, diagonal to
     Misty, where "a" addresses the floor instead of her. So the walk is aimed
     at the tile that is both landable and facing her, which the decode picks
     out uniquely: of `(4, 2)`'s four neighbours, `(3, 2)` and `(4, 1)` are wall,

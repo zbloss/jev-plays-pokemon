@@ -7,8 +7,8 @@ spec's (#14) action-space decision:
 - the navigation macro, which takes no destination argument - it reads its
   target from the current-objective milestone tracker (`milestones.py`,
   #18) - and walks the player toward it via an internally-implemented A*
-  pathfind over PyBoy's RAM/VRAM-derived local collision map, executed over
-  multiple emulator frames.
+  pathfind over the map decoded from this repo's own ROM (see "Walkability
+  comes from the ROM" below), executed over multiple emulator frames.
 
 No code is reused from ClaudePlaysPokemonStarter (see #9's licensing
 decision): both the button-hold timing below and the A* search are written
@@ -38,15 +38,23 @@ whatever one input naturally does - one tile normally, more on a terrain
 feature like a ledge that forces a longer hop - and never overshoots by
 continuing to hold past that.
 
-Local, not global, pathfinding: PyBoy 2.2.0's Gen1 wrapper only exposes a
-collision map for the visible on-screen window (`game_area_collision`,
-scrolled to follow the player) - Game Boy VRAM never holds a whole map's
-tile data at once, and this pinned PyBoy version doesn't expose the
-WRAM-buffered full-map block data either (see `game_state.py`'s docstring
-for the same 2.2.0-vs-dev-branch API gap). The macro therefore re-plans a
-fresh local path every step from whatever's on screen right then, rather
-than computing one global route up front; it walks *toward* the target, it
-doesn't guarantee arrival.
+Walkability comes from the ROM, not from the emulator's screen: the A* searches a
+`MapWalkability` that `_map_walkability` decodes out of `pokemon_red.gb` with
+`tileset_collision.py` - the same source the verified milestone walks are planned
+with - and plans in world tiles, the coordinates `GameState.player_x`/`player_y`
+already report. PyBoy's `game_area_collision()` is deliberately not consulted. It
+exposes only the visible window, and measured at three live Pallet Town positions
+against the ROM's own passable lists it disagrees with them on 117-181 of its 360
+cells (and calls 284 cells walkable where the ROM has 252), so a plan built from
+it routes onto tiles the ROM then refuses - which is exactly how a walk ends up
+pressing into one wall for its whole `max_steps` budget while reporting that it is
+making progress. It is also blind to `CheckForTilePairCollisions`, the elevation
+pairs that make two individually-walkable tiles impossible to walk between
+(`tileset_collision.py`'s Mt Moon B2F measurement: 483 "walkable" tiles around
+that stair landing, 67 of them legally reachable). Searching the whole map costs
+nothing extra: it decodes from the ROM in one pass and is cached per map. The
+macro still re-plans on every step, so it walks *toward* the target and does not
+guarantee arrival - it just no longer plans against a map that isn't there.
 
 Cross-map routing (`docs/adr/0002-travel-graph-for-cross-map-navigation.md`,
 #102): when the player isn't on the current milestone's target map yet,
@@ -63,12 +71,12 @@ section, so a player knocked off course (a battle, a stray screen, an NPC)
 still makes progress from wherever they actually ended up on the very next
 call. A milestone whose target map has no known route in the graph yet
 (ADR-0002's incremental build) is a graceful no-op, matching today's
-same-map-only behavior, rather than a crash. Local A* also treats every
+same-map-only behavior, rather than a crash. The A* also treats every
 other known hop tile on the player's current map as an obstacle by default
-(`_walkable`) - it won't route the player onto a warp/connection tile that
-isn't the one it's actually trying to reach - except the current step's own
-intended goal tile, which is always walkable (ADR-0002's "context-dependent"
-warp treatment).
+(`_next_step_toward`'s `avoid` set, built by `_hop_tiles`) - it won't route the
+player onto a warp/connection tile that isn't the one it's actually trying to
+reach - except the current step's own intended goal tile, which is always
+allowed (ADR-0002's "context-dependent" warp treatment).
 
 All 14 scripted milestones now carry ROM-derived tile coordinates
 (`milestones.py`, #98), so `resolve_navigation_target` resolves a real
@@ -85,21 +93,31 @@ milestones lack one.
 from __future__ import annotations
 
 import heapq
+import logging
 import math
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cache, lru_cache
 
 from pyboy import PyBoy
 
 from jev_plays_pokemon import rom_maps
 from jev_plays_pokemon.game_state import extract_game_state
 from jev_plays_pokemon.milestones import Milestone
+from jev_plays_pokemon.tileset_collision import (
+    TilesetHeader,
+    crosses_blocked_pair,
+    is_walkable,
+    parse_tile_pair_collisions,
+    parse_tileset_headers,
+)
 from jev_plays_pokemon.travel_graph import (
     MILESTONE_MAP_IDS,
     TravelGraph,
     build_milestone_travel_graph,
     next_hop,
 )
+
+logger = logging.getLogger(__name__)
 
 RAW_BUTTONS: tuple[str, ...] = (
     "up",
@@ -138,14 +156,17 @@ _SETTLE_FRAMES = 16
 _PLAYER_X_ADDRESS = 0xD362
 _PLAYER_Y_ADDRESS = 0xD361
 
-# `game_area_collision()` returns an (18, 20) grid, doubled up from a 9x10
-# block grid so each 2x2 tile block shares one value (see the Gen1 wrapper's
-# `_get_screen_walkable_matrix`/`game_area_collision`). The player's own
-# tile always lands on the block at raw-tile (row=8, col=8) - verified in
-# tests/test_navigation.py by checking that cell against the real, visible
-# doorway gap in a booted `pokemon_red.gb`'s Pallet Town collision map.
-_PLAYER_GRID_COL = 8
-_PLAYER_GRID_ROW = 8
+# Frames to let a map transition finish before planning the step after it.
+# `execute_button` releases as soon as the player's RAM position changes, and a
+# warp/stair transition changes it immediately - well before the new map's
+# tiles are loaded and the fade ends. Planning from that mid-transition read
+# would press a direction the ROM then acts on *after* the transition lands,
+# which can shove the player back onto the warp tile they just came through.
+# Measured against a real boot: the position `execute_navigation_macro` reads 16
+# settle frames after crossing Red's House's front door is not the position the
+# player ends up at (it reads Pallet Town (3, 7) mid-transition and settles to
+# (5, 6)), and 60 frames is comfortably past the transition.
+_WARP_SETTLE_FRAMES = 60
 
 
 def execute_button(pyboy: PyBoy, button: str) -> None:
@@ -306,51 +327,192 @@ def resolve_navigation_target(
     return NavigationTarget(target.map_id, target.target_x, target.target_y)
 
 
-def _walkable(
-    collision,
-    col: int,
-    row: int,
-    warp_cells: frozenset[tuple[int, int]],
-    goal: tuple[int, int],
-) -> bool:
-    """Whether `(col, row)` is walkable: on the collision grid, not blocked
-    terrain, and - per ADR-0002's context-dependent warp treatment - not a
-    known hop tile from `warp_cells` unless it's `goal`, this step's own
-    intended destination (the next hop's tile, or the milestone's own final
-    tile - see `execute_navigation_macro`)."""
-    height, width = collision.shape
-    if not (0 <= col < width and 0 <= row < height and collision[row, col] != 0):
-        return False
-    return (col, row) == goal or (col, row) not in warp_cells
+# ---------------------------------------------------------------------------
+# What's walkable, according to the ROM
+# ---------------------------------------------------------------------------
+
+
+@lru_cache(maxsize=1)
+def _rom_bytes() -> bytes | None:
+    """This repo's pinned ROM bytes, or `None` when `pokemon_red.gb` isn't present.
+
+    Every walkability question below is answered from the ROM, and it's
+    gitignored (see `tests/test_navigation.py`'s own `ROM_PATH.exists()` gate),
+    so its absence has to degrade rather than raise: `_map_walkability` returns
+    `None`, `execute_navigation_macro` declines to walk, and the turn costs a
+    no-op instead of a crash - the same graceful fallback `_travel_graph` uses
+    for a missing ROM.
+    """
+    try:
+        return rom_maps.load_rom()
+    except FileNotFoundError:
+        return None
+
+
+@lru_cache(maxsize=1)
+def _tileset_headers() -> tuple[TilesetHeader, ...] | None:
+    """The ROM's tileset header table (each tileset's passable tile list), once.
+
+    `ValueError` - what `parse_tileset_headers` raises when the bytes it anchors
+    on aren't structurally the table it expects - is treated like a missing ROM:
+    a ROM this module can't decode is a ROM it can't plan against, so the live
+    loop degrades instead of dying. Logged, because `lru_cache` means this body
+    runs at most once per process and a silently blind planner is exactly the
+    failure mode this module keeps having to relearn.
+    """
+    rom = _rom_bytes()
+    if rom is None:
+        return None
+    try:
+        return parse_tileset_headers(rom)
+    except ValueError:
+        logger.warning("could not decode the ROM's tileset headers", exc_info=True)
+        return None
+
+
+@lru_cache(maxsize=1)
+def _tile_pair_collisions() -> frozenset[tuple[int, int, int]] | None:
+    """The ROM's blocked tile-pair crossings (`tileset_collision.py`), once."""
+    rom = _rom_bytes()
+    if rom is None:
+        return None
+    try:
+        return parse_tile_pair_collisions(rom)
+    except ValueError:
+        logger.warning("could not decode the ROM's tile-pair collisions", exc_info=True)
+        return None
+
+
+@dataclass(frozen=True)
+class MapWalkability:
+    """One map's walkability, decoded once from the ROM and cached.
+
+    Two facts, because Gen 1 consults both before it lets an ordinary step
+    happen (`tileset_collision.py`'s docstring quotes the `home/overworld.asm`
+    call sites): `walkable` is `CheckTilePassable`'s answer per tile, and
+    `blocked_crossings` is `CheckForTilePairCollisions`' answer per *edge* - the
+    elevation pairs that make two individually-walkable tiles impossible to walk
+    between, which is an edge property no per-tile set can express.
+
+    Tiles are world coordinates, the same ones `GameState.player_x`/`player_y`
+    report, so a caller never converts through a screen window.
+    """
+
+    map_id: int
+    width: int
+    height: int
+    walkable: frozenset[tuple[int, int]]
+    blocked_crossings: frozenset[tuple[tuple[int, int], tuple[int, int]]]
+
+    def is_walkable(self, tile: tuple[int, int]) -> bool:
+        return tile in self.walkable
+
+    def can_cross(self, here: tuple[int, int], there: tuple[int, int]) -> bool:
+        """Whether the ROM lets a walk cross from `here` into `there` (both
+        already known walkable). Both directions are stored: `CheckForTilePair-
+        Collisions` matches the standing tile against either half of a pair, so
+        the rule is two-way."""
+        return (here, there) not in self.blocked_crossings
+
+
+@cache
+def _map_walkability(map_id: int) -> MapWalkability | None:
+    """`MapWalkability` for `map_id`, or `None` when it can't be decoded.
+
+    `None` covers a missing or undecodable ROM and a map whose records don't
+    resolve (`rom_maps.parse_map` raises `ValueError` on the `UNUSED_MAP_*`
+    placeholder slots among others) - in every case the macro declines to walk
+    rather than planning against a guess.
+
+    Cached per map because `execute_navigation_macro` asks on every step and a
+    map's answer never changes for a given ROM. Building it costs one pass over
+    the map's tiles plus one pair check per adjacent walkable pair: tens of
+    milliseconds on the largest maps in scope (Route 4's 90x18 grid), paid once.
+    """
+    rom, headers, pairs = _rom_bytes(), _tileset_headers(), _tile_pair_collisions()
+    if rom is None or headers is None or pairs is None:
+        return None
+    try:
+        rmap = rom_maps.parse_map(rom, map_id)
+    except ValueError:
+        logger.warning("could not decode map %d from the ROM", map_id, exc_info=True)
+        return None
+
+    width, height = rmap.width_blocks * 2, rmap.height_blocks * 2
+    walkable = frozenset(
+        (x, y)
+        for x in range(width)
+        for y in range(height)
+        if is_walkable(rom, rmap, headers, x, y)
+    )
+
+    blocked: set[tuple[tuple[int, int], tuple[int, int]]] = set()
+    for x, y in sorted(walkable):
+        for neighbour in ((x + 1, y), (x, y + 1)):
+            if neighbour not in walkable:
+                continue
+            if crosses_blocked_pair(rom, rmap, headers, pairs, (x, y), neighbour):
+                blocked.add(((x, y), neighbour))
+                blocked.add((neighbour, (x, y)))
+
+    return MapWalkability(
+        map_id=map_id,
+        width=width,
+        height=height,
+        walkable=walkable,
+        blocked_crossings=frozenset(blocked),
+    )
+
+
+def _hop_tiles(map_id: int) -> frozenset[tuple[int, int]]:
+    """Every hop tile leaving `map_id` (`travel_graph.py`'s `hops_from`), as
+    world coordinates. Empty when the graph has no hops for this map yet."""
+    return frozenset(
+        (hop.from_x, hop.from_y) for hop in _travel_graph().hops_from(map_id)
+    )
 
 
 def _next_step_toward(
-    collision,
-    goal_col: int,
-    goal_row: int,
-    warp_cells: frozenset[tuple[int, int]] = frozenset(),
+    walk: MapWalkability,
+    start: tuple[int, int],
+    goal: tuple[int, int],
+    avoid: frozenset[tuple[int, int]] = frozenset(),
+    refused: frozenset[tuple[tuple[int, int], tuple[int, int]]] = frozenset(),
 ) -> str | None:
-    """A* from the player's fixed grid cell toward `(goal_col, goal_row)`.
+    """The first direction to press to walk `start` toward `goal`, or `None`.
 
-    The goal is expressed in the same screen-relative grid as `collision`
-    and may sit outside it, or on a tile it can't resolve as walkable, since
-    the target is often further away than the locally visible window (see
-    module docstring). When the exact goal can't be reached, this returns
-    the first step of the shortest path toward whichever *reachable* tile
-    ends up closest to it by Manhattan distance, so the macro still makes
-    real progress instead of giving up. Returns `None` if the player's own
-    cell has no walkable neighbours at all.
+    A* over the map's own world tiles. `goal` may sit outside the map, or on a
+    tile the ROM doesn't consider walkable at all (an item ball or an NPC is a
+    legitimate milestone target you interact with from next door), so when the
+    exact goal can't be reached this returns the first step toward whichever
+    *reachable* tile ends up closest to it by Manhattan distance - the macro
+    still makes real progress instead of giving up, as it always has. `None`
+    when the player's own tile isn't walkable or has no legal step out of it.
 
-    `warp_cells` are this map's known hop tiles (screen-relative, see
-    `execute_navigation_macro`), treated as obstacles by `_walkable` unless
-    a cell is `(goal_col, goal_row)` itself - ADR-0002's context-dependent
-    warp treatment.
+    `avoid` holds this map's other hop tiles, treated as obstacles unless a tile
+    is `goal` itself - ADR-0002's context-dependent warp treatment, so the
+    player never gets routed onto a door that isn't the one this step aims at.
+
+    `refused` holds the `(from, to)` edges the ROM has already declined during
+    this walk (see `execute_navigation_macro`). It belongs here rather than only
+    in the caller because this is the only place that decides which tiles are
+    reachable at all: without it, a plan that steps into a tile the ROM refuses
+    for a reason the passable list can't express - a ledge, which needs A to
+    drop off, is the standing example - re-proposes that exact press for every
+    remaining step and never gets anywhere.
     """
-    start = (_PLAYER_GRID_COL, _PLAYER_GRID_ROW)
-    goal = (goal_col, goal_row)
+    if not walk.is_walkable(start):
+        return None
 
     def heuristic(cell: tuple[int, int]) -> int:
         return abs(cell[0] - goal[0]) + abs(cell[1] - goal[1])
+
+    def step_is_legal(here: tuple[int, int], there: tuple[int, int]) -> bool:
+        if (here, there) in refused or not walk.is_walkable(there):
+            return False
+        if not walk.can_cross(here, there):
+            return False
+        return there == goal or there not in avoid
 
     open_heap: list[tuple[int, int, tuple[int, int]]] = [(heuristic(start), 0, start)]
     came_from: dict[tuple[int, int], tuple[int, int]] = {}
@@ -373,18 +535,16 @@ def _next_step_toward(
             break
 
         for dx, dy in _DIRECTIONS.values():
-            neighbor = (current[0] + dx, current[1] + dy)
-            if neighbor in closed or not _walkable(
-                collision, *neighbor, warp_cells, goal
-            ):
+            neighbour = (current[0] + dx, current[1] + dy)
+            if neighbour in closed or not step_is_legal(current, neighbour):
                 continue
             tentative_cost = cost + 1
-            if tentative_cost < best_cost.get(neighbor, math.inf):
-                best_cost[neighbor] = tentative_cost
-                came_from[neighbor] = current
+            if tentative_cost < best_cost.get(neighbour, math.inf):
+                best_cost[neighbour] = tentative_cost
+                came_from[neighbour] = current
                 heapq.heappush(
                     open_heap,
-                    (tentative_cost + heuristic(neighbor), tentative_cost, neighbor),
+                    (tentative_cost + heuristic(neighbour), tentative_cost, neighbour),
                 )
 
     if best_cell == start:
@@ -397,96 +557,118 @@ def _next_step_toward(
     return _DIRECTION_BY_DELTA.get(step)
 
 
-def _screen_cell(
-    player_x: int, player_y: int, world_x: int, world_y: int
-) -> tuple[int, int]:
-    """`(world_x, world_y)` as a screen-relative grid cell, anchored off the
-    player's own current world position - the same world-to-screen delta
-    both a step's goal tile and a known hop tile need converting through."""
-    return (
-        _PLAYER_GRID_COL + world_x - player_x,
-        _PLAYER_GRID_ROW + world_y - player_y,
-    )
-
-
-def _warp_cells_on_screen(
-    map_id: int, player_x: int, player_y: int
-) -> frozenset[tuple[int, int]]:
-    """Screen-relative grid cells for every hop tile known to leave
-    `map_id` (`travel_graph.py`'s `hops_from`), anchored off the player's
-    current world position. Empty when the graph has no hops for this map
-    yet - degrading to plain collision-only pathing."""
-    return frozenset(
-        _screen_cell(player_x, player_y, hop.from_x, hop.from_y)
-        for hop in _travel_graph().hops_from(map_id)
-    )
-
-
 def execute_navigation_macro(
     pyboy: PyBoy, target: NavigationTarget, max_steps: int = 128
 ) -> bool:
     """Walk the player toward `target` over multiple emulator frames.
 
-    Re-reads position and re-plans from the freshly-read local collision
-    grid before every step (see module docstring), rather than committing
-    to one upfront route. Returns whether it moved the player at all.
+    Re-reads the game state and re-plans from the ROM's own walkability for
+    whatever map the player is actually on before every step (see module
+    docstring), rather than committing to one upfront route. Returns whether the
+    player's position changed at any point during the walk - `False` means the
+    macro pressed nothing, or pressed and got nowhere.
 
-    Cross-map routing (ADR-0002, #102): on every step, if the player isn't
-    on `target.map_id` yet, this queries `travel_graph.py`'s hop graph for
-    the next hop from wherever the player currently is toward
-    `target.map_id`, and paths local A* toward that hop's tile on the
-    current map instead of `target`'s own tile - walking onto it triggers
-    the game's own map transition, and the following step (in this call or
-    a later one) picks up the next hop from the new map. If the graph has
-    no route from the current map yet (ADR-0002's incremental build), this
-    is a no-op for the milestone, matching pre-#102 same-map-only behavior,
+    Cross-map routing (ADR-0002, #102): on every step, if the player isn't on
+    `target.map_id` yet, this queries `travel_graph.py`'s hop graph for the next
+    hop from wherever the player currently is toward `target.map_id`, and paths
+    A* toward that hop's tile on the current map instead of `target`'s own tile -
+    walking onto it triggers the game's own map transition, and the following
+    step (in this call or a later one) picks up the next hop from the new map. If
+    the graph has no route from the current map yet (ADR-0002's incremental
+    build), or this map's tiles can't be decoded from the ROM
+    (`_map_walkability` returning `None`), this is a no-op for the milestone
     rather than a crash. Once on `target.map_id`, this paths straight to
-    `target`'s own tile, unchanged from before #102.
+    `target`'s own tile.
 
-    `max_steps` (default 128, up from an earlier 32) bounds how far a
-    single call walks before returning - the local A* below only ever gives
-    up when the player's own cell has no walkable neighbour at all, so in
-    practice this cap, not a real decision point, is what ends most calls.
-    128 is meant to cross a typical multi-screen corridor in one Jev turn
-    (cutting down on redundant "keep going to the same place" calls) while
-    still being bounded against a maze-like dead-end pocket that this
-    local-only planner has no memory of previously-visited cells to avoid.
+    A step the ROM refuses is remembered for the rest of this walk and never
+    re-proposed. `execute_button` holds a direction until the player's position
+    changes, so a refused step costs a full `_MAX_WALK_FRAMES` and changes
+    nothing - and because the A* below is stateless, re-planning from the same
+    tile with the same map would name that same step again on every one of the
+    `max_steps` iterations. That is how a walk can spend its whole budget
+    pressing into one tile and still report that it moved: the press happens,
+    the tile just was never going to accept it (a ledge, which the ROM only lets
+    you step off with A held, is the case actually observed on Pallet Town's
+    plateau edge). Refusing the edge is what turns that into a detour.
 
-    Also returns early - before touching the collision grid or pressing
-    anything - the instant `state.dialog_open` or `state.battle.in_battle`
-    is true, even mid-walk (e.g. a sight-triggered trainer). That keeps a
-    long `max_steps` budget from turning into a burst of blind presses
-    against a battle menu or a dialog box: control goes back to `run_turn`
-    so Jev gets a fresh, per-turn decision there, exactly as it already does
-    for every other in-battle/dialog action.
+    A step that changes `map_id` is followed by `_WARP_SETTLE_FRAMES` of ticking
+    before anything is planned from the new map - see that constant.
+
+    `max_steps` (default 128, up from an earlier 32) bounds how far a single
+    call walks before returning. 128 is meant to cross a typical multi-screen
+    corridor in one Jev turn (cutting down on redundant "keep going to the same
+    place" calls) while still being bounded against a maze-like dead-end pocket
+    that this planner has no memory of previously-visited cells to avoid.
+
+    Also returns early - before planning or pressing anything - the instant
+    `state.dialog_open` or `state.battle.in_battle` is true, even mid-walk (e.g.
+    a sight-triggered trainer). That keeps a long `max_steps` budget from turning
+    into a burst of blind presses against a battle menu or a dialog box: control
+    goes back to `run_turn` so Jev gets a fresh, per-turn decision there, exactly
+    as it already does for every other in-battle/dialog action.
     """
     moved = False
+    # The press whose outcome the next state read will settle: the position it
+    # left the player at, and the tile it was aimed at. `None` once accounted
+    # for. Settling one read late is deliberate - the position that says whether
+    # a press worked is the one the next iteration reads anyway.
+    pending: tuple[tuple[int, int, int], tuple[int, int]] | None = None
+    last_position: tuple[int, int, int] | None = None
+    refused: set[tuple[tuple[int, int], tuple[int, int]]] = set()
+
     for _ in range(max_steps):
         state = extract_game_state(pyboy)
+        position = (state.map_id, state.player_x, state.player_y)
+
+        if pending is not None:
+            if position == pending[0]:
+                refused.add((pending[0][1:], pending[1]))
+            else:
+                moved = True
+            pending = None
+
+        if last_position is not None and position[0] != last_position[0]:
+            for _ in range(_WARP_SETTLE_FRAMES):
+                pyboy.tick(1, True)
+            state = extract_game_state(pyboy)
+            position = (state.map_id, state.player_x, state.player_y)
+        last_position = position
+
         if state.dialog_open or state.battle.in_battle:
             break
 
         if state.map_id == target.map_id:
-            goal_x, goal_y = target.x, target.y
+            goal = (target.x, target.y)
         else:
             hop = next_hop(_travel_graph(), state.map_id, target.map_id)
             if hop is None:
                 break
-            goal_x, goal_y = hop.from_x, hop.from_y
+            goal = (hop.from_x, hop.from_y)
 
-        if goal_x == state.player_x and goal_y == state.player_y:
+        here = (state.player_x, state.player_y)
+        if goal == here:
             break
 
-        collision = pyboy.game_area_collision()
-        goal_col, goal_row = _screen_cell(
-            state.player_x, state.player_y, goal_x, goal_y
+        walk = _map_walkability(state.map_id)
+        if walk is None:
+            break
+
+        step = _next_step_toward(
+            walk, here, goal, _hop_tiles(state.map_id) - {goal}, frozenset(refused)
         )
-        warp_cells = _warp_cells_on_screen(state.map_id, state.player_x, state.player_y)
-        step = _next_step_toward(collision, goal_col, goal_row, warp_cells)
         if step is None:
             break
 
+        delta_x, delta_y = _DIRECTIONS[step]
         execute_button(pyboy, step)
-        moved = True
+        pending = (position, (here[0] + delta_x, here[1] + delta_y))
+
+    if pending is not None:
+        # The loop ended on an unsettled press; read once more so the return
+        # value describes the whole walk rather than everything but its last
+        # step.
+        state = extract_game_state(pyboy)
+        if (state.map_id, state.player_x, state.player_y) != pending[0]:
+            moved = True
 
     return moved

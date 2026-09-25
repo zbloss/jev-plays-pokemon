@@ -36,8 +36,8 @@ A single travel graph edge — one warp door or map-edge connection — that tak
 _Avoid_: "warp" alone when a connection-based hop is equally possible
 
 **Last-mile pathing**:
-The existing local A* search over PyBoy's on-screen collision window, scoped to walking from the player's current position to the next hop's tile (or the milestone's own target tile, once on the target map) rather than to a distant milestone target directly.
-_Avoid_: "local pathfinding" alone once the travel graph exists — ambiguous about whether the whole route or just the current map's last leg is meant
+The existing local A* search over the walkability decoded from the ROM's own tileset collision data for the whole current map (`tileset_collision.py`, world-tile coordinates), scoped to walking from the player's current position to the next hop's tile (or the milestone's own target tile, once on the target map) rather than to a distant milestone target directly.
+_Avoid_: "local pathfinding" alone once the travel graph exists — ambiguous about whether the whole route or just the current map's last leg is meant; "screen-window pathing" — the A* no longer plans against PyBoy's `game_area_collision()` window
 
 **Game state**:
 The structured text description of the current moment in the game that gets handed to Jev as input for a decision. Preferred source is direct extraction from emulator memory (RAM); a vision-model-as-tool-call is the fallback path when reliable RAM extraction isn't available for a given piece of state.

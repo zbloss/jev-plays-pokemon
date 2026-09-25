@@ -171,7 +171,14 @@ def test_build_hops_resolves_last_map_edges_without_a_hardcoded_destination():
     """The interior's own `LAST_MAP` exits carry no destination map at all
     in their raw data - `build_hops` must discover the outdoor map
     (`_OUTDOOR_MAP_ID`) itself, from the scoped ROM data, not from any
-    value this test or `travel_graph.py` hand-declares."""
+    value this test or `travel_graph.py` hand-declares.
+
+    Only the door tile the player can actually be *landed on* gets an exit
+    hop (see `_find_entrance_map`), which is why this is one hop and not the
+    two `LAST_MAP` records the interior declares: the interior's second
+    `LAST_MAP` tile is the other half of the same door, and nothing in scope
+    lands on it, so a hop out of it would be a claim about a `wLastMap` value
+    no walk can ever produce."""
     map_ids = frozenset({_OUTDOOR_MAP_ID, _INTERIOR_MAP_ID})
     hops = tg.build_hops(_ROM_MAPS, map_ids)
 
@@ -189,8 +196,134 @@ def test_build_hops_resolves_last_map_edges_without_a_hardcoded_destination():
         for h in hops
         if h.from_map == _INTERIOR_MAP_ID and h.to_map == _OUTDOOR_MAP_ID
     ]
-    assert len(backward) == 2  # both LAST_MAP doors resolve
-    assert all((h.to_x, h.to_y) == (12, 11) for h in backward)
+    assert len(backward) == 1  # the landing half of the door, and only that
+    assert (backward[0].from_x, backward[0].from_y) == (5, 11)
+    assert (backward[0].to_x, backward[0].to_y) == (12, 11)
+
+
+# An interior with *two* entrances, mirroring Red's House 1F: one door from
+# the town and one staircase from its own upstairs floor, both landing on this
+# map, both with a `LAST_MAP` record on the tile they land on. Counting maps
+# that warp into the interior finds two candidates and learns nothing; the
+# tile a walk can be dropped onto identifies the door it came in through.
+_TWO_ENTRANCE_INTERIOR_ID = 203
+_UPSTAIRS_MAP_ID = 204
+_TWO_ENTRANCE_TOWN_ID = 205
+_SECOND_TOWN_ID = 206
+
+_TWO_ENTRANCE_TOWN = RomMap(
+    map_id=_TWO_ENTRANCE_TOWN_ID,
+    tileset_id=0,
+    height_blocks=9,
+    width_blocks=10,
+    blocks=b"",
+    objects=(),
+    warps=(MapWarp(x=5, y=5, dest_warp=0, dest_map=_TWO_ENTRANCE_INTERIOR_ID),),
+    connections=(),
+)
+
+_TWO_ENTRANCE_INTERIOR = RomMap(
+    map_id=_TWO_ENTRANCE_INTERIOR_ID,
+    tileset_id=2,
+    height_blocks=4,
+    width_blocks=4,
+    blocks=b"",
+    objects=(),
+    warps=(
+        MapWarp(x=2, y=7, dest_warp=0, dest_map=None),  # the town's front door
+        MapWarp(x=7, y=1, dest_warp=0, dest_map=_UPSTAIRS_MAP_ID),  # up the stairs
+    ),
+    connections=(),
+)
+
+_UPSTAIRS_MAP = RomMap(
+    map_id=_UPSTAIRS_MAP_ID,
+    tileset_id=2,
+    height_blocks=4,
+    width_blocks=4,
+    blocks=b"",
+    objects=(),
+    warps=(MapWarp(x=7, y=1, dest_warp=1, dest_map=_TWO_ENTRANCE_INTERIOR_ID),),
+    connections=(),
+)
+
+_TWO_ENTRANCE_ROM_MAPS = {
+    _TWO_ENTRANCE_TOWN_ID: _TWO_ENTRANCE_TOWN,
+    _TWO_ENTRANCE_INTERIOR_ID: _TWO_ENTRANCE_INTERIOR,
+    _UPSTAIRS_MAP_ID: _UPSTAIRS_MAP,
+}
+_TWO_ENTRANCE_MAP_IDS = frozenset(_TWO_ENTRANCE_ROM_MAPS)
+
+
+def test_find_entrance_map_picks_the_map_whose_warp_lands_on_this_exact_tile():
+    """Two maps warp into this interior, so "which map is the `LAST_MAP`
+    door's `wLastMap`?" has no answer in a count of incoming warps - it has
+    one in *where* each of them drops the player. The front door's tile is
+    the town's landing tile, the staircase's is the upstairs map's, and each
+    `LAST_MAP` record resolves to its own counterpart."""
+    front_door, staircase = _TWO_ENTRANCE_INTERIOR.warps
+
+    assert (
+        tg._find_entrance_map(
+            _TWO_ENTRANCE_ROM_MAPS,
+            _TWO_ENTRANCE_MAP_IDS,
+            _TWO_ENTRANCE_INTERIOR_ID,
+            front_door,
+        )
+        == _TWO_ENTRANCE_TOWN_ID
+    )
+    assert (
+        tg._find_entrance_map(
+            _TWO_ENTRANCE_ROM_MAPS,
+            _TWO_ENTRANCE_MAP_IDS,
+            _TWO_ENTRANCE_INTERIOR_ID,
+            staircase,
+        )
+        == _UPSTAIRS_MAP_ID
+    )
+
+
+def test_find_entrance_map_refuses_to_guess_when_two_maps_land_in_the_same_spot():
+    """Two in-scope maps landing on one tile is a real ambiguity about
+    `wLastMap`, and a guessed map would produce a hop to a tile the player
+    can never arrive at - `None` (and therefore no hop) is the honest answer."""
+    second_town = RomMap(
+        map_id=_SECOND_TOWN_ID,
+        tileset_id=0,
+        height_blocks=9,
+        width_blocks=10,
+        blocks=b"",
+        objects=(),
+        warps=(MapWarp(x=1, y=1, dest_warp=0, dest_map=_TWO_ENTRANCE_INTERIOR_ID),),
+        connections=(),
+    )
+    rom_maps = {**_TWO_ENTRANCE_ROM_MAPS, _SECOND_TOWN_ID: second_town}
+    front_door = _TWO_ENTRANCE_INTERIOR.warps[0]
+
+    assert (
+        tg._find_entrance_map(
+            rom_maps,
+            _TWO_ENTRANCE_MAP_IDS | {_SECOND_TOWN_ID},
+            _TWO_ENTRANCE_INTERIOR_ID,
+            front_door,
+        )
+        is None
+    )
+
+
+def test_build_hops_gives_a_two_entrance_interior_one_door_back_out():
+    """The consequence the two tests above exist for: the front door gets its
+    exit hop, so a route out of a two-entrance map exists even though a
+    count-based lookup would have dropped the door for being ambiguous."""
+    hops = tg.build_hops(_TWO_ENTRANCE_ROM_MAPS, _TWO_ENTRANCE_MAP_IDS)
+    leaving = {
+        (h.from_x, h.from_y, h.to_map, h.to_x, h.to_y)
+        for h in hops
+        if h.from_map == _TWO_ENTRANCE_INTERIOR_ID
+    }
+
+    assert (2, 7, _TWO_ENTRANCE_TOWN_ID, 5, 5) in leaving
+    assert (7, 1, _UPSTAIRS_MAP_ID, 7, 1) in leaving
 
 
 def test_build_hops_skips_warps_whose_destination_is_out_of_scope():
