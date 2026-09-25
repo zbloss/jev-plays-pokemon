@@ -29,7 +29,10 @@ tests:
   synchronized against ``pyboy`` by one shared lock - wraps its state/action
   seams for stuck detection (#57), and runs ``run_loop`` until interrupted -
   catching (and logging) a crash in-process and exiting nonzero, for
-  ``watchdog.py`` (#58) to restart.
+  ``watchdog.py`` (#58) to restart. A run whose stuck-recovery ladder runs
+  out instead raises ``stuck_detection.StuckRunAborted`` and exits with
+  ``watchdog.EXIT_CODE_STUCK_ABORT``, which that watchdog deliberately does
+  *not* restart on.
 
 The ``jev-plays-pokemon`` console script (``cli.py``, ADR 0001) is what
 actually invokes ``main`` in production; this module has no CLI parsing of
@@ -85,8 +88,11 @@ from jev_plays_pokemon.stream_surface import (
     start_stream_surface_server,
     stream_logger,
 )
-from jev_plays_pokemon.stuck_detection import wrap_for_stuck_detection
-from jev_plays_pokemon.watchdog import touch_heartbeat
+from jev_plays_pokemon.stuck_detection import (
+    StuckRunAborted,
+    wrap_for_stuck_detection,
+)
+from jev_plays_pokemon.watchdog import EXIT_CODE_STUCK_ABORT, touch_heartbeat
 
 logger = logging.getLogger(__name__)
 
@@ -337,8 +343,11 @@ def main(
     save_snapshot = with_pyboy_lock(emulator.make_pyboy_snapshot_saver(pyboy))
 
     def load_snapshot_if_present() -> None:
-        # A stuck escalation before any snapshot has ever been saved has
-        # nothing to reload yet - log and continue rather than crash.
+        # `emulator.boot_or_resume` now saves a snapshot on every cold boot, so
+        # in a normal run there is always something to reload here. The check
+        # stays because the file can still go away (deleted, unreadable, a
+        # `--rom-path` run whose snapshot path was never writable) - and
+        # logging and continuing beats crashing a live run over it.
         if emulator.DEFAULT_SNAPSHOT_PATH.exists():
             with pyboy_lock:
                 emulator.load_snapshot(pyboy)
@@ -377,6 +386,7 @@ def main(
         log_and_update_surface(decision)
 
     crashed = False
+    gave_up = False
     try:
         run_loop(
             state_source,
@@ -388,6 +398,13 @@ def main(
         )
     except KeyboardInterrupt:
         logger.info("interrupted; shutting down")
+    except StuckRunAborted as abort:
+        # Not a crash: the run's own recovery ladder (#57) decided this state
+        # is not recoverable and stopped billing against it. Logged and exited
+        # with its own code (#58) so the watchdog stops rather than restarts
+        # straight back into the stuck state.
+        logger.error("run gave up: %s", abort)
+        gave_up = True
     except Exception:
         # Caught in-process (#58) rather than left to propagate as a bare
         # traceback: logged here, then a deliberate nonzero exit below (once
@@ -404,3 +421,5 @@ def main(
 
     if crashed:
         sys.exit(1)
+    if gave_up:
+        sys.exit(EXIT_CODE_STUCK_ABORT)

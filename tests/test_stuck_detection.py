@@ -1,11 +1,14 @@
 import dataclasses
 
+import pytest
+
 from jev_plays_pokemon.decision import NAVIGATION_MACRO_ACTION
 from jev_plays_pokemon.game_state import BattleState, GameState
 from jev_plays_pokemon.navigation import RAW_BUTTONS
 from jev_plays_pokemon.stuck_detection import (
     RecoveryTier,
     StuckRecoveryPolicy,
+    StuckRunAborted,
     TurnRecord,
     is_stuck,
     wrap_for_stuck_detection,
@@ -116,6 +119,44 @@ def test_recovery_policy_honors_a_custom_escalation_threshold():
     tiers = [policy.on_turn(stuck=True) for _ in range(2)]
 
     assert tiers == [RecoveryTier.NUDGE, RecoveryTier.RELOAD]
+
+
+def test_recovery_policy_gives_up_once_the_reload_budget_is_spent():
+    # escalation_threshold=1 so every stuck turn is an escalation, keeping
+    # the sequence short: two reloads, then the third escalation is the run
+    # stopping itself rather than billing another ~100 turns (#59's run never
+    # stopped at all).
+    policy = StuckRecoveryPolicy(escalation_threshold=1, max_reloads=2)
+    tiers = [policy.on_turn(stuck=True) for _ in range(3)]
+
+    assert tiers == [
+        RecoveryTier.RELOAD,
+        RecoveryTier.RELOAD,
+        RecoveryTier.ABORT,
+    ]
+
+
+def test_a_single_non_stuck_turn_does_not_hand_the_reload_budget_back():
+    # Deliberate, and the reason the budget can't be keyed to `stuck`:
+    # reloading clears the caller's history, so the turn right after a reload
+    # is *always* reported not-stuck yet (too little history). Resetting here
+    # would hand the budget back on every reload and bound nothing.
+    policy = StuckRecoveryPolicy(escalation_threshold=1, max_reloads=1)
+
+    assert policy.on_turn(stuck=True) is RecoveryTier.RELOAD
+    assert policy.on_turn(stuck=False) is RecoveryTier.NONE
+    assert policy.on_turn(stuck=True) is RecoveryTier.ABORT
+
+
+def test_note_progress_hands_the_reload_budget_back():
+    # The signal that actually means something - the run got somewhere the
+    # reload didn't put it - is reported through note_progress (see
+    # wrap_for_stuck_detection, which is what calls it).
+    policy = StuckRecoveryPolicy(escalation_threshold=1, max_reloads=1)
+
+    assert policy.on_turn(stuck=True) is RecoveryTier.RELOAD
+    policy.note_progress()
+    assert policy.on_turn(stuck=True) is RecoveryTier.RELOAD
 
 
 def _game_state(**overrides) -> GameState:
@@ -232,3 +273,80 @@ def test_wrap_escalates_to_reload_and_clears_history_after_a_sustained_stuck_run
     wrapped_state_source()
     wrapped_execute_action("up")
     assert reloads == [None]
+
+
+def _position_source(*positions):
+    """A `state_source` yielding `positions` in order, repeating the last one
+    forever once they run out.
+
+    Needed by the reload-budget tests because a reload itself performs one
+    extra read to see where it landed, so a scripted sequence has a turn
+    boundary that isn't a turn.
+    """
+    remaining = list(positions)
+
+    def source():
+        position = remaining.pop(0) if remaining else positions[-1]
+        map_id, player_x, player_y = position
+        return _game_state(map_id=map_id, player_x=player_x, player_y=player_y)
+
+    return source
+
+
+def test_wrap_aborts_instead_of_reloading_a_fourth_time():
+    # The #59 case: the position never moves, so every reload buys nothing and
+    # the ladder would otherwise nudge/reload/re-detect forever. Here it gets
+    # its budget (1 reload) spent, and the next escalation raises instead.
+    reloads: list[None] = []
+    wrapped_state_source, wrapped_execute_action = wrap_for_stuck_detection(
+        lambda: _game_state(),  # always the same position
+        lambda action: None,
+        load_snapshot=lambda: reloads.append(None),
+        threshold=2,
+        escalation_threshold=3,
+        max_reloads=1,
+        legal_actions=("nudge",),
+        random_choice=lambda actions: actions[0],
+    )
+
+    with pytest.raises(StuckRunAborted):
+        for _ in range(20):
+            wrapped_state_source()
+            wrapped_execute_action("up")
+
+    # Exactly the budgeted number of reloads - the abort replaced the rest.
+    assert reloads == [None]
+
+
+def test_wrap_can_reload_again_once_the_run_walks_somewhere_new():
+    # Turns 1-4: stuck at _POS -> nudge, wait, reload. Turn 4's reload then
+    # reads its own landing (_ELSEWHERE) as turn 5's read. From turn 6 the run
+    # is at a third tile it reached on its own, so the budget is restored and
+    # a second reload is allowed instead of an abort.
+    reloads: list[None] = []
+    wrapped_state_source, wrapped_execute_action = wrap_for_stuck_detection(
+        _position_source(
+            _POS,  # turn 1
+            _POS,  # turn 2 -> nudge
+            _POS,  # turn 3 -> waiting
+            _POS,  # turn 4 -> reload #1
+            _ELSEWHERE,  # the reload's own landing read
+            (40, 5, 5),  # turn 5 -> somewhere the reload didn't put it
+            (40, 5, 5),  # turn 6 -> stuck again -> nudge
+            (40, 5, 5),  # turn 7 -> waiting
+            (40, 5, 5),  # turn 8 -> reload #2, allowed
+        ),
+        lambda action: None,
+        load_snapshot=lambda: reloads.append(None),
+        threshold=2,
+        escalation_threshold=3,
+        max_reloads=1,
+        legal_actions=("nudge",),
+        random_choice=lambda actions: actions[0],
+    )
+
+    for _ in range(9):
+        wrapped_state_source()
+        wrapped_execute_action("up")
+
+    assert reloads == [None, None]

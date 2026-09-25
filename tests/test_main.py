@@ -8,9 +8,12 @@ from pyboy import PyBoy
 from jev_plays_pokemon.decision import make_pyboy_action_executor
 from jev_plays_pokemon.emulator import DEFAULT_ROM_PATH, boot_to_controllable_state
 from jev_plays_pokemon.game_state import BattleState, GameState, extract_game_state
-from jev_plays_pokemon.main import build_dialog_text_source, run_loop
+from jev_plays_pokemon.main import build_dialog_text_source, main, run_loop
 from jev_plays_pokemon.resilience import TurnSkipped
+from jev_plays_pokemon.settings import Settings
 from jev_plays_pokemon.stream_surface import StreamSurface, stream_logger
+from jev_plays_pokemon.stuck_detection import StuckRunAborted
+from jev_plays_pokemon.watchdog import EXIT_CODE_STUCK_ABORT
 
 
 def _game_state(**overrides) -> GameState:
@@ -456,6 +459,102 @@ def test_run_loop_never_saves_when_no_save_snapshot_seam_is_given():
         on_decision=lambda decision: None,
         max_turns=2,
     )
+
+
+# -- main(): the exit codes watchdog.py (#58) reads ---------------------------
+
+
+class _FakePyBoyWithStop:
+    """Just enough PyBoy for `main()`'s cleanup path: it only ever gets
+    `stop(save=False)` called on it here, since `run_loop` never runs."""
+
+    def __init__(self) -> None:
+        self.stop_saved: bool | None = None
+
+    def stop(self, save: bool = True) -> None:
+        self.stop_saved = save
+
+
+class _FakeServer:
+    def __init__(self) -> None:
+        self.server_address = ("127.0.0.1", 54321)
+        self.shutdowns = 0
+        self.closes = 0
+
+    def shutdown(self) -> None:
+        self.shutdowns += 1
+
+    def server_close(self) -> None:
+        self.closes += 1
+
+
+class _FakeTimer:
+    def __init__(self) -> None:
+        self.stops = 0
+
+    def stop(self) -> None:
+        self.stops += 1
+
+
+def _main_with_a_failing_loop(monkeypatch, boom: BaseException):
+    """Run `main()` with every external seam faked and `run_loop` raising
+    `boom`, so what's left under test is `main()`'s own error handling: the
+    distinct exit code it maps that to, and that cleanup still happens.
+    """
+    pyboy = _FakePyBoyWithStop()
+    server = _FakeServer()
+    timers = [_FakeTimer(), _FakeTimer()]
+    monkeypatch.setattr(
+        "jev_plays_pokemon.emulator.boot_or_resume", lambda rom_path: pyboy
+    )
+    monkeypatch.setattr("jev_plays_pokemon.main.capture_screen", lambda pyboy: "img")
+    monkeypatch.setattr(
+        "jev_plays_pokemon.main.start_frame_capture", lambda *a, **k: timers[0]
+    )
+    monkeypatch.setattr(
+        "jev_plays_pokemon.main.start_emulator_clock", lambda *a, **k: timers[1]
+    )
+    monkeypatch.setattr(
+        "jev_plays_pokemon.main.start_stream_surface_server", lambda *a, **k: server
+    )
+    monkeypatch.setattr(
+        "jev_plays_pokemon.main.load_dialog_decoder_or_none", lambda **k: None
+    )
+    # Not what these tests are about, and it writes at the working-tree root.
+    monkeypatch.setattr("jev_plays_pokemon.main.touch_heartbeat", lambda: None)
+
+    def failing_loop(*args, **kwargs):
+        raise boom
+
+    monkeypatch.setattr("jev_plays_pokemon.main.run_loop", failing_loop)
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(jev_client=_ScriptedJevClient([]), settings=Settings(), stream_port=0)
+
+    assert pyboy.stop_saved is False, "the run must not leave a save behind"
+    assert server.shutdowns == 1 and server.closes == 1
+    assert [timer.stops for timer in timers] == [1, 1]
+    return exit_info.value.code
+
+
+def test_main_exits_with_the_stuck_abort_code_when_the_ladder_gives_up(monkeypatch):
+    # watchdog.py deliberately does not restart on this code, so the run
+    # giving up on an unrecoverable stuck state has to be distinguishable from
+    # a crash - which is what keeps #57's give-up from becoming a restart loop
+    # back into the same stuck state.
+    code = _main_with_a_failing_loop(
+        monkeypatch, StuckRunAborted("stuck persisted through 3 snapshot reload(s)")
+    )
+
+    assert code == EXIT_CODE_STUCK_ABORT
+
+
+def test_main_still_exits_one_on_an_ordinary_crash(monkeypatch):
+    # The pre-existing crash path (#58's restart signal) must be unchanged by
+    # the give-up branch added above it.
+    code = _main_with_a_failing_loop(monkeypatch, RuntimeError("PyBoy died"))
+
+    assert code == 1
 
 
 # -- end-to-end: the real per-turn cycle against a booted ROM ------------------

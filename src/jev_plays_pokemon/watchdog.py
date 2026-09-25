@@ -52,6 +52,13 @@ DEFAULT_POLL_INTERVAL_SECONDS = 5.0
 # regenerable run state, not something to check in.
 DEFAULT_HEARTBEAT_PATH = Path(__file__).resolve().parents[2] / "heartbeat.txt"
 
+# The exit code `main.py` uses for `stuck_detection.StuckRunAborted` - the run
+# decided it was unrecoverable and stopped itself. Distinct from a crash's
+# plain `1` precisely because restarting would be wrong: the next start
+# resumes the same snapshot the last run gave up on. `3` rather than `2`
+# because Typer/argparse already exit `2` on CLI misuse.
+EXIT_CODE_STUCK_ABORT = 3
+
 
 def touch_heartbeat(path: str | Path = DEFAULT_HEARTBEAT_PATH) -> None:
     """Update `path`'s mtime to now, creating it if it doesn't exist yet.
@@ -107,6 +114,10 @@ def run_watchdog(
     `max_polls` bound the loop for tests rather than needing a real hang or
     a real subprocess.
 
+    `EXIT_CODE_STUCK_ABORT` is the one exit that is never restarted: the run
+    stopped itself because its own recovery ladder exhausted, so a restart
+    would only boot back into the state it just gave up on.
+
     `spawn` is a zero-argument seam returning a fresh process handle each
     call - production passes a real `subprocess.Popen`; tests inject a fake
     exposing just `poll`/`terminate`/`kill`/`wait`. This function never
@@ -121,6 +132,14 @@ def run_watchdog(
         while True:
             exit_code = process.poll()
             if exit_code is not None:
+                if exit_code == EXIT_CODE_STUCK_ABORT:
+                    logger.error(
+                        "watchdog: subprocess gave up on a stuck run (exit %s); "
+                        "stopping rather than restarting - a fresh start would "
+                        "resume the very snapshot this one gave up on",
+                        exit_code,
+                    )
+                    return
                 logger.warning(
                     "watchdog: subprocess exited with code %s; restarting", exit_code
                 )
