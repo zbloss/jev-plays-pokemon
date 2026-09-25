@@ -8,6 +8,13 @@ the loop was stuck needs a human watching each decision go by; at several
 calls per second that's impossible, and every call is a real, billed
 TypeSafe request.
 
+Two things about that run itself have since been fixed: a cold boot now saves
+a snapshot (`emulator.boot_or_resume`), so the reload tier has something to
+reload; and the ladder gives up after `stuck_detection.DEFAULT_MAX_RELOADS`
+reload that didn't take, instead of re-detecting every ~100 turns forever.
+Slowing the loop down is still the only way to actually *watch* a stuck run go
+by, which is what this module is for.
+
 `RateLimitedJevClient` is `JevClient`-shaped (same `system_one(state,
 questions)` signature as `resilience.ResilientJevClient`, which it composes
 with the same way: wherever a real or fake `JevClient` goes), and caps the

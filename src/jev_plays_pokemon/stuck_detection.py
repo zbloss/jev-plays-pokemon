@@ -12,7 +12,7 @@ sequence has cycled, over a tunable trailing window (`DEFAULT_STUCK_THRESHOLD`,
 100 turns - ~30s at the tactical loop's ~3.3 turns/s, per
 `docs/turn-rate-budget.md`).
 
-Recovery is two-tier, tracked by `StuckRecoveryPolicy`:
+Recovery is three-tier, tracked by `StuckRecoveryPolicy`:
 
 1. Nudge: the first stuck detection injects one random legal action to
    break the input pattern - no reload.
@@ -21,6 +21,16 @@ Recovery is two-tier, tracked by `StuckRecoveryPolicy`:
    triggered the nudge), escalate to reloading the latest persisted
    snapshot (`emulator.py`, #55). A detection streak that breaks (position
    moves again) resets the policy back to tier 1 for next time.
+3. Give up: after `DEFAULT_MAX_RELOADS` reloads that never took - nothing
+   moved the player from where the reload left them - `wrap_for_stuck_detection`
+   raises `StuckRunAborted` instead of reloading again. Without this the
+   ladder had no floor: #59's run re-detected every ~100 turns, reloaded
+   something that either didn't exist yet or was itself saved mid-stuck,
+   cleared its history, and billed another ~100 decisions - 570 of them in
+   ~102 seconds, unbounded. Aborting costs a bounded number of calls and
+   exits with `watchdog.EXIT_CODE_STUCK_ABORT`, which the watchdog
+   deliberately does not restart on: restarting would resume the same stuck
+   state.
 
 `wrap_for_stuck_detection` is the production integration point: a thin
 wrapper seam around `main.run_loop`'s own `state_source`/`execute_action`
@@ -49,8 +59,27 @@ DEFAULT_STUCK_THRESHOLD = 100
 # Consecutive stuck detections - counting the one that triggers the nudge -
 # before escalating to a snapshot reload.
 DEFAULT_ESCALATION_THRESHOLD = 3
+# Reloads that never took - each followed by no non-stuck turn at all - before
+# the run gives up entirely. Each futile reload costs roughly
+# `DEFAULT_STUCK_THRESHOLD` more billed decisions before it is even detected,
+# so this is the cap on how much a permanently-stuck run can spend: ~3
+# reloads + the detections between them is a few hundred decisions instead of
+# an unbounded number until a human notices (#59 billed 570 in ~102s).
+DEFAULT_MAX_RELOADS = 3
 
 Position = tuple[int, int, int]  # (map_id, player_x, player_y)
+
+
+class StuckRunAborted(RuntimeError):
+    """Raised out of the wrapped `execute_action` seam when the run has
+    exhausted its recovery ladder without ever unsticking.
+
+    Propagates through `main.run_loop` (nothing in `decision.run_turn`
+    catches it - only `resilience.TurnSkipped`, and only around the Jev call,
+    not around `execute_action`) to `main.main`, which logs it and exits with
+    `watchdog.EXIT_CODE_STUCK_ABORT` rather than the generic crash code, so
+    the watchdog can tell "this run decided to stop" from "this run broke".
+    """
 
 
 @dataclass(frozen=True)
@@ -99,22 +128,41 @@ class RecoveryTier(Enum):
     NONE = "none"
     NUDGE = "nudge"
     RELOAD = "reload"
+    ABORT = "abort"
 
 
 class StuckRecoveryPolicy:
-    """Tracks the nudge/reload escalation state machine across turns.
+    """Tracks the nudge/reload/give-up escalation state machine across turns.
 
-    `on_turn(stuck)` is the whole interface: feed it this turn's `is_stuck`
+    `on_turn(stuck)` is the normal interface: feed it this turn's `is_stuck`
     verdict, get back the recovery tier to apply. A `False` at any point
     resets the streak - a run that's moving again starts back at tier 1
     (nudge) the next time it gets stuck.
+
+    The reload budget deliberately does *not* come back on a `False` verdict,
+    because reloading clears the caller's history and the turn right after
+    that is never stuck yet - keying the budget to `stuck` would hand it back
+    on every single reload and bound nothing. `note_progress()` is the
+    caller's way of reporting the signal that actually means something: the
+    run has been somewhere since the last reload that the reload itself did
+    not put it at.
     """
 
     def __init__(
-        self, escalation_threshold: int = DEFAULT_ESCALATION_THRESHOLD
+        self,
+        escalation_threshold: int = DEFAULT_ESCALATION_THRESHOLD,
+        max_reloads: int = DEFAULT_MAX_RELOADS,
     ) -> None:
         self._escalation_threshold = escalation_threshold
+        self._max_reloads = max_reloads
         self._consecutive_stuck = 0
+        self._reloads = 0
+
+    def note_progress(self) -> None:
+        """Report that the run has made real progress, restoring the reload
+        budget (#59's run never earned this back - it reloaded, re-detected at
+        the same spot, and reloaded again)."""
+        self._reloads = 0
 
     def on_turn(self, stuck: bool) -> RecoveryTier:
         if not stuck:
@@ -123,6 +171,9 @@ class StuckRecoveryPolicy:
         self._consecutive_stuck += 1
         if self._consecutive_stuck >= self._escalation_threshold:
             self._consecutive_stuck = 0
+            if self._reloads >= self._max_reloads:
+                return RecoveryTier.ABORT
+            self._reloads += 1
             return RecoveryTier.RELOAD
         if self._consecutive_stuck == 1:
             return RecoveryTier.NUDGE
@@ -136,6 +187,7 @@ def wrap_for_stuck_detection(
     load_snapshot: Callable[[], None],
     threshold: int = DEFAULT_STUCK_THRESHOLD,
     escalation_threshold: int = DEFAULT_ESCALATION_THRESHOLD,
+    max_reloads: int = DEFAULT_MAX_RELOADS,
     legal_actions: Sequence[str] | None = None,
     random_choice: Callable[[Sequence[str]], str] = random.choice,
 ) -> tuple[Callable[[], GameState], Callable[[str], None]]:
@@ -160,15 +212,32 @@ def wrap_for_stuck_detection(
     injected button, not the wrapped one - the nudge is an out-of-band
     recovery action, not another turn, so it isn't itself recorded into the
     history `is_stuck` evaluates.
+
+    `max_reloads` bounds the reload tier: once that many reloads have gone by
+    without the player getting anywhere other than where the reload itself
+    left them, the wrapped `execute_action` raises `StuckRunAborted` instead
+    of reloading again, so a permanently-stuck run stops itself after a
+    bounded spend rather than billing forever (#59's run reached 570
+    decisions this way). A run that does walk somewhere new earns its budget
+    back. `max_reloads=0` makes the first escalation that reaches the reload
+    tier abort outright.
     """
     history: deque[TurnRecord] = deque(maxlen=threshold)
-    policy = StuckRecoveryPolicy(escalation_threshold=escalation_threshold)
+    policy = StuckRecoveryPolicy(
+        escalation_threshold=escalation_threshold, max_reloads=max_reloads
+    )
     last_position: list[Position | None] = [None]
     last_milestone: list[Milestone | None] = [None]
+    # Where the most recent reload left the player, or None once they have
+    # been somewhere else since (see the progress check below).
+    reloaded_into: list[Position | None] = [None]
+
+    def _position_of(state: GameState) -> Position:
+        return (state.map_id, state.player_x, state.player_y)
 
     def wrapped_state_source() -> GameState:
         state = state_source()
-        last_position[0] = (state.map_id, state.player_x, state.player_y)
+        last_position[0] = _position_of(state)
         last_milestone[0] = track_milestones(state.event_flags, state.badges).current
         return state
 
@@ -180,6 +249,17 @@ def wrap_for_stuck_detection(
             # state_source hasn't been called yet this run - nothing to
             # pair this action with; skip recording rather than guess.
             return
+
+        if reloaded_into[0] is not None and position != reloaded_into[0]:
+            # Somewhere other than where the last reload dropped the player:
+            # the run has moved under its own steam since, so the reload
+            # ladder has something to work with again. Compared against the
+            # post-reload position, not the position it was stuck at - a
+            # reload to the boot state changes the position on its own, and
+            # that is not the run making progress.
+            policy.note_progress()
+            reloaded_into[0] = None
+
         history.append(TurnRecord(position=position, action=action))
 
         stuck = is_stuck(history, threshold=threshold)
@@ -197,5 +277,15 @@ def wrap_for_stuck_detection(
             logger.warning("stuck persisted after nudge; reloading the latest snapshot")
             load_snapshot()
             history.clear()
+            # Read the reloaded state back: `load_snapshot` can put the player
+            # anywhere (the boot state's bedroom, most often), and the progress
+            # check above only means anything against where it actually landed.
+            reloaded_into[0] = _position_of(state_source())
+        elif tier is RecoveryTier.ABORT:
+            raise StuckRunAborted(
+                f"stuck persisted through {max_reloads} snapshot reload(s), each "
+                f"detected over a {threshold}-turn window; giving up rather than "
+                "billing more decisions against a state recovery cannot fix"
+            )
 
     return wrapped_state_source, wrapped_execute_action

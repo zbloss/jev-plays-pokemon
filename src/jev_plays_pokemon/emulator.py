@@ -20,7 +20,11 @@ tests share one definition rather than each carrying their own copy.
 minimal persistence: a live run's `pyboy.save_state()` overwrites the single
 latest snapshot on disk (no history), and `boot_or_resume` loads it back on
 the next startup instead of replaying the intro-mash - the intro sequence
-below only ever runs again once no snapshot exists yet.
+below only ever runs again once no snapshot exists yet. A cold boot also
+*saves* the state it just mashed its way to, so a snapshot exists from the
+first second of every run rather than only after the first thing worth
+saving has happened (see `boot_or_resume` for why that matters to #57's
+recovery ladder).
 
 Deterministic: the Pokemon Red cartridge has no RTC chip, so nothing in this
 sequence depends on wall-clock time, and the same inputs land on the same
@@ -175,11 +179,25 @@ def boot_or_resume(
     A snapshot already carries a fully in-game state, so it's loaded onto a
     freshly created (not intro-mashed) instance. With no snapshot on disk -
     every cold start until the first save - this falls back to
-    `boot_to_controllable_state`'s fixed intro-mash sequence, unchanged.
+    `boot_to_controllable_state`'s fixed intro-mash sequence, unchanged, and
+    then immediately saves the controllable state it reached.
+
+    That boot-time save is what makes `stuck_detection.py`'s top recovery
+    rung (reload the latest snapshot) actually reachable. Until now a
+    snapshot only ever appeared on a milestone completion or
+    `main._SAVE_INTERVAL_SECONDS` (600s) - and a run that gets stuck early
+    produces neither, so the escalation could only log "no snapshot exists
+    yet" and carry on in the same stuck state, re-detecting every ~100 turns
+    forever. That is how #59's run billed 570 decisions in ~102s without
+    ever breaking out. Reloading the boot state is a slow recovery (back to
+    the bedroom, empty party), but it is a real one: the position changes, so
+    the stuck streak breaks.
     """
     snapshot_path = Path(snapshot_path)
     if snapshot_path.exists():
         pyboy = create_pyboy(rom_path)
         load_snapshot(pyboy, snapshot_path)
         return pyboy
-    return boot_to_controllable_state(rom_path)
+    pyboy = boot_to_controllable_state(rom_path)
+    save_snapshot(pyboy, snapshot_path)
+    return pyboy

@@ -2,6 +2,7 @@ import os
 import sys
 
 from jev_plays_pokemon.watchdog import (
+    EXIT_CODE_STUCK_ABORT,
     run_watchdog,
     spawn_run_subprocess,
     touch_heartbeat,
@@ -80,6 +81,32 @@ def test_restarts_the_subprocess_on_a_nonzero_exit(tmp_path):
         # Exited on its own - the watchdog has no reason to terminate/kill it.
         assert process.terminated is False
         assert process.killed is False
+
+
+def test_a_stuck_abort_exit_stops_the_watchdog_instead_of_restarting(tmp_path):
+    # `main.py` exits with this code when its stuck-recovery ladder runs out
+    # (#57). Restarting would boot straight back into the snapshot the run
+    # just gave up on and bill the same climb again, so this is the one exit
+    # the watchdog deliberately does not follow with a new spawn - hence the
+    # second scripted process below never running, despite max_restarts=5.
+    heartbeat_path = tmp_path / "heartbeat.txt"
+    processes = [_FakeProcess([EXIT_CODE_STUCK_ABORT]), _FakeProcess([1])]
+    spawned: list[_FakeProcess] = []
+
+    def spawn() -> _FakeProcess:
+        process = processes[len(spawned)]
+        spawned.append(process)
+        return process
+
+    run_watchdog(
+        spawn,
+        heartbeat_path=heartbeat_path,
+        time_source=lambda: 0.0,
+        sleep=lambda seconds: None,
+        max_restarts=5,
+    )
+
+    assert len(spawned) == 1
 
 
 def test_restarts_the_subprocess_when_the_heartbeat_goes_stale(tmp_path):

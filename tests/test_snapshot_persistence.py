@@ -17,6 +17,7 @@ from jev_plays_pokemon.emulator import (
     DEFAULT_ROM_PATH,
     boot_or_resume,
     boot_to_controllable_state,
+    create_pyboy,
     load_snapshot,
     make_pyboy_snapshot_saver,
     save_snapshot,
@@ -95,11 +96,55 @@ def test_boot_or_resume_boots_fresh_when_no_snapshot_exists(monkeypatch, tmp_pat
         "jev_plays_pokemon.emulator.load_snapshot",
         lambda pyboy, path: pytest.fail("should not load - no snapshot exists"),
     )
+    # The cold-boot save has its own tests below; this one is about which boot
+    # path ran, and the "pyboy" here is a string, so saving through it would
+    # fail for a reason that has nothing to do with what is being asserted.
+    monkeypatch.setattr(
+        "jev_plays_pokemon.emulator.save_snapshot", lambda pyboy, path: None
+    )
 
     result = boot_or_resume("rom.gb", tmp_path / "missing.state")
 
     assert result == "fresh-pyboy"
     assert calls == ["boot_fresh"]
+
+
+def test_boot_or_resume_saves_a_snapshot_on_a_cold_boot(monkeypatch, tmp_path):
+    # The stuck-recovery ladder's top rung (#57) reloads the latest snapshot.
+    # Until a cold boot saved one, that rung was unreachable on a fresh run:
+    # the only other save triggers are a milestone completion (a stuck run
+    # completes none) and main's 600s safety net (longer than such a run
+    # survives) - which is how #59 billed 570 decisions without ever
+    # recovering.
+    snapshot_path = tmp_path / "boot.state"
+    fake = _FakePyBoy()
+    monkeypatch.setattr(
+        "jev_plays_pokemon.emulator.boot_to_controllable_state",
+        lambda rom_path: fake,
+    )
+
+    boot_or_resume("rom.gb", snapshot_path)
+
+    assert len(fake.saved_to) == 1
+    assert snapshot_path.exists()
+
+
+def test_boot_or_resume_does_not_save_when_it_resumed(monkeypatch, tmp_path):
+    # Resuming already has a snapshot; re-saving the state just loaded would
+    # only overwrite the thing a later reload is meant to restore.
+    snapshot_path = tmp_path / "snapshot.state"
+    snapshot_path.write_bytes(b"fake-state-bytes")
+    fake = _FakePyBoy()
+    monkeypatch.setattr("jev_plays_pokemon.emulator.create_pyboy", lambda rom: fake)
+    monkeypatch.setattr(
+        "jev_plays_pokemon.emulator.load_snapshot", lambda pyboy, p: None
+    )
+    monkeypatch.setattr(
+        "jev_plays_pokemon.emulator.save_snapshot",
+        lambda pyboy, path: pytest.fail("should not save - it just resumed"),
+    )
+
+    assert boot_or_resume("rom.gb", snapshot_path) is fake
 
 
 def test_boot_or_resume_loads_the_snapshot_when_one_exists(monkeypatch, tmp_path):
@@ -177,3 +222,39 @@ def test_boot_or_resume_resumes_from_a_real_saved_snapshot(tmp_path):
         assert (resumed.memory[0xD362], resumed.memory[0xD361]) == saved_position
     finally:
         resumed.stop(save=False)
+
+
+@pytestmark_e2e
+def test_a_cold_boot_snapshot_restores_a_playable_state_against_the_real_rom(
+    tmp_path,
+):
+    """What #57's top recovery rung actually needs: not that a file exists, but
+    that reloading it puts a fresh instance back somewhere it can still play
+    from. `boot_or_resume`'s cold-boot save is loaded onto a second, freshly
+    created instance - no intro-mash - and the player can walk.
+    """
+    snapshot_path = tmp_path / "boot.state"
+
+    booted = boot_or_resume(DEFAULT_ROM_PATH, snapshot_path)
+    try:
+        saved_position = (booted.memory[0xD362], booted.memory[0xD361])
+    finally:
+        booted.stop(save=False)
+
+    assert snapshot_path.exists()
+
+    reloaded = create_pyboy(DEFAULT_ROM_PATH)
+    try:
+        load_snapshot(reloaded, snapshot_path)
+
+        # No intro-mash happened on this instance, so this position can only
+        # have come from the snapshot the cold boot wrote.
+        assert (reloaded.memory[0xD362], reloaded.memory[0xD361]) == saved_position
+
+        # And it is a state the loop could act from again, not a screen it
+        # would have to button-mash out of: "down" is the one move already
+        # proven to go through from this exact boot position.
+        execute_button(reloaded, "down")
+        assert (reloaded.memory[0xD362], reloaded.memory[0xD361]) != saved_position
+    finally:
+        reloaded.stop(save=False)
